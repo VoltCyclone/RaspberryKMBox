@@ -13,6 +13,14 @@
 #include "hardware/uart.h"
 #include "pico/unique_id.h"
 
+#ifdef RP2350
+#include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/pio.h"
+#include "rp2350_hw_accel.h"
+#include "rp2350_dma_handler.h"
+#endif
+
 #include "tusb.h"
 #include "defines.h"
 #include "config.h"
@@ -69,7 +77,6 @@ static void core1_main(void);
 static void core1_task_loop(void);
 #ifdef RP2350
 static bool init_hid_hardware_acceleration(void);
-static void tuh_task_with_acceleration(void);
 #endif
 #endif
 
@@ -148,6 +155,24 @@ static void core1_main(void) {
     hw_accel_enabled = init_hid_hardware_acceleration();
     if (hw_accel_enabled) {
         printf("Core1: RP2350 hardware acceleration initialized successfully\n");
+        
+        // Initialize enhanced tuh_task implementation
+        extern bool rp2350_tuh_task_init(void);
+        extern bool rp2350_patch_tuh_task(void);
+        
+        // First initialize the enhanced implementation
+        if (rp2350_tuh_task_init()) {
+            printf("Core1: Enhanced tuh_task implementation initialized successfully\n");
+            
+            // Then patch the tuh_task function to use our enhanced implementation
+            if (rp2350_patch_tuh_task()) {
+                printf("Core1: tuh_task patched successfully\n");
+            } else {
+                printf("Core1: Failed to patch tuh_task, using direct calls\n");
+            }
+        } else {
+            printf("Core1: Enhanced tuh_task implementation initialization failed\n");
+        }
     } else {
         printf("Core1: RP2350 hardware acceleration initialization failed, using standard mode\n");
     }
@@ -166,18 +191,35 @@ static void core1_task_loop(void) {
     core1_state_t state = {0};  // Local state instead of static
 
 #ifdef RP2350
-    // RP2350: Initialize hardware acceleration
+    // RP2350: Initialize hardware acceleration if not already initialized
     if (!hw_accel_enabled) {
         hw_accel_enabled = init_hid_hardware_acceleration();
+        
+        // Initialize enhanced tuh_task implementation if hardware acceleration is enabled
+        if (hw_accel_enabled) {
+            extern bool rp2350_tuh_task_init(void);
+            extern bool rp2350_patch_tuh_task(void);
+            
+            // First initialize the enhanced implementation
+            if (rp2350_tuh_task_init()) {
+                // Then patch the tuh_task function
+                rp2350_patch_tuh_task();
+            }
+        }
     }
 #endif
 
     while (true) {
 #ifdef RP2350
-        // RP2350: Use hardware-accelerated task processing
+        // RP2350: Use enhanced tuh_task implementation directly
+        extern void rp2350_enhanced_tuh_task(void);
+        extern bool rp2350_tuh_task_hw_accel_enabled(void);
+        
         if (hw_accel_enabled) {
-            tuh_task_with_acceleration();
+            // Call our enhanced implementation directly
+            rp2350_enhanced_tuh_task();
         } else {
+            // Fall back to standard implementation
             tuh_task();
         }
 #else
@@ -211,38 +253,17 @@ static void core1_task_loop(void) {
 static bool init_hid_hardware_acceleration(void) {
     printf("Initializing RP2350 hardware acceleration for USB HID...\n");
     
-    // Configure RP2350-specific hardware acceleration registers
-    // Note: This is a placeholder implementation. The actual implementation
-    // would depend on the specific RP2350 hardware acceleration capabilities.
+    // Use the implementation from rp2350_hw_accel.c
+    extern bool hw_accel_init(void);
+    bool success = hw_accel_init();
     
-    // Example implementation:
-    // 1. Enable hardware acceleration clock
-    // 2. Configure acceleration parameters
-    // 3. Set up DMA channels for HID data processing
-    // 4. Initialize hardware FIFO buffers
+    if (success) {
+        printf("RP2350 hardware acceleration initialized successfully\n");
+    } else {
+        printf("RP2350 hardware acceleration initialization failed, falling back to standard mode\n");
+    }
     
-    // For now, we'll just return true to simulate successful initialization
-    return true;
-}
-
-/**
- * @brief Perform USB host task processing with hardware acceleration
- *
- * This function uses the RP2350 hardware acceleration features to process
- * USB host tasks more efficiently than the standard tuh_task() function.
- */
-static void tuh_task_with_acceleration(void) {
-    // This is a placeholder implementation. The actual implementation
-    // would use RP2350-specific hardware acceleration features.
-    
-    // Example implementation:
-    // 1. Check hardware FIFO for incoming HID reports
-    // 2. Process reports using hardware acceleration
-    // 3. Handle any hardware-specific events
-    
-    // For now, we'll just call the standard tuh_task() function
-    // but in a real implementation, this would use hardware acceleration
-    tuh_task();
+    return success;
 }
 #endif // RP2350
 

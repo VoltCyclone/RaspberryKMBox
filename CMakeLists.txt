@@ -97,6 +97,16 @@ set(PROJECT_SOURCES
     state_management.c
 )
 
+# Add RP2350-specific source files
+if(TARGET_CHIP STREQUAL "RP2350")
+    list(APPEND PROJECT_SOURCES
+        rp2350_hw_accel.c
+        rp2350_tuh_task.c
+        rp2350_dma_handler.c
+    )
+    message(STATUS "Added RP2350 hardware acceleration source files")
+endif()
+
 # Add executable
 add_executable(PIOKMbox ${PROJECT_SOURCES})
 
@@ -154,6 +164,8 @@ if(TARGET_CHIP STREQUAL "RP2350")
         PICO_RP2350=1
         PIN_USB_HOST_DP=10
         PIN_USB_HOST_DM=11
+        USE_HARDWARE_ACCELERATION=1
+        RP2350=1
     )
     message(STATUS "Added RP2350-specific definitions")
 else()

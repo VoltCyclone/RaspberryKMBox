@@ -8,6 +8,10 @@
 #include <string.h>
 #include "pico/time.h"
 
+#ifdef RP2350
+#include "rp2350_hw_accel.h"
+#endif
+
 // External declarations for variables defined in other modules
 extern device_connection_state_t connection_state;
 extern performance_stats_t stats;
@@ -58,6 +62,23 @@ void get_hid_stats(hid_stats_t* stats_out)
     stats_out->hw_accel_success_rate = calculate_hw_accel_success_rate();
     stats_out->hw_avg_processing_time_us = calculate_avg_hw_processing_time_us();
     stats_out->sw_avg_processing_time_us = calculate_avg_sw_processing_time_us();
+    
+    // Get additional hardware acceleration statistics
+    if (hw_accel_is_enabled()) {
+        hw_accel_stats_t hw_stats;
+        hw_accel_get_stats(&hw_stats);
+        
+        // Update hardware acceleration statistics
+        stats_out->hw_accel_reports_processed += hw_stats.dma_transfers_completed + hw_stats.pio_operations_completed;
+        stats_out->hw_accel_errors += hw_stats.dma_transfer_errors + hw_stats.pio_operation_errors +
+                                     hw_stats.fifo_overflows + hw_stats.fifo_underflows;
+        
+        // Update processing time statistics
+        if (hw_stats.processing_count > 0) {
+            stats_out->hw_processing_time_us += hw_stats.processing_time_us;
+            stats_out->hw_processing_count += hw_stats.processing_count;
+        }
+    }
 #endif
     
     // Print connection status with VID/PID information
@@ -148,6 +169,22 @@ void print_hw_accel_stats(void)
     if (hw_avg_time > 0 && sw_avg_time > 0) {
         float speedup = sw_avg_time / hw_avg_time;
         printf("  HW Acceleration Speedup: %.2fx\n", speedup);
+    }
+    
+    // Print additional hardware acceleration details if available
+    if (hw_accel_is_enabled()) {
+        hw_accel_stats_t hw_stats;
+        hw_accel_get_stats(&hw_stats);
+        
+        printf("\nHardware Acceleration Details:\n");
+        printf("  DMA Transfers Completed: %lu\n", hw_stats.dma_transfers_completed);
+        printf("  DMA Transfer Errors: %lu\n", hw_stats.dma_transfer_errors);
+        printf("  PIO Operations Completed: %lu\n", hw_stats.pio_operations_completed);
+        printf("  PIO Operation Errors: %lu\n", hw_stats.pio_operation_errors);
+        printf("  FIFO Overflows: %lu\n", hw_stats.fifo_overflows);
+        printf("  FIFO Underflows: %lu\n", hw_stats.fifo_underflows);
+    } else {
+        printf("\nHardware Acceleration: DISABLED\n");
     }
 }
 #endif
