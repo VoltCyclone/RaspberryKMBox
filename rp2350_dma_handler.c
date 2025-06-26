@@ -18,8 +18,7 @@
 #include "usb_hid_types.h"
 #include "rp2350_hw_accel.h"
 
-// External declarations
-extern performance_stats_t stats;
+// No external declarations needed
 
 /**
  * @brief DMA interrupt handler for hardware-accelerated HID processing
@@ -49,17 +48,8 @@ void dma_handler(void) {
             uint8_t valid_buttons = report->buttons & 0x07;
             
             // Forward the report to the USB device stack
-            bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, valid_buttons, 
-                                               report->x, report->y, report->wheel, 0);
-            
-            // Update statistics
-            if (success) {
-                stats.mouse_reports_forwarded++;
-                stats.hw_accel_reports_processed++;
-            } else {
-                stats.forwarding_errors++;
-                stats.hw_accel_errors++;
-            }
+            tud_hid_mouse_report(REPORT_ID_MOUSE, valid_buttons,
+                                report->x, report->y, report->wheel, 0);
         }
     }
     
@@ -76,16 +66,7 @@ void dma_handler(void) {
             hid_keyboard_report_t* report = (hid_keyboard_report_t*)keyboard_buffer;
             
             // Forward the report to the USB device stack
-            bool success = tud_hid_report(REPORT_ID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
-            
-            // Update statistics
-            if (success) {
-                stats.keyboard_reports_forwarded++;
-                stats.hw_accel_reports_processed++;
-            } else {
-                stats.forwarding_errors++;
-                stats.hw_accel_errors++;
-            }
+            tud_hid_report(REPORT_ID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
         }
     }
 }

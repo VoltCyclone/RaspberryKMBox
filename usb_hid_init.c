@@ -11,7 +11,7 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "usb_hid_reports.h"
-#include "usb_hid_stats.h"
+#include "usb_locks.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -117,9 +117,9 @@ static bool init_gpio_pins(void)
  * shared resources in the USB HID module.
  */
 void init_synchronization(void) {
-    critical_section_init(&usb_state_lock);
-    critical_section_init(&stats_lock);
-    LOG_INIT("Critical sections initialized for thread safety");
+    // Initialize the USB locks
+    init_usb_locks();
+    LOG_INIT("Spinlocks initialized for thread safety");
 }
 
 bool usb_host_enable_power(void)

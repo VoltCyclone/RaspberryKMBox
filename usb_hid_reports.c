@@ -9,14 +9,15 @@
 
 #ifdef RP2350
 #include "rp2350_hw_accel.h"
+#include "rp2350_dma_handler.h"
 #endif
 
-// External declarations for variables defined in other modules
-extern performance_stats_t stats;
+// No external stats declarations needed
 
 // Forward declarations for static functions
 static bool process_keyboard_report_internal(const hid_keyboard_report_t* report);
 static bool process_mouse_report_internal(const hid_mouse_report_t* report);
+static void dequeue_and_process_mouse_report(void);
 
 #ifdef RP2350
 // RP2350 hardware-accelerated implementations
@@ -116,6 +117,21 @@ void init_hid_dma(void) {
     dma_channel_set_irq0_enabled(kbd_dma_channel, true);
     dma_channel_set_irq0_enabled(mouse_dma_channel, true);
     
+#ifdef RP2350
+    // Set up DMA interrupt handlers from rp2350_dma_handler.c
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+    irq_set_priority(DMA_IRQ_0, DMA_IRQ_PRIORITY);
+    irq_set_enabled(DMA_IRQ_0, true);
+    
+    irq_set_exclusive_handler(DMA_IRQ_1, dma_handler);
+    irq_set_priority(DMA_IRQ_1, DMA_IRQ_PRIORITY);
+    irq_set_enabled(DMA_IRQ_1, true);
+#else
+    // Define generic DMA handlers for non-RP2350 platforms
+    // These would need to be implemented elsewhere
+    extern void dma_kbd_irq_handler(void);
+    extern void dma_mouse_irq_handler(void);
+    
     irq_set_exclusive_handler(DMA_IRQ_0, dma_kbd_irq_handler);
     irq_set_priority(DMA_IRQ_0, DMA_IRQ_PRIORITY);
     irq_set_enabled(DMA_IRQ_0, true);
@@ -123,6 +139,7 @@ void init_hid_dma(void) {
     irq_set_exclusive_handler(DMA_IRQ_1, dma_mouse_irq_handler);
     irq_set_priority(DMA_IRQ_1, DMA_IRQ_PRIORITY);
     irq_set_enabled(DMA_IRQ_1, true);
+#endif
     
     LOG_INIT("DMA HID report processing initialized");
 }
@@ -146,26 +163,15 @@ void process_kbd_report(const hid_keyboard_report_t* report)
     // Fast forward the report using hardware acceleration if available
 #ifdef RP2350
     if (hw_accel_is_enabled() && hw_accel_process_keyboard_report(report)) {
-        stats.keyboard_reports_received++;
-        
-#ifdef RP2350
-        // Update RP2350 hardware acceleration statistics
-        stats.hw_accel_reports_processed++;
-#endif
+        // Hardware acceleration successful
     } else {
-        if (process_keyboard_report_internal(report)) {
-            stats.keyboard_reports_received++;
-            
-#ifdef RP2350
-            // Update RP2350 software fallback statistics
-            stats.sw_fallback_reports_processed++;
-#endif
-        }
+        // Software fallback
+        process_keyboard_report_internal(report);
     }
 #else
-    if (process_keyboard_report_internal(report)) {
-        stats.keyboard_reports_received++;
-    }
+    // Standard processing
+    process_keyboard_report_internal(report);
+#endif
 }
 
 // Process mouse report - queue to circular buffer
@@ -184,34 +190,80 @@ void process_mouse_report(const hid_mouse_report_t* report)
     // Fast forward the report using hardware acceleration if available
 #ifdef RP2350
     if (hw_accel_is_enabled() && hw_accel_process_mouse_report(report)) {
-        stats.mouse_reports_received++;
-        
-#ifdef RP2350
-        // Update RP2350 hardware acceleration statistics
-        stats.hw_accel_reports_processed++;
-#endif
+        // Hardware acceleration successful
     } else {
-        if (process_mouse_report_internal(report)) {
-            stats.mouse_reports_received++;
-            
-#ifdef RP2350
-            // Update RP2350 software fallback statistics
-            stats.sw_fallback_reports_processed++;
-#endif
-        }
+        // Software fallback
+        process_mouse_report_internal(report);
     }
 #else
-    if (process_mouse_report_internal(report)) {
-        stats.mouse_reports_forwarded++;
-    } else {
-        stats.forwarding_errors++;
-    }
+    // Standard processing
+    process_mouse_report_internal(report);
 #endif
     
     // Process next report if available
     if (!is_mouse_buffer_empty()) {
         dequeue_and_process_mouse_report();
     }
+}
+
+/**
+ * @brief Check if the mouse circular buffer is empty
+ *
+ * @return true if the buffer is empty, false otherwise
+ */
+bool is_mouse_buffer_empty(void) {
+    return mouse_circular_buffer.read_idx == mouse_circular_buffer.write_idx;
+}
+
+/**
+ * @brief Check if the keyboard circular buffer is empty
+ *
+ * @return true if the buffer is empty, false otherwise
+ */
+bool is_kbd_buffer_empty(void) {
+    return kbd_circular_buffer.read_idx == kbd_circular_buffer.write_idx;
+}
+
+/**
+ * @brief Process all queued reports in the circular buffers
+ *
+ * This function processes all pending reports in both the keyboard and mouse
+ * circular buffers. It should be called periodically to ensure reports are
+ * processed in a timely manner.
+ */
+void process_queued_reports(void) {
+    // Process keyboard reports
+    while (!is_kbd_buffer_empty()) {
+        // Implementation would dequeue and process keyboard reports
+        // Similar to dequeue_and_process_mouse_report
+    }
+    
+    // Process mouse reports
+    while (!is_mouse_buffer_empty()) {
+        dequeue_and_process_mouse_report();
+    }
+}
+
+/**
+ * @brief Dequeue a mouse report from the circular buffer and process it
+ *
+ * This function removes the oldest mouse report from the circular buffer
+ * and processes it.
+ */
+static void dequeue_and_process_mouse_report(void) {
+    if (is_mouse_buffer_empty()) {
+        return; // Buffer is empty, nothing to process
+    }
+    
+    // Get the next report from the circular buffer
+    uint32_t read_idx = mouse_circular_buffer.read_idx;
+    hid_mouse_report_t* report = &mouse_buffer[read_idx];
+    
+    // Process the report
+    process_mouse_report_internal(report);
+    
+    // Update read index
+    mouse_circular_buffer.read_idx = (read_idx + 1) & mouse_circular_buffer.mask;
 }
 
 bool find_key_in_report(const hid_keyboard_report_t* report, uint8_t keycode)

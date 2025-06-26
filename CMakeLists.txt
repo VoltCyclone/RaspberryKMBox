@@ -91,10 +91,12 @@ set(PROJECT_SOURCES
     usb_hid_descriptors.c
     usb_hid_strings.c
     usb_hid_callbacks.c
-    usb_hid_stats.c
     watchdog.c
     init_state_machine.c
     state_management.c
+    dma_handlers.c
+    dma_manager.c
+    usb_locks.c
 )
 
 # Add RP2350-specific source files

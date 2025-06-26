@@ -273,10 +273,11 @@ static void core1_task_loop(void) {
  *
  * @return uint32_t Current time in microseconds
  */
-static inline uint32_t time_us_32(void) {
-    // Use the 64-bit timer and truncate to 32 bits
-    return (uint32_t)time_us_64();
-}
+// Function already defined in pico SDK, so we'll use that instead
+// static inline uint32_t time_us_32(void) {
+//     // Use the 64-bit timer and truncate to 32 bits
+//     return (uint32_t)time_us_64();
+// }
 
 typedef struct {
     bool initialized;
@@ -470,18 +471,11 @@ static void report_hid_statistics(uint32_t current_time, uint32_t* stats_timer) 
 
     *stats_timer = current_time;
     
-    #if ENABLE_STATS_LOGGING
-    hid_stats_t stats;
-    get_hid_stats(&stats);
-    
-    printf("=== HID Statistics ===\n");
-    printf("Mouse: RX=%lu, TX=%lu\n", stats.mouse_reports_received, stats.mouse_reports_forwarded);
-    printf("Keyboard: RX=%lu, TX=%lu\n", stats.keyboard_reports_received, stats.keyboard_reports_forwarded);
-    printf("Errors: %lu\n", stats.forwarding_errors);
+    // Stats reporting removed
+    printf("=== HID Status ===\n");
     printf("Mouse connected: %s\n", is_mouse_connected() ? "YES" : "NO");
     printf("Keyboard connected: %s\n", is_keyboard_connected() ? "YES" : "NO");
-    printf("=====================\n");
-    #endif
+    printf("=================\n");
 }
 
 static void report_watchdog_status(uint32_t current_time, uint32_t* watchdog_status_timer) {
