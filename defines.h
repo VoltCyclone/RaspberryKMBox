@@ -114,7 +114,7 @@
 #define USB_RESET_COOLDOWN_MS           2000    // Post-reset cooldown
 
 // Main loop task timing
-#define HID_DEVICE_TASK_INTERVAL_MS     8       // 8ms = ~125 FPS for ultra-smooth operation
+#define HID_DEVICE_TASK_INTERVAL_MS     3       // 3ms = ~333 FPS for ultra-smooth operation
 #define WATCHDOG_TASK_INTERVAL_MS       100     // Watchdog update frequency
 #define WATCHDOG_INIT_DELAY_MS          8       // HID device task frequency
 #define VISUAL_TASK_INTERVAL_MS         50      // LED/neopixel update frequency
@@ -343,11 +343,11 @@
 //--------------------------------------------------------------------+
 
 #ifndef ENABLE_HID_STATISTICS
-#define ENABLE_HID_STATISTICS           1
+#define ENABLE_HID_STATISTICS           0
 #endif
 
 #ifndef ENABLE_WATCHDOG_REPORTING
-#define ENABLE_WATCHDOG_REPORTING       1
+#define ENABLE_WATCHDOG_REPORTING       0
 #endif
 
 #ifndef ENABLE_NEOPIXEL_STATUS
@@ -355,10 +355,10 @@
 #endif
 
 #ifndef ENABLE_BUTTON_RESET
-#define ENABLE_BUTTON_RESET             1
+#define ENABLE_BUTTON_RESET             0
 #endif
 
-#define ENABLE_PERIODIC_REINIT          1
+#define ENABLE_PERIODIC_REINIT          0
 #define ENABLE_FALLBACK_MODE            1
 
 //--------------------------------------------------------------------+

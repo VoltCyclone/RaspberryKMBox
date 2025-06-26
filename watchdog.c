@@ -129,8 +129,6 @@ static void check_inter_core_health(void) {
             watchdog_force_reset();
         }
     } else {
-        // Reset unhealthy timer when system becomes healthy again
-        // Reset unhealthy timer when system becomes healthy again
         // (No action needed - timer is reset by healthy state)
     }
 }
@@ -247,7 +245,6 @@ void watchdog_stop(void) {
     }
     
     if (WATCHDOG_ENABLE_HARDWARE) {
-        // Note: The RP2040 hardware watchdog cannot be disabled once enabled
         // We can only update it to prevent reset
         printf("Watchdog: WARNING - Hardware watchdog cannot be disabled on RP2040\n");
         printf("Watchdog: Continuing to update hardware watchdog to prevent reset\n");

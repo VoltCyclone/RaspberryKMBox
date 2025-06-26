@@ -8,12 +8,17 @@
 #include "pico/stdlib.h"
 #include "pico/unique_id.h"
 #include "hardware/gpio.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "usb_hid_reports.h"
+#include "usb_hid_stats.h"
 #include <stdio.h>
 #include <string.h>
 
 // Function declarations
 static bool generate_serial_string(void);
 static bool init_gpio_pins(void);
+void init_synchronization(void);
 
 // External declarations for variables defined in other modules
 extern device_connection_state_t connection_state;
@@ -28,6 +33,9 @@ static bool usb_host_initialized = false;
 
 bool usb_hid_init(void)
 {
+    // Initialize critical sections for thread safety
+    init_synchronization();
+    
     // Generate unique serial string from chip ID
     if (!generate_serial_string()) {
         LOG_ERROR("Failed to generate serial string");
@@ -91,7 +99,7 @@ static bool init_gpio_pins(void)
     gpio_set_dir(PIN_BUTTON, GPIO_IN);
     gpio_pull_up(PIN_BUTTON);
     
-#ifndef TARGET_RP2350
+#ifndef RP2350
     // USB 5V power pin initialization but keep it OFF during early boot
     // Only for RP2040 boards, not needed for RP2350 which uses plain USB
     gpio_init(PIN_USB_5V);
@@ -102,10 +110,22 @@ static bool init_gpio_pins(void)
     return true;
 }
 
+/**
+ * @brief Initialize critical sections for thread safety
+ *
+ * This function initializes the critical sections used for protecting
+ * shared resources in the USB HID module.
+ */
+void init_synchronization(void) {
+    critical_section_init(&usb_state_lock);
+    critical_section_init(&stats_lock);
+    LOG_INIT("Critical sections initialized for thread safety");
+}
+
 bool usb_host_enable_power(void)
 {
     LOG_INIT("Enabling USB host power...");
-#ifndef TARGET_RP2350
+#ifndef RP2350
     // Only control the 5V power pin on RP2040 boards
     gpio_put(PIN_USB_5V, 1); // Enable USB power
     sleep_ms(100); // Allow power to stabilize
@@ -156,7 +176,7 @@ bool usb_host_stack_reset(void)
     usb_host_initialized = false;
     
     // Power cycle the USB host port
-#ifndef TARGET_RP2350
+#ifndef RP2350
     // Only power cycle on RP2040 boards
     gpio_put(PIN_USB_5V, 0);
     sleep_ms(500); // Wait for power to fully discharge
@@ -190,6 +210,24 @@ bool usb_stacks_reset(void)
     bool host_reset = usb_host_stack_reset();
     
     return device_reset && host_reset;
+}
+
+bool usb_hid_dma_init(void)
+{
+    LOG_INIT("Initializing DMA for USB HID report processing...");
+    
+#ifdef RP2350
+    // Initialize DMA channels and circular buffers for HID reports
+    init_hid_dma();
+    LOG_INIT("DMA HID report processing initialized successfully");
+    return true;
+#else
+    // For RP2040, we'll still initialize the DMA but with a note
+    LOG_INIT("RP2040 detected - DMA performance may be limited compared to RP2350");
+    init_hid_dma();
+    LOG_INIT("DMA HID report processing initialized successfully");
+    return true;
+#endif
 }
 
 void usb_stack_error_check(void)

@@ -6,6 +6,7 @@
 #include "defines.h"
 #include "led_control.h"
 #include "pico/stdlib.h"
+#include "usb_hid_stats.h"
 #include <stdio.h>
 
 // External declarations for variables defined in other modules
@@ -38,7 +39,14 @@ void hid_device_task(void)
     }
     
     // Only send reports when devices are not connected (avoid conflicts)
-    if (!connection_state.mouse_connected && !connection_state.keyboard_connected) {
+    bool mouse_connected, keyboard_connected;
+    
+    critical_section_enter_blocking(&usb_state_lock);
+    mouse_connected = connection_state.mouse_connected;
+    keyboard_connected = connection_state.keyboard_connected;
+    critical_section_exit(&usb_state_lock);
+    
+    if (!mouse_connected && !keyboard_connected) {
         send_hid_report(REPORT_ID_MOUSE);
     } else {
         // Send empty consumer control report to maintain connection
@@ -64,8 +72,14 @@ void send_hid_report(uint8_t report_id)
     }
     
     switch (report_id) {
-        case REPORT_ID_KEYBOARD:
-            if (!connection_state.keyboard_connected) {
+        case REPORT_ID_KEYBOARD: {
+            bool keyboard_connected;
+            
+            critical_section_enter_blocking(&usb_state_lock);
+            keyboard_connected = connection_state.keyboard_connected;
+            critical_section_exit(&usb_state_lock);
+            
+            if (!keyboard_connected) {
                 // CRITICAL: Check device readiness before each report
                 if (tud_hid_ready()) {
                     // Use static array to avoid stack allocation overhead
@@ -74,10 +88,17 @@ void send_hid_report(uint8_t report_id)
                 }
             }
             break;
+        }
 
-        case REPORT_ID_MOUSE:
+        case REPORT_ID_MOUSE: {
+            bool mouse_connected;
+            
+            critical_section_enter_blocking(&usb_state_lock);
+            mouse_connected = connection_state.mouse_connected;
+            critical_section_exit(&usb_state_lock);
+            
             // Only send button-based mouse movement if no mouse is connected
-            if (!connection_state.mouse_connected) {
+            if (!mouse_connected) {
                 // CRITICAL: Check device readiness before each report
                 if (tud_hid_ready()) {
                     static bool prev_button_state = true; // true = not pressed (active low)
@@ -99,6 +120,7 @@ void send_hid_report(uint8_t report_id)
                 }
             }
             break;
+        }
 
         case REPORT_ID_CONSUMER_CONTROL: {
             // CRITICAL: Check device readiness before each report

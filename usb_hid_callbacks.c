@@ -34,12 +34,9 @@ void tud_mount_cb(void)
 void tud_umount_cb(void)
 {
     led_set_blink_interval(LED_BLINK_UNMOUNTED_MS);
-    // USB Device unmounted (reduced logging)
     
     // Track device unmount as potential error condition
-    usb_error_tracker.consecutive_device_errors++;
-    // Device unmount error tracking (reduced logging)
-    
+    usb_error_tracker.consecutive_device_errors++;    
     neopixel_update_status();
 }
 
@@ -47,7 +44,6 @@ void tud_suspend_cb(bool remote_wakeup_en)
 {
     (void) remote_wakeup_en;
     led_set_blink_interval(LED_BLINK_SUSPENDED_MS);
-    // USB Device suspended (reduced logging)
     neopixel_update_status();
 }
 
@@ -61,7 +57,6 @@ void tud_resume_cb(void)
 // HID device callbacks
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen)
 {
-    // Not used for this application
     (void) instance;
     (void) report_id;
     (void) report_type;
@@ -106,7 +101,6 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint16_
     (void) report;
     (void) len;
     
-    // Not used for this application
 }
 
 // Host callbacks with improved error handling
@@ -136,7 +130,6 @@ void tuh_umount_cb(uint8_t dev_addr)
     // Handle device disconnection - this will reset VID/PID if needed
     handle_device_disconnection(dev_addr);
     
-    // Track host unmount with improved logic
     static uint32_t last_unmount_time = 0;
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
@@ -187,7 +180,6 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
     (void)instance; // Suppress unused parameter warning
     
-    // HID device unmounted (reduced logging)
     
     // Handle device disconnection
     handle_device_disconnection(dev_addr);
@@ -310,7 +302,7 @@ bool hw_validate_report(uint8_t itf_protocol, uint8_t const* report, uint16_t le
 }
 
 // Hardware-accelerated report processing
-void process_hid_report_hardware(uint8_t dev_addr, uint8_t instance, uint8_t itf_protocol, uint8_t const* report, uint16_t len)
+void process_hid_report_hardware(uint8_t dev_addr __attribute__((unused)), uint8_t instance __attribute__((unused)), uint8_t itf_protocol, uint8_t const* report, uint16_t len)
 {
     // Use RP2350 PIO for accelerated report processing
     switch (itf_protocol) {
@@ -338,7 +330,7 @@ void process_hid_report_hardware(uint8_t dev_addr, uint8_t instance, uint8_t itf
 #endif // USE_HARDWARE_ACCELERATION
 
 // Software fallback for report processing
-void process_hid_report_software(uint8_t dev_addr, uint8_t instance, uint8_t itf_protocol, uint8_t const* report, uint16_t len)
+void process_hid_report_software(uint8_t dev_addr __attribute__((unused)), uint8_t instance __attribute__((unused)), uint8_t itf_protocol, uint8_t const* report, uint16_t len)
 {
     // Direct processing without extra copying for better performance
     switch (itf_protocol) {

@@ -7,6 +7,11 @@
 
 #include "usb_hid_types.h"
 #include <stdint.h>
+#include "pico/critical_section.h"
+
+// Critical section locks for thread safety
+extern critical_section_t usb_state_lock;
+extern critical_section_t stats_lock;
 
 // Performance monitoring functions
 void print_hid_connection_status(void);

@@ -11,6 +11,8 @@
 // Initialization functions
 bool usb_hid_init(void);
 bool usb_host_enable_power(void);
+bool usb_hid_dma_init(void);
+void init_synchronization(void);
 
 // USB stack initialization tracking
 void usb_device_mark_initialized(void);
