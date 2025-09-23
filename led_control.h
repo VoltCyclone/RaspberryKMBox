@@ -49,6 +49,8 @@ void neopixel_init(void);
 void neopixel_enable_power(void);
 void neopixel_set_color(uint32_t color);
 void neopixel_set_color_with_brightness(uint32_t color, float brightness);
+// Integer brightness variant (0-255) for fixed-point code paths
+void neopixel_set_color_with_brightness_u8(uint32_t color, uint8_t brightness);
 void neopixel_update_status(void);
 void neopixel_status_task(void);
 void neopixel_trigger_activity_flash(void);
@@ -69,6 +71,9 @@ void neopixel_rainbow_on_movement(int16_t dx, int16_t dy);
 // Utility functions
 uint32_t neopixel_rgb_to_grb(uint32_t rgb);
 uint32_t neopixel_apply_brightness(uint32_t color, float brightness);
+uint32_t neopixel_apply_brightness_u8(uint32_t color, uint8_t brightness);
 void neopixel_breathing_effect(void);
+// Flush any queued LED frames to the PIO FIFO if space is available
+void neopixel_flush_queue(void);
 
 #endif // LED_CONTROL_H

@@ -1,8 +1,7 @@
 /*
- * KMBox Interface - Consolidated UART and SPI Interface
+ * KMBox Interface - UART Interface
  * 
- * Provides a clean, unified interface for KMBox communication
- * supporting both UART and SPI transports.
+ * Provides a clean interface for KMBox communication over UART.
  */
 
 #ifndef KMBOX_INTERFACE_H
@@ -15,8 +14,7 @@
 // Transport types
 typedef enum {
     KMBOX_TRANSPORT_NONE = 0,
-    KMBOX_TRANSPORT_UART,
-    KMBOX_TRANSPORT_SPI
+    KMBOX_TRANSPORT_UART
 } kmbox_transport_type_t;
 
 // Configuration structures
@@ -27,22 +25,11 @@ typedef struct {
     bool use_dma;
 } kmbox_uart_config_t;
 
-typedef struct {
-    uint32_t baudrate;
-    unsigned int sck_pin;
-    unsigned int mosi_pin;
-    unsigned int miso_pin;
-    unsigned int cs_pin;
-    bool use_dma;
-    bool is_slave;
-} kmbox_spi_config_t;
-
 // Main interface configuration
 typedef struct {
     kmbox_transport_type_t transport_type;
     union {
         kmbox_uart_config_t uart;
-        kmbox_spi_config_t spi;
     } config;
     
     // Callback for received commands
@@ -82,6 +69,5 @@ kmbox_transport_type_t kmbox_interface_get_transport_type(void);
 
 // Default configurations
 extern const kmbox_uart_config_t KMBOX_UART_DEFAULT_CONFIG;
-extern const kmbox_spi_config_t KMBOX_SPI_DEFAULT_CONFIG;
 
 #endif // KMBOX_INTERFACE_H

@@ -15,14 +15,16 @@
 
 // Ring buffer for non-blocking UART reception
 // Use power-of-2 size for efficient modulo operation
-#define UART_RX_BUFFER_SIZE 256
+// Memory is plentiful: use a large buffer to minimize overflow/drops
+#define UART_RX_BUFFER_SIZE 2048
 #define UART_RX_BUFFER_MASK (UART_RX_BUFFER_SIZE - 1)
 static volatile uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE];
 static volatile uint16_t uart_rx_head = 0;
 static volatile uint16_t uart_rx_tail = 0;
 
 // UART RX interrupt handler for high-performance non-blocking reception
-static void on_uart_rx(void) {
+// Place in RAM to avoid XIP stalls during heavy serial traffic
+static void __not_in_flash_func(on_uart_rx)(void) {
     while (uart_is_readable(KMBOX_UART)) {
         uint8_t ch = uart_getc(KMBOX_UART);
         
@@ -35,23 +37,6 @@ static void on_uart_rx(void) {
             uart_rx_head = next_head;
         }
         // If buffer full, oldest data is discarded
-    }
-}
-
-// Callback invoked by PIO UART DMA handler. Copies bytes into the ring buffer.
-// When attached, pio UART DMA will write directly into uart_rx_buffer.
-static void pio_rx_to_ringbuffer(const uint8_t *data, size_t len)
-{
-    for (size_t i = 0; i < len; ++i) {
-        uint8_t ch = data[i];
-        uint16_t next_head = (uart_rx_head + 1) & UART_RX_BUFFER_MASK;
-        if (next_head != uart_rx_tail) {
-            uart_rx_buffer[uart_rx_head] = ch;
-            uart_rx_head = next_head;
-        } else {
-            // Buffer full; drop oldest (same policy as IRQ handler)
-            break;
-        }
     }
 }
 
@@ -125,30 +110,58 @@ static bool ringbuf_peek_line_and_copy(char *dst, size_t dst_size, size_t *out_l
     return true;
 }
 
+// Fast bulk read from ring buffer (no terminator scan). Returns number of bytes copied.
+// Copies contiguous bytes up to maxlen from current tail to either head or buffer end.
+static inline size_t ringbuf_read_chunk(uint8_t *dst, size_t maxlen) {
+    uint16_t head = uart_rx_head;
+    uint16_t tail = uart_rx_tail;
+    if (head == tail || maxlen == 0) return 0;
+
+    size_t available = (head - tail) & UART_RX_BUFFER_MASK;
+    if (available == 0) return 0;
+
+    size_t first_chunk = UART_RX_BUFFER_SIZE - (tail & UART_RX_BUFFER_MASK);
+    if (first_chunk > available) first_chunk = available;
+    if (first_chunk > maxlen) first_chunk = maxlen;
+
+    memcpy(dst, (const void *)&uart_rx_buffer[tail & UART_RX_BUFFER_MASK], first_chunk);
+    uart_rx_tail = (tail + (uint16_t)first_chunk) & UART_RX_BUFFER_MASK;
+    return first_chunk;
+}
+
 // Initialize the serial handler
 void kmbox_serial_init(void)
 {
-    bool pio_ok = false;
-    printf("PIO UART disabled via KMBOX_ENABLE_PIO_UART - using hardware UART1 fallback\n");
+    // Reset UART RX ring buffer indices
+    uart_rx_head = 0;
+    uart_rx_tail = 0;
 
     uart_init(KMBOX_UART, KMBOX_UART_BAUDRATE);
+    // Standard 8N1 format and enable FIFO for throughput
+    uart_set_format(KMBOX_UART, 8, 1, UART_PARITY_NONE);
     
-    // Set up GPIO pins for UART1
+    // Set up GPIO pins for selected UART (KMBOX_UART maps to pins below)
     gpio_set_function(KMBOX_UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(KMBOX_UART_RX_PIN, GPIO_FUNC_UART);
+    gpio_pull_up(KMBOX_UART_RX_PIN); // Help avoid spurious RX when line idle/floating
     
     // Enable UART FIFOs for better performance
     uart_set_fifo_enabled(KMBOX_UART, true);
     
-    // Set up UART RX interrupt for non-blocking reception
+    // Set up UART RX interrupt for non-blocking reception with higher priority
     int uart_irq = (KMBOX_UART == uart0) ? UART0_IRQ : UART1_IRQ;
     irq_set_exclusive_handler(uart_irq, on_uart_rx);
+    // Lower numerical value = higher priority on RP2040; 0 is highest. Use 0 for KMBox.
+    irq_set_priority(uart_irq, 0);
     irq_set_enabled(uart_irq, true);
     
     // Enable UART RX interrupt
     uart_set_irq_enables(KMBOX_UART, true, false);
     // Initialize the kmbox commands module
     kmbox_commands_init();
+    // Establish an initial timing baseline for the commands module
+    uint32_t init_time_ms = to_ms_since_boot(get_absolute_time());
+    kmbox_update_states(init_time_ms);
     
     printf("KMBox serial handler initialized on UART1 (TX: GPIO%d, RX: GPIO%d) @ %d baud\n",
            KMBOX_UART_TX_PIN, KMBOX_UART_RX_PIN, KMBOX_UART_BAUDRATE);
@@ -168,10 +181,21 @@ void kmbox_serial_task(void)
         kmbox_process_serial_line(linebuf, line_len, termbuf, termlen, current_time_ms);
     }
 
-    // Fallback: process any remaining single bytes (partial line building)
-    int c;
-    while ((c = uart_rx_getchar()) != -1) {
-        kmbox_process_serial_char((char)c, current_time_ms);
+    // Fallback: process any remaining partial bytes in chunks to reduce per-byte overhead
+    uint8_t tmp[128];
+    size_t n;
+    while ((n = ringbuf_read_chunk(tmp, sizeof(tmp))) > 0) {
+        // Manually unroll small inner loop for speed
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            kmbox_process_serial_char((char)tmp[i + 0], current_time_ms);
+            kmbox_process_serial_char((char)tmp[i + 1], current_time_ms);
+            kmbox_process_serial_char((char)tmp[i + 2], current_time_ms);
+            kmbox_process_serial_char((char)tmp[i + 3], current_time_ms);
+        }
+        for (; i < n; ++i) {
+            kmbox_process_serial_char((char)tmp[i], current_time_ms);
+        }
     }
     
     // Update button states (handles timing for releases)
@@ -186,6 +210,10 @@ bool kmbox_send_mouse_report(void)
         return false;
     }
     
+    // Ensure library state (timers/clicks) is up-to-date for this frame
+    uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
+    kmbox_update_states(current_time_ms);
+
     // Get the report data from kmbox commands
     uint8_t buttons;
     int8_t x, y, wheel, pan;

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 //--------------------------------------------------------------------+
 // Constants
@@ -42,8 +43,64 @@ static const char* lock_button_names[KMBOX_BUTTON_COUNT] = {
 // Static Variables
 //--------------------------------------------------------------------+
 
-static kmbox_state_t g_kmbox_state = {0};
-static kmbox_parser_t g_parser = {0};
+static kmbox_state_t g_kmbox_state; // zero-initialized by default (static storage)
+static kmbox_parser_t g_parser;     // zero-initialized by default (static storage)
+
+//--------------------------------------------------------------------+
+// Movement History for catch_xy
+//--------------------------------------------------------------------+
+
+// Keep a short ring buffer of recent movement deltas with timestamps (ms)
+// to support km.catch_xy(duration) queries up to 1000ms.
+typedef struct {
+    int16_t dx;
+    int16_t dy;
+    uint32_t t_ms;
+} movement_event_t;
+
+// Choose a reasonable size; even at high USB poll rates, 256 entries
+// comfortably covers >1000ms of movement samples.
+#define KMBOX_MOV_HISTORY_SIZE 256
+static movement_event_t g_mov_history[KMBOX_MOV_HISTORY_SIZE];
+static uint16_t g_mov_head = 0;   // Next write position
+static uint16_t g_mov_count = 0;  // Number of valid entries
+
+static void record_movement_event(int16_t dx, int16_t dy, uint32_t now_ms)
+{
+    // Ignore zero deltas to reduce noise
+    if (dx == 0 && dy == 0) return;
+
+    g_mov_history[g_mov_head].dx = dx;
+    g_mov_history[g_mov_head].dy = dy;
+    g_mov_history[g_mov_head].t_ms = now_ms;
+    g_mov_head = (uint16_t)((g_mov_head + 1) % KMBOX_MOV_HISTORY_SIZE);
+    if (g_mov_count < KMBOX_MOV_HISTORY_SIZE) {
+        g_mov_count++;
+    }
+}
+
+static void sum_movement_since(uint32_t since_ms, uint32_t now_ms, int32_t *out_x, int32_t *out_y)
+{
+    (void)now_ms; // currently unused; kept for future precision improvements
+    int32_t sx = 0, sy = 0;
+    if (g_mov_count == 0) {
+        *out_x = 0; *out_y = 0; return;
+    }
+    // Iterate newest->oldest until entries are older than window
+    int idx = (int)g_mov_head - 1;
+    if (idx < 0) idx = KMBOX_MOV_HISTORY_SIZE - 1;
+    uint16_t remaining = g_mov_count;
+    while (remaining--) {
+        const movement_event_t *ev = &g_mov_history[idx];
+        if (ev->t_ms < since_ms) break; // older than window
+        sx += ev->dx;
+        sy += ev->dy;
+        idx--;
+        if (idx < 0) idx = KMBOX_MOV_HISTORY_SIZE - 1;
+    }
+    *out_x = sx;
+    *out_y = sy;
+}
 
 //--------------------------------------------------------------------+
 // Random Number Generation
@@ -170,9 +227,9 @@ static bool get_button_lock(kmbox_button_t button)
 
 static void send_button_state_callback(uint8_t button_state)
 {
-    // Send the callback in the format: km.[button_state]\r\n
+    // Send the callback in the format: km.[button_state]\r\n>>> 
     // where button_state is the raw character representing the bitmap
-    printf("km.%c\r\n", button_state);
+    printf("km.%c\r\n>>> ", button_state);
 }
 
 //--------------------------------------------------------------------+
@@ -181,14 +238,6 @@ static void send_button_state_callback(uint8_t button_state)
 
 static void parse_command(const char* cmd, uint32_t current_time_ms)
 {
-    // Fast path: check command prefix first
-    if (cmd[0] != 'k' || cmd[1] != 'm' || cmd[2] != '.') {
-        return;
-    }
-    
-    // Skip "km." prefix
-    const char* cmd_ptr = cmd + 3;
-    
     // Expected formats:
     // button_name(state) - Example: left(1) or side2(0)
     // click(button_num) - Example: click(0) for left button
@@ -200,19 +249,46 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     // lock_mx(state) - Set X axis lock (1=locked, 0=unlocked)
     // lock_my() - Get Y axis lock state
     // lock_my(state) - Set Y axis lock (1=locked, 0=unlocked)
-    
-    // Check if command starts with "km."
-    if (strncmp(cmd, "km.", 3) != 0) {
+    // catch_xy(duration_ms) - Sum x/y input over last duration (0..1000ms)
+    // Aliases supported:
+    // m(...) -> km.move(...)
+
+    // Determine if this is a standard km.* command or a supported alias
+    bool is_km = (strncmp(cmd, "km.", 3) == 0);
+    bool is_alias_move = (cmd[0] == 'm' && cmd[1] == '(');
+    if (!is_km && !is_alias_move) {
         return;
     }
-    
+
+    // Check if this is a catch_xy command
+    if (strncmp(cmd + 3, "catch_xy(", 9) == 0) {
+        const char* num_start = cmd + 12; // Skip "km.catch_xy("
+        char* num_end;
+        long duration = strtol(num_start, &num_end, 10);
+        // Validate closing parenthesis (no trailing spaces per other commands)
+        if (*num_end != ')') {
+            return;
+        }
+        if (duration < 0) duration = 0;
+        if (duration > 1000) duration = 1000;
+
+        uint32_t now = current_time_ms;
+        uint32_t since = now - (uint32_t)duration;
+        int32_t sx = 0, sy = 0;
+        sum_movement_since(since, now, &sx, &sy);
+
+        // Output format: (x, y) then prompt
+        printf("(%ld, %ld)\r\n>>> ", (long)sx, (long)sy);
+        return;
+    }
+
     // Echo the command back with the original line terminator
     printf("%s%.*s", cmd, g_parser.terminator_len, g_parser.command_terminator);
     
     // Check if this is a move command
-    if (strncmp(cmd + 3, "move(", 5) == 0) {
+    if ((is_km && strncmp(cmd + 3, "move(", 5) == 0) || is_alias_move) {
         // Parse move command
-        const char* args_start = cmd + 8; // Skip "km.move("
+        const char* args_start = is_alias_move ? (cmd + 2) : (cmd + 8); // Skip "m(" or "km.move("
         const char* comma_pos = strchr(args_start, ',');
         if (!comma_pos) {
             return;
@@ -226,10 +302,19 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         }
         strncpy(x_str, args_start, x_len);
         x_str[x_len] = '\0';
+
+        // Ensure X is provided (not blank/whitespace-only)
+        {
+            const char *p = x_str;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p == '\0') {
+                return; // x missing; require explicit 0 per spec
+            }
+        }
         
         // Skip whitespace after comma
         const char* y_start = comma_pos + 1;
-        while (*y_start == ' ' || *y_start == '\t') {
+        while (*y_start && isspace((unsigned char)*y_start)) {
             y_start++;
         }
         
@@ -247,6 +332,15 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         }
         strncpy(y_str, y_start, y_len);
         y_str[y_len] = '\0';
+
+        // Ensure Y is provided (not blank/whitespace-only)
+        {
+            const char *p = y_str;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p == '\0') {
+                return; // y missing; require explicit 0 per spec
+            }
+        }
         
         // Convert to integers
         int x_amount = atoi(x_str);
@@ -511,7 +605,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     strncpy(button_name, cmd + 3, button_name_len);
     button_name[button_name_len] = '\0';
     
-    // Extract state value
+    // Extract state value (may be empty for getter form km.[button]())
     char state_str[8];
     size_t state_len = paren_end - paren_start - 1;
     if (state_len >= sizeof(state_str)) {
@@ -521,12 +615,25 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     strncpy(state_str, paren_start + 1, state_len);
     state_str[state_len] = '\0';
     
-    // Parse button and state
+    // Parse button name first
     kmbox_button_t button = parse_button_name(button_name);
     if (button == KMBOX_BUTTON_COUNT) {
         return; // Invalid button name
     }
-    
+
+    // Determine if this is a getter: empty or whitespace-only inside parentheses
+    {
+        const char *p = state_str;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0') {
+            // Getter: print current state (1 pressed, 0 released)
+            int pressed = g_kmbox_state.buttons[button].is_pressed ? 1 : 0;
+            printf("%d\r\n>>> ", pressed);
+            return;
+        }
+    }
+
+    // Setter path: parse explicit 0/1
     int state = atoi(state_str);
     if (state != 0 && state != 1) {
         return; // Invalid state
@@ -534,9 +641,9 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     
     // Apply the command
     set_button_state(button, state == 1, current_time_ms);
-    
-    // Send result (1 for button press/release commands)
-    printf("1\r\n>>> ");
+
+    // Per spec, echo the command then print the prompt only
+    printf(">>> ");
 }
 
 //--------------------------------------------------------------------+
@@ -1033,13 +1140,21 @@ void kmbox_update_physical_buttons(uint8_t physical_buttons)
 void kmbox_add_mouse_movement(int16_t x, int16_t y)
 {
     // Apply axis locks
+    int16_t ax = 0;
+    int16_t ay = 0;
     if (!g_kmbox_state.lock_mx) {
         g_kmbox_state.mouse_x_accumulator += x;
+        ax = x;
     }
-    
     if (!g_kmbox_state.lock_my) {
         g_kmbox_state.mouse_y_accumulator += y;
+        ay = y;
     }
+
+    // Record actual movement applied (post-lock) using the latest known time
+    // from update loop. This may lag slightly for command-initiated moves,
+    // but remains accurate within the scheduling tick.
+    record_movement_event(ax, ay, g_kmbox_state.last_update_time);
 }
 
 void kmbox_add_wheel_movement(int8_t wheel)

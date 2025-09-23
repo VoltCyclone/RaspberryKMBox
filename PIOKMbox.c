@@ -175,6 +175,9 @@ static bool initialize_system(void) {
     printf("System clock set successfully to %d kHz\n", CPU_FREQ);
     
     // Configure UART0 for debug output with non-blocking operation
+    // Set a high baud rate to reduce printf backpressure and enable FIFO
+    uart_init(uart0, STDIO_UART_BAUDRATE);
+    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(uart0, true);  // Enable FIFO for better performance
     
     // Initialize KMBox serial handler on UART1
