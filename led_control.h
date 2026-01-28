@@ -33,8 +33,23 @@ typedef enum {
     STATUS_SUSPENDED,
     STATUS_USB_RESET_PENDING,
     STATUS_USB_RESET_SUCCESS,
-    STATUS_USB_RESET_FAILED
+    STATUS_USB_RESET_FAILED,
+    // CP2110 Serial Connection Status
+    STATUS_CP2110_WAITING,
+    STATUS_CP2110_CONNECTING,
+    STATUS_CP2110_CONNECTED,
+    STATUS_CP2110_ACTIVE,
+    STATUS_CP2110_DISCONNECTED
 } system_status_t;
+
+// CP2110 Connection state (for serial handler)
+typedef enum {
+    CP2110_STATE_WAITING,       // Waiting for initial connection
+    CP2110_STATE_CONNECTING,    // Handshake in progress
+    CP2110_STATE_CONNECTED,     // Connected and ready
+    CP2110_STATE_ACTIVE,        // Actively receiving commands
+    CP2110_STATE_DISCONNECTED   // Connection lost (timeout)
+} cp2110_connection_state_t;
 
 //--------------------------------------------------------------------+
 // FUNCTION PROTOTYPES

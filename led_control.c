@@ -108,7 +108,13 @@ static const status_config_t g_status_configs[] = {
     [STATUS_SUSPENDED]            = {COLOR_SUSPENDED,            true,  "SUSPENDED"},
     [STATUS_USB_RESET_PENDING]    = {COLOR_USB_RESET_PENDING,    true,  "USB_RESET_PENDING"},
     [STATUS_USB_RESET_SUCCESS]    = {COLOR_USB_RESET_SUCCESS,    false, "USB_RESET_SUCCESS"},
-    [STATUS_USB_RESET_FAILED]     = {COLOR_USB_RESET_FAILED,     true,  "USB_RESET_FAILED"}
+    [STATUS_USB_RESET_FAILED]     = {COLOR_USB_RESET_FAILED,     true,  "USB_RESET_FAILED"},
+    // CP2110 connection states
+    [STATUS_CP2110_WAITING]       = {COLOR_CP2110_WAITING,       true,  "CP2110_WAITING"},
+    [STATUS_CP2110_CONNECTING]    = {COLOR_CP2110_CONNECTING,    false, "CP2110_CONNECTING"},
+    [STATUS_CP2110_CONNECTED]     = {COLOR_CP2110_CONNECTED,     false, "CP2110_CONNECTED"},
+    [STATUS_CP2110_ACTIVE]        = {COLOR_CP2110_ACTIVE,        false, "CP2110_ACTIVE"},
+    [STATUS_CP2110_DISCONNECTED]  = {COLOR_CP2110_DISCONNECTED,  true,  "CP2110_DISCONNECTED"}
 };
 
 //--------------------------------------------------------------------+

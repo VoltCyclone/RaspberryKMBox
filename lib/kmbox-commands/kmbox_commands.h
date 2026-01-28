@@ -52,6 +52,9 @@ typedef struct {
     // Axis lock states
     bool lock_mx;  // Lock X axis (left/right movement)
     bool lock_my;  // Lock Y axis (up/down movement)
+    
+    // Monitor mode (polling-based button state queries)
+    bool monitor_enabled;  // True if monitoring is enabled
 } kmbox_state_t;
 
 //--------------------------------------------------------------------+
@@ -113,5 +116,16 @@ const char* kmbox_get_button_name(kmbox_button_t button);
 
 // Update physical button states (call this with actual hardware button states)
 void kmbox_update_physical_buttons(uint8_t physical_buttons);
+
+// Monitor mode control (polling-based button state queries)
+void kmbox_set_monitor_enabled(bool enabled);
+bool kmbox_get_monitor_enabled(void);
+
+// Query button states (for monitor mode - returns physical button state)
+bool kmbox_isdown_left(void);
+bool kmbox_isdown_right(void);
+bool kmbox_isdown_middle(void);
+bool kmbox_isdown_side1(void);
+bool kmbox_isdown_side2(void);
 
 #endif // KMBOX_COMMANDS_H

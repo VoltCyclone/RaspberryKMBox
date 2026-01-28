@@ -23,6 +23,7 @@
 #include "init_state_machine.h"
 #include "state_management.h"
 #include "kmbox_serial_handler.h"
+#include "smooth_injection.h"
 
 #if PIO_USB_AVAILABLE
 #include "pio_usb.h"
@@ -170,18 +171,15 @@ static bool initialize_system(void) {
     
     // Re-initialize stdio after clock change with proper delay
     sleep_ms(100);  // Allow clock to stabilize
-    stdio_init_all();
-    sleep_ms(100);  // Allow UART to stabilize
-    printf("System clock set successfully to %d kHz\n", CPU_FREQ);
+    stdio_init_all();  // No-op when both UART and USB stdio are disabled
+    sleep_ms(100);  // Allow system to stabilize
     
-    // Configure UART0 for debug output with non-blocking operation
-    // Set a high baud rate to reduce printf backpressure and enable FIFO
-    uart_init(uart0, STDIO_UART_BAUDRATE);
-    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
-    uart_set_fifo_enabled(uart0, true);  // Enable FIFO for better performance
-    
-    // Initialize KMBox serial handler on UART1
+    // Initialize KMBox serial handler on UART0 (via CP2110 USB UART5 Click)
+    // Note: stdio is disabled - debug output goes through KMBox interface if needed
     kmbox_serial_init();
+    
+    // Initialize smooth injection system for seamless mouse movement blending
+    smooth_injection_init();
     
     // Initialize LED control module (neopixel power OFF for now)
     neopixel_init();

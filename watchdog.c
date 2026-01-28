@@ -120,8 +120,8 @@ static void check_inter_core_health(void) {
         g_watchdog_status.core0_responsive && g_watchdog_status.core1_responsive;
     
     // If system is unhealthy for too long, force reset
+    static uint32_t unhealthy_start_time = 0;
     if (!g_watchdog_status.system_healthy) {
-        static uint32_t unhealthy_start_time = 0;
         if (unhealthy_start_time == 0) {
             unhealthy_start_time = current_time;
         } else if (current_time - unhealthy_start_time > WATCHDOG_CORE_TIMEOUT_MS * 2) {
@@ -130,8 +130,7 @@ static void check_inter_core_health(void) {
         }
     } else {
         // Reset unhealthy timer when system becomes healthy again
-        // Reset unhealthy timer when system becomes healthy again
-        // (No action needed - timer is reset by healthy state)
+        unhealthy_start_time = 0;
     }
 }
 
