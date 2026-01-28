@@ -217,7 +217,8 @@ class UARTConfig:
 
 
 # Legacy constants for backward compatibility
-DEFAULT_BAUD_RATE = 921600  # Updated to high-speed for fast commands
+# Increase default to 2 Mbps to match KMBox firmware defaults
+DEFAULT_BAUD_RATE = 115200  # Updated to high-speed (2 Mbps)
 DEFAULT_DATA_BITS = 8
 DEFAULT_PARITY = 0  # None
 DEFAULT_STOP_BITS = 0  # 1 stop bit
@@ -232,7 +233,7 @@ CONNECTION_TIMEOUT_MS = 5000  # Connection timeout
 # FAST BINARY COMMAND PROTOCOL
 # ============================================================================
 # Ultra-fast binary protocol for minimal latency mouse/keyboard control
-# At 921600 baud: 8 bytes takes only ~87µs vs ~700µs at 115200
+# At 2 Mbps: 8 bytes takes only ~40µs vs ~700µs at 115200
 #
 # Command format (8 bytes fixed, no parsing overhead):
 #   Byte 0: Command type (FAST_CMD_*)
@@ -1016,7 +1017,7 @@ class CP2110KMBox:
         self.send_command(f"km.keyup({key})")
     
     # ========================================================================
-    # FAST BINARY COMMANDS - Ultra-low latency (~87µs per packet at 921600 baud)
+    # FAST BINARY COMMANDS - Ultra-low latency (~40µs per packet at 2 Mbps)
     # ========================================================================
     # These bypass text parsing for maximum speed. Use for:
     # - High-frequency mouse movement (gaming, drawing)
@@ -1042,7 +1043,7 @@ class CP2110KMBox:
         """
         Ultra-fast mouse movement using binary protocol.
         
-        This is ~8x faster than text commands at 921600 baud.
+        This is significantly faster than text commands at lower baud rates.
         
         Args:
             x: Horizontal movement (-32768 to 32767, clamped to -127..127 on device)
@@ -1214,7 +1215,7 @@ class CP2110KMBox:
         Smooth mouse movement using fast binary protocol.
         
         Much faster than move_smooth() - uses binary packets instead of text.
-        At 921600 baud, can achieve 1000+ updates per second.
+        At 2 Mbps, can achieve 2000+ updates per second depending on PC/bridge setup.
         
         Args:
             x: Total X movement

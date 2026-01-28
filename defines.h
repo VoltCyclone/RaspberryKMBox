@@ -14,7 +14,10 @@
 #if PICO_PLATFORM == rp2040
 #define DEFAULT_CPU_FREQ 240000
 #elif PICO_PLATFORM == rp2350
-#define DEFAULT_CPU_FREQ 120000
+// Overclock RP2350 to match RP2040 performance for real-time tracking
+// NOTE: This increases power draw and may be unstable on some boards.
+// Default increased from 120 MHz -> 240 MHz (kHz units)
+#define DEFAULT_CPU_FREQ 240000
 #endif
 
 #ifndef CPU_FREQ
@@ -41,7 +44,7 @@
 #define KMBOX_UART              uart0    // Use UART0 for KMBox (via Click Shield RX/TX pins)
 #define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to CP2110 RX)
 #define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from CP2110 TX)
-#define KMBOX_UART_BAUDRATE     921600   // High-speed baud rate for fast commands
+#define KMBOX_UART_BAUDRATE     115200  // High-speed baud rate for fast commands (2 Mbps)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
 // PIO SPI SLAVE configuration for KMBox input via MCP2210 USB-SPI Click
@@ -61,7 +64,7 @@
 // FAST BINARY COMMAND PROTOCOL
 //--------------------------------------------------------------------+
 // Ultra-fast binary protocol for minimal latency mouse/keyboard control
-// At 921600 baud: 8 bytes takes only ~87µs vs ~700µs at 115200
+// At 2 Mbps: 8 bytes takes only ~40µs vs ~700µs at 115200
 //
 // Memory-aligned 8-byte packets enable single-cycle struct access
 // Clock-synchronized processing for deterministic timing

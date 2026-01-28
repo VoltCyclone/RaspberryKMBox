@@ -51,17 +51,20 @@ static inline int8_t clamp_i8(int32_t val) {
 static void velocity_update(int8_t x, int8_t y) {
     velocity_tracker_t *v = &g_smooth.velocity;
     
-    // Store in history
+    // Get old value that will be replaced
+    int8_t old_x = v->x_history[v->history_index];
+    int8_t old_y = v->y_history[v->history_index];
+    
+    // Store new values in history
     v->x_history[v->history_index] = x;
     v->y_history[v->history_index] = y;
     v->history_index = (v->history_index + 1) % SMOOTH_VELOCITY_WINDOW;
     
-    // Calculate average velocity (simple moving average)
-    int32_t sum_x = 0, sum_y = 0;
-    for (int i = 0; i < SMOOTH_VELOCITY_WINDOW; i++) {
-        sum_x += v->x_history[i];
-        sum_y += v->y_history[i];
-    }
+    // Update running sum (remove old, add new) - O(1) instead of O(n)
+    int32_t sum_x = (v->avg_velocity_x_fp * SMOOTH_VELOCITY_WINDOW) >> SMOOTH_FP_SHIFT;
+    int32_t sum_y = (v->avg_velocity_y_fp * SMOOTH_VELOCITY_WINDOW) >> SMOOTH_FP_SHIFT;
+    sum_x = sum_x - old_x + x;
+    sum_y = sum_y - old_y + y;
     
     // Store as fixed-point average
     v->avg_velocity_x_fp = int_to_fp(sum_x) / SMOOTH_VELOCITY_WINDOW;
@@ -78,15 +81,27 @@ static smooth_queue_entry_t* queue_alloc(void) {
         return NULL;
     }
     
-    // Find an inactive slot
-    for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
-        if (!g_smooth.queue[i].active) {
-            g_smooth.queue_count++;
-            return &g_smooth.queue[i];
+    // O(1) allocation using bitmask to track free slots
+    // Check 8 slots at a time using bit operations
+    static uint32_t free_bitmap = 0xFFFFFFFF; // 1 = free, 0 = used
+    
+    if (free_bitmap == 0) {
+        // Rebuild bitmap (should rarely happen)
+        free_bitmap = 0;
+        for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
+            if (!g_smooth.queue[i].active) {
+                free_bitmap |= (1u << i);
+            }
         }
+        if (free_bitmap == 0) return NULL;
     }
     
-    return NULL;
+    // Find first free slot using count trailing zeros (CTZ)
+    int idx = __builtin_ctz(free_bitmap);
+    free_bitmap &= ~(1u << idx);
+    
+    g_smooth.queue_count++;
+    return &g_smooth.queue[idx];
 }
 
 static void queue_free(smooth_queue_entry_t *entry) {
@@ -199,6 +214,12 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
     int32_t frame_x_fp = 0;
     int32_t frame_y_fp = 0;
     
+    // Early exit if no active entries
+    if (g_smooth.queue_count == 0) {
+        goto apply_accumulator;
+    }
+    
+    // Process active entries (typically only 1-3 active at a time)
     for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
         smooth_queue_entry_t *entry = &g_smooth.queue[i];
         if (!entry->active) continue;
@@ -229,6 +250,7 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
         }
     }
     
+apply_accumulator:
     // Add sub-pixel accumulator
     frame_x_fp += g_smooth.x_accumulator_fp;
     frame_y_fp += g_smooth.y_accumulator_fp;

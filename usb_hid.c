@@ -55,24 +55,37 @@ static void utf16_to_utf8(uint16_t *utf16_buf, size_t utf16_buf_bytes, char *utf
     }
 
     size_t utf8_pos = 0;
-    for (size_t i = 0; i < code_units && utf8_pos < utf8_len - 1; i++)
+    
+    // Unroll loop by 4 for better performance (most strings are short)
+    size_t i = 0;
+    while (i + 3 < code_units && utf8_pos + 3 < utf8_len - 1) {
+        uint16_t u0 = utf16_buf[1 + i];
+        uint16_t u1 = utf16_buf[1 + i + 1];
+        uint16_t u2 = utf16_buf[1 + i + 2];
+        uint16_t u3 = utf16_buf[1 + i + 3];
+        
+        // Early exit on NUL
+        if (u0 == 0) break;
+        utf8_buf[utf8_pos++] = (u0 <= 0x7F) ? (char)u0 : '?';
+        
+        if (u1 == 0) break;
+        utf8_buf[utf8_pos++] = (u1 <= 0x7F) ? (char)u1 : '?';
+        
+        if (u2 == 0) break;
+        utf8_buf[utf8_pos++] = (u2 <= 0x7F) ? (char)u2 : '?';
+        
+        if (u3 == 0) break;
+        utf8_buf[utf8_pos++] = (u3 <= 0x7F) ? (char)u3 : '?';
+        
+        i += 4;
+    }
+    
+    // Handle remaining code units
+    for (; i < code_units && utf8_pos < utf8_len - 1; i++)
     {
-        // Code units start after the 2-byte header; our buffer is uint16_t*, so index offset is +1
         uint16_t u = utf16_buf[1 + i];
-
-        // Stop early if we hit a NUL code unit (some devices include it)
-        if (u == 0)
-            break;
-
-        if (u <= 0x7F)
-        {
-            utf8_buf[utf8_pos++] = (char)u;
-        }
-        else
-        {
-            // Non-ASCII: replace with '?'
-            utf8_buf[utf8_pos++] = '?';
-        }
+        if (u == 0) break;
+        utf8_buf[utf8_pos++] = (u <= 0x7F) ? (char)u : '?';
     }
 
     utf8_buf[utf8_pos] = '\0';
@@ -928,6 +941,17 @@ void __time_critical_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t 
             // Handle different mouse report formats
             hid_mouse_report_t mouse_report_local = {0};
             
+            // Debug: log report format on first few reports
+            static uint32_t report_count = 0;
+            if (report_count < 5) {
+                printf("Mouse report len=%d: ", len);
+                for (int i = 0; i < len && i < 12; i++) {
+                    printf("%02X ", report[i]);
+                }
+                printf("\n");
+                report_count++;
+            }
+            
             if (len == 8) {
                 // This is a 16-bit coordinate mouse (8-byte report)
                 // Format: [buttons] [pad] [pad] [pad] [x_low] [x_high] [y_low] [y_high]
@@ -961,12 +985,24 @@ void __time_critical_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t 
                 mouse_report_local.wheel = wheel_candidate;
                 mouse_report_local.pan = 0;
                 
+            } else if (len >= 3) {
+                // Standard mouse report format (3-7 bytes)
+                // Minimum format: [buttons] [x] [y]
+                // Extended: [buttons] [x] [y] [wheel] [pan] ...
+                mouse_report_local.buttons = report[0];
+                mouse_report_local.x = (int8_t)report[1];
+                mouse_report_local.y = (int8_t)report[2];
+                
+                if (len >= 4) {
+                    mouse_report_local.wheel = (int8_t)report[3];
+                }
+                if (len >= 5) {
+                    mouse_report_local.pan = (int8_t)report[4];
+                }
             } else {
-                // Standard 5-byte mouse report format
-                size_t copy_sz = len;
-                if (copy_sz > sizeof(mouse_report_local))
-                    copy_sz = sizeof(mouse_report_local);
-                memcpy(&mouse_report_local, report, copy_sz);
+                // Unknown format - skip
+                printf("Unknown mouse report format, len=%d\n", len);
+                break;
             }
 
             // Process through kmbox system (this handles movement accumulation,

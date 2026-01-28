@@ -6,8 +6,8 @@
  * 
  * FAST BINARY PROTOCOL:
  * For ultra-low latency, supports 8-byte binary packets that can be
- * processed without string parsing. At 921600 baud, an 8-byte packet
- * takes only ~87µs to transmit.
+ * processed without string parsing. At 2 Mbps, an 8-byte packet
+ * takes only ~40µs to transmit.
  *
  * MEMORY-ALIGNED PROCESSING:
  * All command structures are 4-byte aligned and exactly 8 bytes, enabling:
@@ -150,12 +150,30 @@ static bool __not_in_flash_func(process_fast_command_aligned)(const fast_cmd_uni
             
             // Non-blocking: Queue press/release reports
             // The HID polling rate will naturally space them out
-            for (uint8_t i = 0; i < count && i < 10; i++) {
-                hid_mouse_report_t report = {0};
+            // Unroll for common cases (1-3 clicks)
+            hid_mouse_report_t report = {0};
+            if (count >= 1) {
                 report.buttons = btn_mask;
                 process_mouse_report(&report);
-                
-                // Immediate release (queued for next HID frame)
+                report.buttons = 0;
+                process_mouse_report(&report);
+            }
+            if (count >= 2) {
+                report.buttons = btn_mask;
+                process_mouse_report(&report);
+                report.buttons = 0;
+                process_mouse_report(&report);
+            }
+            if (count >= 3) {
+                report.buttons = btn_mask;
+                process_mouse_report(&report);
+                report.buttons = 0;
+                process_mouse_report(&report);
+            }
+            // Handle remaining clicks (rare)
+            for (uint8_t i = 3; i < count && i < 10; i++) {
+                report.buttons = btn_mask;
+                process_mouse_report(&report);
                 report.buttons = 0;
                 process_mouse_report(&report);
             }
@@ -189,13 +207,12 @@ static bool __not_in_flash_func(process_fast_command_aligned)(const fast_cmd_uni
             hid_keyboard_report_t report = {0};
             report.modifier = c->modifiers;
             
-            // Add up to 4 keys
+            // Unroll key adding (4 keys max, most common cases are 1-2 keys)
             uint8_t key_count = 0;
-            for (int i = 0; i < 4 && key_count < 6; i++) {
-                if (c->keys[i] != 0) {
-                    report.keycode[key_count++] = c->keys[i];
-                }
-            }
+            if (c->keys[0] != 0) report.keycode[key_count++] = c->keys[0];
+            if (c->keys[1] != 0) report.keycode[key_count++] = c->keys[1];
+            if (c->keys[2] != 0) report.keycode[key_count++] = c->keys[2];
+            if (c->keys[3] != 0) report.keycode[key_count++] = c->keys[3];
             
             process_kbd_report(&report);
             

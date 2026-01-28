@@ -13,7 +13,7 @@
 // Hardware Configuration
 #define UART_TX_PIN          1        // Bridge TX → Doubler → KMBox RX
 #define UART_RX_PIN          0        // Bridge RX ← Doubler ← KMBox TX
-#define UART_BAUD            921600   // Baud rate for RP2350<->RP2040 communication
+#define UART_BAUD            115200  // Baud rate for RP2350<->RP2040 communication (2 Mbps)
 #define LED_PIN              PICO_DEFAULT_LED_PIN
 #define WS2812_PIN           PICO_DEFAULT_WS2812_PIN
 
