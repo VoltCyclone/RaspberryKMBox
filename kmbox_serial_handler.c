@@ -128,8 +128,8 @@ static bool __not_in_flash_func(process_fast_command_aligned)(const fast_cmd_uni
             
             hid_mouse_report_t report = {0};
             report.buttons = m->buttons;
-            report.x = (m->x > 127) ? 127 : ((m->x < -127) ? -127 : (int8_t)m->x);
-            report.y = (m->y > 127) ? 127 : ((m->y < -127) ? -127 : (int8_t)m->y);
+            report.x = kmbox_clamp_movement_i8(m->x);
+            report.y = kmbox_clamp_movement_i8(m->y);
             report.wheel = m->wheel;
             process_mouse_report(&report);
             
@@ -141,12 +141,8 @@ static bool __not_in_flash_func(process_fast_command_aligned)(const fast_cmd_uni
             const fast_cmd_click_t *c = &cmd->click;
             uint8_t count = c->count ? c->count : 1;
             
-            // Map button number to bit
-            static const uint8_t btn_map[] = {
-                FAST_BTN_LEFT, FAST_BTN_LEFT, FAST_BTN_RIGHT,
-                FAST_BTN_MIDDLE, FAST_BTN_BACK, FAST_BTN_FORWARD
-            };
-            uint8_t btn_mask = (c->button < 6) ? btn_map[c->button] : FAST_BTN_LEFT;
+            // Map button number to HID bit mask using library function
+            uint8_t btn_mask = kmbox_map_button_to_hid_mask(c->button);
             
             // Non-blocking: Queue press/release reports
             // The HID polling rate will naturally space them out
@@ -906,8 +902,19 @@ void kmbox_serial_task(void)
         while ((n = ringbuf_read_chunk(tmp, sizeof(tmp))) > 0) {
             // Skip if it looks like a partial fast command waiting for more bytes
             if (n > 0 && is_fast_cmd_start(tmp[0]) && n < FAST_CMD_PACKET_SIZE) {
-                // Put bytes back by adjusting tail (can't easily do this, so just process them)
-                // Actually, since fast commands should be complete above, this shouldn't happen often
+                // Re-insert bytes back into ring buffer for next time
+                for (size_t i = 0; i < n; i++) {
+                    // Calculate next head position
+                    uint16_t next_head = (uart_rx_head + 1) & UART_RX_BUFFER_MASK;
+                    if (next_head != uart_rx_tail) {
+                        uart_rx_buffer[uart_rx_head] = tmp[i];
+                        uart_rx_head = next_head;
+                    } else {
+                        // Buffer full, drop remaining bytes
+                        break;
+                    }
+                }
+                break; // Exit processing loop
             }
             
             // Update activity timestamp for any data

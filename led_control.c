@@ -644,7 +644,7 @@ void neopixel_status_task(void)
 // ACTIVITY TRIGGER FUNCTIONS
 //--------------------------------------------------------------------+
 
-static void trigger_activity_flash_internal(uint32_t color)
+void neopixel_trigger_activity_flash_color(uint32_t color)
 {
     if (!g_led_controller.initialized || !validate_color(color)) {
         return;
@@ -655,37 +655,13 @@ static void trigger_activity_flash_internal(uint32_t color)
     g_led_controller.activity_flash_color = color;
 }
 
-void neopixel_trigger_activity_flash(void)
-{
-    trigger_activity_flash_internal(COLOR_ACTIVITY_FLASH);
-}
 
-void neopixel_trigger_mouse_activity(void)
-{
-    trigger_activity_flash_internal(COLOR_MOUSE_ACTIVITY);
-}
-
-void neopixel_trigger_keyboard_activity(void)
-{
-    trigger_activity_flash_internal(COLOR_KEYBOARD_ACTIVITY);
-}
-
-void neopixel_trigger_usb_connection_flash(void)
-{
-    trigger_activity_flash_internal(COLOR_USB_CONNECTION);
-}
-
-void neopixel_trigger_usb_disconnection_flash(void)
-{
-    trigger_activity_flash_internal(COLOR_USB_DISCONNECTION);
-}
 
 void neopixel_trigger_caps_lock_flash(void)
 {
     if (!g_led_controller.initialized) {
         return;
     }
-
     g_led_controller.caps_lock_flash_active = true;
     g_led_controller.caps_lock_flash_start_time = get_current_time_ms();
 }
@@ -699,9 +675,7 @@ void neopixel_trigger_usb_reset_pending(void)
     if (!g_led_controller.initialized) {
         return;
     }
-
     neopixel_set_status_override(STATUS_USB_RESET_PENDING);
-    (void)0; // suppressed status reset pending log
 }
 
 void neopixel_trigger_usb_reset_success(void)
@@ -709,14 +683,8 @@ void neopixel_trigger_usb_reset_success(void)
     if (!g_led_controller.initialized) {
         return;
     }
-
-    // Clear any status override first
     neopixel_clear_status_override();
-    
-    // Trigger success flash
-    trigger_activity_flash_internal(COLOR_USB_RESET_SUCCESS);
-    
-    (void)0; // suppressed status reset success log
+    neopixel_trigger_activity_flash_color(COLOR_USB_RESET_SUCCESS);
 }
 
 void neopixel_trigger_usb_reset_failed(void)
@@ -724,9 +692,7 @@ void neopixel_trigger_usb_reset_failed(void)
     if (!g_led_controller.initialized) {
         return;
     }
-
     neopixel_set_status_override(STATUS_USB_RESET_FAILED);
-    (void)0; // suppressed status reset failed log
 }
 
 //--------------------------------------------------------------------+
@@ -736,14 +702,14 @@ void neopixel_trigger_usb_reset_failed(void)
 void neopixel_set_status_override(system_status_t status)
 {
     if (!g_led_controller.initialized || !validate_status(status)) {
-        (void)status; // suppressed log to avoid blocking hot paths
+        (void)status;
         return;
     }
 
     g_led_controller.status_override = status;
     g_led_controller.status_override_active = true;
 
-    (void)0; // suppressed status override log
+    (void)0;
 }
 
 void neopixel_clear_status_override(void)
@@ -753,7 +719,7 @@ void neopixel_clear_status_override(void)
     }
 
     g_led_controller.status_override_active = false;
-    (void)0; // suppressed status override cleared log
+    (void)0;
 }
 
 //--------------------------------------------------------------------+

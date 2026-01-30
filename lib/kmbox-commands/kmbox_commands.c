@@ -1312,3 +1312,81 @@ bool kmbox_isdown_side2(void)
 {
     return (g_kmbox_state.physical_buttons & 0x10) != 0;
 }
+
+//--------------------------------------------------------------------+
+// Utility Functions for Duplicate Code Consolidation
+//--------------------------------------------------------------------+
+
+uint8_t kmbox_map_button_to_hid_mask(uint8_t button_num)
+{
+    // Map button number to HID bit mask compatible with FAST_BTN_* defines
+    // This consolidates the duplicate btn_map logic from kmbox_serial_handler.c
+    static const uint8_t btn_map[] = {
+        KMBOX_HID_BTN_LEFT,     // Button 0: Left
+        KMBOX_HID_BTN_LEFT,     // Button 1: Left (duplicate mapping for compatibility)
+        KMBOX_HID_BTN_RIGHT,    // Button 2: Right  
+        KMBOX_HID_BTN_MIDDLE,   // Button 3: Middle
+        KMBOX_HID_BTN_BACK,     // Button 4: Back/Side1
+        KMBOX_HID_BTN_FORWARD   // Button 5: Forward/Side2
+    };
+    
+    return (button_num < 6) ? btn_map[button_num] : KMBOX_HID_BTN_LEFT; // Default to left button
+}
+
+int8_t kmbox_clamp_movement_i8(int16_t value)
+{
+    // Clamp to int8_t range for mouse movement (-127 to 127)
+    // Note: Using -127 instead of -128 to match existing clamping logic
+    if (value > 127) return 127;
+    if (value < -127) return -127;
+    return (int8_t)value;
+}
+
+int8_t kmbox_clamp_wheel_i8(int16_t value)
+{
+    // Clamp to int8_t range for wheel movement (-128 to 127)
+    if (value > 127) return 127;
+    if (value < -128) return -128;
+    return (int8_t)value;
+}
+
+//--------------------------------------------------------------------+
+// Command Parsing Utilities
+//--------------------------------------------------------------------+
+
+bool kmbox_parse_move_command(const char* cmd, int* x, int* y)
+{
+    if (!cmd || !x || !y) {
+        return false;
+    }
+    
+    // Check for km.move(x,y) format
+    if (strncmp(cmd, "km.move(", 8) != 0) {
+        return false;
+    }
+    
+    return sscanf(cmd, "km.move(%d,%d)", x, y) == 2;
+}
+
+bool kmbox_parse_click_command(const char* cmd, int* button)
+{
+    if (!cmd || !button) {
+        return false;
+    }
+    
+    // Check for km.click(btn) format
+    if (strncmp(cmd, "km.click(", 9) != 0) {
+        return false;
+    }
+    
+    return sscanf(cmd, "km.click(%d)", button) == 1;
+}
+
+bool kmbox_is_version_command(const char* cmd)
+{
+    if (!cmd) {
+        return false;
+    }
+    
+    return strncmp(cmd, "km.version()", 12) == 0;
+}

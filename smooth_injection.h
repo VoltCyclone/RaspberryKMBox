@@ -261,4 +261,14 @@ humanization_mode_t smooth_get_humanization_mode(void);
  */
 humanization_mode_t smooth_cycle_humanization_mode(void);
 
+/**
+ * Save current humanization mode to flash memory
+ */
+void smooth_save_humanization_mode(void);
+
+/**
+ * Load humanization mode from flash memory
+ */
+void smooth_load_humanization_mode(void);
+
 #endif // SMOOTH_INJECTION_H

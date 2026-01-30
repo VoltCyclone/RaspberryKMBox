@@ -25,6 +25,7 @@
 #include "tracker.h"
 #include "uart_tx.pio.h"
 #include "uart_rx.pio.h"
+#include "../lib/kmbox-commands/kmbox_commands.h"
 
 // PIO UART state
 static PIO pio = pio0;
@@ -60,9 +61,9 @@ static uint8_t status_buffer_idx = 0;
 typedef enum {
     KMBOX_DISCONNECTED,
     KMBOX_CONNECTED
-} kmbox_state_t;
+} kmbox_connection_state_t;
 
-static kmbox_state_t kmbox_state = KMBOX_DISCONNECTED;
+static kmbox_connection_state_t kmbox_state = KMBOX_DISCONNECTED;
 static uint32_t kmbox_last_rx_time = 0;
 static uint32_t kmbox_last_ping_time = 0;
 static uint32_t kmbox_ping_count = 0;
@@ -390,39 +391,35 @@ static uint8_t cmd_buffer_idx = 0;
 
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
-    // km.move(x,y) - relative mouse movement
-    if (strncmp(cmd, "km.move(", 8) == 0) {
-        int x, y;
-        if (sscanf(cmd, "km.move(%d,%d)", &x, &y) == 2) {
-            send_mouse_command(x, y, 0);
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("OK\r\n");
-                tud_cdc_write_flush();
-            }
+    // km.move(x,y) - relative mouse movement  
+    int x, y;
+    if (kmbox_parse_move_command(cmd, &x, &y)) {
+        send_mouse_command(x, y, 0);
+        if (tud_cdc_connected()) {
+            tud_cdc_write_str("OK\r\n");
+            tud_cdc_write_flush();
         }
         return;
     }
     
     // km.click(btn) - mouse click
-    if (strncmp(cmd, "km.click(", 9) == 0) {
-        int btn;
-        if (sscanf(cmd, "km.click(%d)", &btn) == 1) {
-            // Send click packet to KMBox
-            pio_uart_tx_byte(0x02);  // FAST_CMD_MOUSE_CLICK
-            pio_uart_tx_byte(btn);
-            pio_uart_tx_byte(1);     // count
-            for (int i = 0; i < 5; i++) pio_uart_tx_byte(0);
-            uart_tx_bytes_total += 8;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("OK\r\n");
-                tud_cdc_write_flush();
-            }
+    int btn;
+    if (kmbox_parse_click_command(cmd, &btn)) {
+        // Send click packet to KMBox
+        pio_uart_tx_byte(0x02);  // FAST_CMD_MOUSE_CLICK
+        pio_uart_tx_byte(btn);
+        pio_uart_tx_byte(1);     // count
+        for (int i = 0; i < 5; i++) pio_uart_tx_byte(0);
+        uart_tx_bytes_total += 8;
+        if (tud_cdc_connected()) {
+            tud_cdc_write_str("OK\r\n");
+            tud_cdc_write_flush();
         }
         return;
     }
     
     // km.version() - report version
-    if (strncmp(cmd, "km.version()", 12) == 0) {
+    if (kmbox_is_version_command(cmd)) {
         if (tud_cdc_connected()) {
             tud_cdc_write_str("kmbox bridge v1.0\r\n");
             tud_cdc_write_flush();

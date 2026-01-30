@@ -175,7 +175,6 @@ static bool initialize_system(void) {
     sleep_ms(100);  // Allow system to stabilize
     
     // Initialize KMBox serial handler on UART0 (via RP2350 USB Bridge)
-    // Note: stdio is disabled - debug output goes through KMBox interface if needed
     kmbox_serial_init();
     
     // Initialize smooth injection system for seamless mouse movement blending

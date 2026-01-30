@@ -22,6 +22,9 @@ add_executable(kmbox_bridge
     tracker.c
 )
 
+# Add kmbox-commands library for shared utilities
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/kmbox-commands kmbox-commands)
+
 # Generate PIO headers
 pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/uart_tx.pio)
 pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/uart_rx.pio)
@@ -30,6 +33,7 @@ target_link_libraries(kmbox_bridge
     pico_stdlib
     hardware_pio
     hardware_clocks
+    kmbox_commands
 )
 
 # Enable USB CDC output (this is our PC interface)

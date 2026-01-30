@@ -47,19 +47,6 @@
 #define KMBOX_UART_BAUDRATE     115200  // High-speed baud rate for fast commands (2 Mbps)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
-// PIO SPI SLAVE configuration for KMBox input via MCP2210 USB-SPI Click
-// Connected through Feather Click Shield mikroBUS socket 1
-// MCP2210 is SPI Master, RP2040 is SPI Slave using PIO (not hardware SPI)
-// 
-// Click Shield wiring (designed for Feather-as-master):
-//   - mikroBUS MOSI → Feather MO (GPIO15) - master sends data HERE
-//   - mikroBUS MISO ← Feather MI (GPIO8) - master expects data FROM here
-//   - mikroBUS SCK → Feather SCK (GPIO14)
-//   - mikroBUS CS → Socket 1 CS (GPIO10)
-//
-// Hardware SPI1 can't be used because:
-//   - SPI1 RX is at GPIO8, but master sends to GPIO15
-//   - SPI1 TX is at GPIO15, but master reads from GPIO8
 //--------------------------------------------------------------------+
 // FAST BINARY COMMAND PROTOCOL
 //--------------------------------------------------------------------+
@@ -105,7 +92,7 @@
 // Clock synchronization timing
 // NOTE: Actual HID frame rate depends on connected mouse's bInterval (1-8ms typical)
 // Gaming mice: 1ms (1000Hz), Standard mice: 8ms (125Hz)
-// These are defaults/fallbacks - runtime should use actual device interval
+// These are defaults/fallbacks
 #define FAST_CMD_FRAME_US_DEFAULT  1000 // Default 1ms for gaming mice (1000Hz)
 #define FAST_CMD_JITTER_US         100  // Acceptable timing jitter
 #define FAST_CMD_SYNC_INTERVAL     1000 // Sync every 1000 packets (~1 second)
@@ -251,10 +238,7 @@ _Static_assert(sizeof(fast_cmd_sync_t) == 8, "fast_cmd_sync_t must be 8 bytes");
 _Static_assert(sizeof(fast_cmd_union_t) == 8, "fast_cmd_union_t must be 8 bytes");
 _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 
-// Debug output configuration
-// Note: With KMBox on UART0, debug output goes to USB CDC (if enabled) or is disabled
-// Set to 1 to enable USB CDC debug output, 0 to disable debug entirely
-#define DEBUG_OUTPUT_USB_CDC    0        // Enable debug output via USB CDC
+#define DEBUG_OUTPUT_USB_CDC    0        // Always disable debug output over USB CDC
 
 // USB port configuration
 #define USB_DEVICE_PORT         0       // On-board USB controller port (device mode)
@@ -374,10 +358,6 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 #define CONFIG_TOTAL_LEN                (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
 #define EPNUM_HID                       HID_ENDPOINT_ADDRESS
 
-// HID report descriptor length is always patched at runtime to match the
-// constructed runtime HID report descriptor which mirrors the attached host
-// mouse. No compile-time static length is used.
-
 //--------------------------------------------------------------------+
 // HID CONFIGURATION
 //--------------------------------------------------------------------+
@@ -413,16 +393,7 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 // Mouse button masks
 #define MOUSE_BUTTON_NONE               0x00    // No mouse buttons pressed
 
-//--------------------------------------------------------------------+
-// SERIAL STRING CONFIGURATION
-//--------------------------------------------------------------------+
 
-#define SERIAL_STRING_LENGTH            16      // 16 hex characters for unique ID
-#define SERIAL_STRING_BUFFER_SIZE       17      // 16 chars + null terminator
-#define SERIAL_HEX_CHARS_PER_BYTE       2       // 2 hex characters per byte
-#define SERIAL_SNPRINTF_BUFFER_SIZE     3       // Buffer size for snprintf formatting
-
-//--------------------------------------------------------------------+
 // STRING DESCRIPTOR PROCESSING
 //--------------------------------------------------------------------+
 

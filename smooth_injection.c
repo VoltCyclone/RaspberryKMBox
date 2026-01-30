@@ -22,6 +22,9 @@
 #define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define HUMANIZATION_MAGIC 0x484D414E  // "HMAN"
 
+// Forward declaration for internal use
+static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool auto_save);
+
 
 // Global state
 static smooth_injection_state_t g_smooth = {0};
@@ -224,8 +227,8 @@ void smooth_injection_init(void) {
     uint64_t time_us = time_us_64();
     rng_seed((uint32_t)(time_us ^ (time_us >> 32)));
     
-    // Set default humanization mode to MEDIUM
-    smooth_set_humanization_mode(HUMANIZATION_MEDIUM);
+    // Load saved humanization mode, or use default if none saved
+    smooth_load_humanization_mode();
 }
 
 bool smooth_inject_movement(int16_t x, int16_t y, inject_mode_t mode) {
@@ -520,9 +523,10 @@ bool smooth_has_pending(void) {
     return false;
 }
 
-void smooth_set_humanization_mode(humanization_mode_t mode) {
+static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool auto_save) {
     if (mode >= HUMANIZATION_MODE_COUNT) mode = HUMANIZATION_MEDIUM;
     
+    humanization_mode_t old_mode = g_smooth.humanization.mode;
     g_smooth.humanization.mode = mode;
     
     switch (mode) {
@@ -575,9 +579,18 @@ void smooth_set_humanization_mode(humanization_mode_t mode) {
             break;
             
         default:
-            smooth_set_humanization_mode(HUMANIZATION_MEDIUM);
-            break;
+            smooth_set_humanization_mode_internal(HUMANIZATION_MEDIUM, auto_save);
+            return;
     }
+    
+    // Save to flash if mode actually changed and auto_save is enabled
+    if (auto_save && old_mode != mode) {
+        smooth_save_humanization_mode();
+    }
+}
+
+void smooth_set_humanization_mode(humanization_mode_t mode) {
+    smooth_set_humanization_mode_internal(mode, true);
 }
 
 humanization_mode_t smooth_get_humanization_mode(void) {
@@ -599,17 +612,33 @@ void smooth_save_humanization_mode(void) {
         .checksum = HUMANIZATION_MAGIC ^ g_smooth.humanization.mode
     };
     
+    // Ensure data structure is properly aligned and sized for flash
+    static_assert(sizeof(humanization_persist_t) <= FLASH_SECTOR_SIZE, "Data too large for flash sector");
+    static_assert((sizeof(humanization_persist_t) % 4) == 0, "Data must be 4-byte aligned for flash");
+    
     uint32_t ints = save_and_disable_interrupts();
+    
+    // Erase the sector (required before programming)
     flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
+    
+    // Program the data
     flash_range_program(FLASH_TARGET_OFFSET, (uint8_t*)&data, sizeof(data));
+    
     restore_interrupts(ints);
 }
 
 void smooth_load_humanization_mode(void) {
-    humanization_persist_t *data = (humanization_persist_t*)(XIP_BASE + FLASH_TARGET_OFFSET);
+    const humanization_persist_t *data = (const humanization_persist_t*)(XIP_BASE + FLASH_TARGET_OFFSET);
+    
+    // Validate magic number, checksum, and mode range
     if (data->magic == HUMANIZATION_MAGIC && 
         data->checksum == (HUMANIZATION_MAGIC ^ data->mode) &&
         data->mode < HUMANIZATION_MODE_COUNT) {
-        smooth_set_humanization_mode(data->mode);
+        
+        // Load without auto-save to avoid recursion
+        smooth_set_humanization_mode_internal(data->mode, false);
+    } else {
+        // No valid data found, use default (without auto-save during init)
+        smooth_set_humanization_mode_internal(HUMANIZATION_MEDIUM, false);
     }
 }
