@@ -14,13 +14,20 @@
 
 #include "smooth_injection.h"
 #include "pico/stdlib.h"
+#include <stdio.h>
 #include <string.h>
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "pico/multicore.h"
 
 // Persist state
 #define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define HUMANIZATION_MAGIC 0x484D414E  // "HMAN"
+
+// Deferred flash save state (to avoid crashing multicore during button press)
+static volatile bool g_save_pending = false;
+static volatile uint32_t g_save_request_time = 0;
+#define SAVE_DEFER_MS 2000  // Wait 2 seconds after last mode change before saving
 
 // Forward declaration for internal use
 static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool auto_save);
@@ -584,8 +591,10 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
     }
     
     // Save to flash if mode actually changed and auto_save is enabled
+    // NOTE: We defer the save to avoid flash write issues with multicore
     if (auto_save && old_mode != mode) {
-        smooth_save_humanization_mode();
+        g_save_pending = true;
+        g_save_request_time = to_ms_since_boot(get_absolute_time());
     }
 }
 
@@ -604,8 +613,12 @@ humanization_mode_t smooth_cycle_humanization_mode(void) {
 }
 
 // save smooth state to flash
+// WARNING: Flash operations on RP2040 with multicore require careful coordination
+// We use a lockout flag to coordinate with Core1
+extern volatile bool g_flash_operation_in_progress;
 
-void smooth_save_humanization_mode(void) {
+// Internal flash save - called from smooth_process_deferred_save when safe
+static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
     humanization_persist_t data = {
         .magic = HUMANIZATION_MAGIC,
         .mode = g_smooth.humanization.mode,
@@ -625,6 +638,37 @@ void smooth_save_humanization_mode(void) {
     flash_range_program(FLASH_TARGET_OFFSET, (uint8_t*)&data, sizeof(data));
     
     restore_interrupts(ints);
+}
+
+void smooth_save_humanization_mode(void) {
+    // Request deferred save instead of immediate save
+    g_save_pending = true;
+    g_save_request_time = to_ms_since_boot(get_absolute_time());
+}
+
+// Call this periodically from main loop when Core1 is in a safe state
+void smooth_process_deferred_save(void) {
+    if (!g_save_pending) return;
+    
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    // Wait for the defer period to allow rapid button presses
+    if ((current_time - g_save_request_time) < SAVE_DEFER_MS) return;
+    
+    // Signal Core1 to pause - it checks this flag in its tight loop
+    g_flash_operation_in_progress = true;
+    
+    // Small delay to let Core1 notice and pause
+    sleep_ms(5);
+    
+    // Now perform the flash write
+    smooth_save_humanization_mode_internal();
+    
+    // Allow Core1 to resume
+    g_flash_operation_in_progress = false;
+    
+    g_save_pending = false;
+    printf("Humanization mode saved to flash\n");
 }
 
 void smooth_load_humanization_mode(void) {

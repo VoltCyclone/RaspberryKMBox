@@ -280,18 +280,35 @@ static inline bool send_uart_packet(const uint8_t* data, size_t len) {
 // UART RX Processing - Status Messages from KMBox
 // ============================================================================
 
+// UART statistics (declared here so process_status_message can use them)
+static uint32_t uart_rx_bytes_total = 0;
+static uint32_t uart_tx_bytes_total = 0;
+static uint32_t text_messages_received = 0;
+static uint32_t binary_packets_received = 0;
+
+// Debug: track byte types received
+static uint32_t rx_printable_chars = 0;
+static uint32_t rx_control_chars = 0;
+static uint32_t rx_binary_start = 0;
+static uint32_t rx_newlines = 0;
+
 static void process_status_message(const char* msg, size_t len) {
+    text_messages_received++;
+    
     // Check for handshake response
     if (len >= 11 && strncmp(msg, "KMBOX_READY", 11) == 0) {
         if (kmbox_state != KMBOX_CONNECTED) {
             kmbox_state = KMBOX_CONNECTED;
             kmbox_response_count++;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("[Bridge] KMBox connected (handshake OK)\r\n");
-                tud_cdc_write_flush();
-            }
         }
-        return;  // Don't echo handshake messages
+        // Still forward handshake message
+        if (tud_cdc_connected()) {
+            tud_cdc_write_str("[KMBox] ");
+            tud_cdc_write(msg, len);
+            tud_cdc_write_str("\r\n");
+            tud_cdc_write_flush();
+        }
+        return;
     }
     
     // Check for pong response  
@@ -300,11 +317,11 @@ static void process_status_message(const char* msg, size_t len) {
             kmbox_state = KMBOX_CONNECTED;
             kmbox_response_count++;
         }
-        // Don't echo pong messages
+        // Don't echo pong messages (too frequent)
         return;
     }
     
-    // Forward other status messages to CDC
+    // Forward ALL other status messages to CDC
     if (tud_cdc_connected()) {
         tud_cdc_write_str("[KMBox] ");
         tud_cdc_write(msg, len);
@@ -313,25 +330,44 @@ static void process_status_message(const char* msg, size_t len) {
     }
 }
 
-static uint32_t uart_rx_bytes_total = 0;
-static uint32_t uart_tx_bytes_total = 0;
-
 static void uart_rx_task(void) {
-    uint32_t now = to_ms_since_boot(get_absolute_time());
     static uint8_t binary_packet[8];
     static uint8_t binary_idx = 0;
     static bool in_binary_packet = false;
+    static uint32_t binary_packet_start_time = 0;
     
-    while (pio_uart_rx_available()) {
+    // Batch process up to 64 bytes per call to avoid blocking too long
+    uint8_t batch_count = 0;
+    while (pio_uart_rx_available() && batch_count < 64) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
         uint8_t c = pio_uart_rx_getc();
         uart_rx_bytes_total++;
+        batch_count++;
         kmbox_last_rx_time = now;  // Track last RX time
+        
+        // Debug: categorize received bytes
+        if (c == 0xFF || c == 0xFE) {
+            rx_binary_start++;
+        } else if (c == '\n' || c == '\r') {
+            rx_newlines++;
+        } else if (c >= 0x20 && c < 0x7F) {
+            rx_printable_chars++;
+        } else {
+            rx_control_chars++;
+        }
+        
+        // Reset binary packet state if timeout (stuck packet)
+        if (in_binary_packet && (now - binary_packet_start_time) > 100) {
+            in_binary_packet = false;
+            binary_idx = 0;
+        }
         
         // Check for start of binary response packet (0xFF or 0xFE from KMBox)
         if (!in_binary_packet && (c == 0xFF || c == 0xFE)) {
             in_binary_packet = true;
             binary_idx = 0;
             binary_packet[binary_idx++] = c;
+            binary_packet_start_time = now;
             continue;
         }
         
@@ -340,6 +376,7 @@ static void uart_rx_task(void) {
             binary_packet[binary_idx++] = c;
             if (binary_idx >= 8) {
                 // Complete packet received - forward to PC and process
+                binary_packets_received++;
                 if (binary_packet[0] == 0xFF) {
                     kmbox_response_count++;
                     
@@ -369,6 +406,9 @@ static void uart_rx_task(void) {
         } else if (c >= 0x20 && c < 0x7F) {  // Printable ASCII only
             if (status_buffer_idx < STATUS_BUFFER_SIZE - 1) {
                 status_buffer[status_buffer_idx++] = c;
+            } else {
+                // Buffer overflow - reset
+                status_buffer_idx = 0;
             }
         }
         // Ignore other non-printable bytes
@@ -451,10 +491,12 @@ static void uart_debug_task(void) {
         if (tud_cdc_connected()) {
             const char* state_str = (kmbox_state == KMBOX_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
             
-            char debug_msg[128];
+            char debug_msg[200];
             snprintf(debug_msg, sizeof(debug_msg), 
-                     "[Bridge] %s | TX: %lu | RX: %lu bytes\r\n", 
-                     state_str, uart_tx_bytes_total, uart_rx_bytes_total);
+                     "[Bridge] %s | TX:%lu RX:%lu | Print:%lu Ctrl:%lu NL:%lu Bin:%lu | Msg:%lu Pkt:%lu\r\n", 
+                     state_str, uart_tx_bytes_total, uart_rx_bytes_total,
+                     rx_printable_chars, rx_control_chars, rx_newlines, rx_binary_start,
+                     text_messages_received, binary_packets_received);
             tud_cdc_write_str(debug_msg);
             tud_cdc_write_flush();
         }

@@ -57,6 +57,11 @@ typedef struct {
 static const uint32_t WATCHDOG_STATUS_INTERVAL_MS = WATCHDOG_STATUS_REPORT_INTERVAL_MS;
 
 //--------------------------------------------------------------------+
+// Global state for flash operation coordination
+//--------------------------------------------------------------------+
+volatile bool g_flash_operation_in_progress = false;
+
+//--------------------------------------------------------------------+
 // Function Prototypes
 //--------------------------------------------------------------------+
 
@@ -135,6 +140,14 @@ static void core1_task_loop(void) {
     const uint32_t heartbeat_check_threshold = CORE1_HEARTBEAT_CHECK_LOOPS * 4; // 4x less frequent
     
     while (true) {
+        // CRITICAL: Pause during flash operations to prevent crash
+        // This runs from RAM so it's safe even while flash is being written
+        while (g_flash_operation_in_progress) {
+            // Just spin - flash write is very fast (~5ms)
+            // DO NOT call any functions here that might be in flash
+            tight_loop_contents();
+        }
+        
         tuh_task();
         
         // Heartbeat check optimization - much less frequent timing calls
@@ -408,6 +421,10 @@ static void main_application_loop(void) {
         
         if (task_flags & STATUS_FLAG) {
             report_watchdog_status(current_time, &state->watchdog_status_timer);
+            
+            // Process deferred flash saves (checks internally if needed)
+            // Run at status report interval (~10s) since flash save is deferred anyway
+            smooth_process_deferred_save();
         }
     }
 }

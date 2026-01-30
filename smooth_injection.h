@@ -263,6 +263,7 @@ humanization_mode_t smooth_cycle_humanization_mode(void);
 
 /**
  * Save current humanization mode to flash memory
+ * NOTE: This now schedules a deferred save to avoid multicore flash issues
  */
 void smooth_save_humanization_mode(void);
 
@@ -270,5 +271,12 @@ void smooth_save_humanization_mode(void);
  * Load humanization mode from flash memory
  */
 void smooth_load_humanization_mode(void);
+
+/**
+ * Process deferred flash saves
+ * Call this periodically from main loop (safe to call frequently)
+ * Performs the actual flash write when conditions are met
+ */
+void smooth_process_deferred_save(void);
 
 #endif // SMOOTH_INJECTION_H
