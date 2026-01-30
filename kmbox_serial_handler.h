@@ -50,6 +50,9 @@
 // Initialize the serial handler
 void kmbox_serial_init(void);
 
+// Initialize DMA for UART TX and RX (call after USB is fully initialized)
+void kmbox_serial_init_dma(void);
+
 // Process any available serial input (call this in main loop)
 void kmbox_serial_task(void);
 

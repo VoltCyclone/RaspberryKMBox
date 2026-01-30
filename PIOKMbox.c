@@ -337,6 +337,10 @@ static void main_application_loop(void) {
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     uint16_t loop_counter = 0;
     
+    // Initialize DMA after a delay to ensure USB is fully stable
+    bool dma_initialized = false;
+    uint32_t boot_complete_time = current_time;
+    
     // Batch time checks with bit flags for efficiency
     uint8_t task_flags = 0;
     #define WATCHDOG_FLAG   (1 << 0)
@@ -348,6 +352,12 @@ static void main_application_loop(void) {
         // TinyUSB device task - highest priority
         tud_task();
         hid_device_task();
+        
+        // Initialize DMA after 3 seconds of stable USB operation
+        if (!dma_initialized && (current_time - boot_complete_time) > 3000) {
+            kmbox_serial_init_dma();
+            dma_initialized = true;
+        }
         
         // KMBox serial task - high priority for responsiveness
         kmbox_serial_task();

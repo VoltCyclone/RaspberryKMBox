@@ -31,6 +31,7 @@
 #include "hardware/uart.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
+#include "hardware/dma.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -438,6 +439,35 @@ static uint32_t g_last_data_time_ms = 0;
 static uint32_t g_last_heartbeat_check_ms = 0;
 static bool g_connection_led_updated = false;
 
+//--------------------------------------------------------------------+
+// UART TX DMA Configuration (Post-Boot Optimization)
+//--------------------------------------------------------------------+
+
+// DMA state - only initialized after USB is running
+static bool uart_tx_dma_initialized = false;
+static int uart_tx_dma_chan = -1;
+static volatile bool tx_dma_busy = false;
+
+static bool uart_rx_dma_initialized = false;
+static int uart_rx_dma_chan = -1;
+
+// Double-buffered TX DMA for zero-wait non-blocking transmission
+#define UART_TX_DMA_BUFFER_SIZE 512
+static uint8_t __attribute__((aligned(4))) uart_tx_dma_buffer_a[UART_TX_DMA_BUFFER_SIZE];
+static uint8_t __attribute__((aligned(4))) uart_tx_dma_buffer_b[UART_TX_DMA_BUFFER_SIZE];
+static volatile uint16_t tx_buffer_a_len = 0;
+static volatile uint16_t tx_buffer_b_len = 0;
+static volatile uint8_t active_tx_buffer = 0;  // 0=A, 1=B
+
+// RX DMA buffer for continuous circular reception
+#define UART_RX_DMA_BUFFER_SIZE 1024
+static uint8_t __attribute__((aligned(4))) uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
+static volatile uint16_t uart_rx_dma_read_pos = 0;
+
+//--------------------------------------------------------------------+
+// UART RX Ring Buffer
+//--------------------------------------------------------------------+
+
 // Ring buffer for non-blocking UART reception
 // Use power-of-2 size for efficient modulo operation
 // Memory is plentiful: use a large buffer to minimize overflow/drops
@@ -446,6 +476,25 @@ static bool g_connection_led_updated = false;
 static volatile uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE];
 static volatile uint16_t uart_rx_head = 0;
 static volatile uint16_t uart_rx_tail = 0;
+
+//--------------------------------------------------------------------+
+// UART TX DMA Interrupt Handler (Post-Boot)
+//--------------------------------------------------------------------+
+
+// DMA completion handler for UART TX (placed in RAM for low latency)
+static void __not_in_flash_func(uart_tx_dma_handler)(void) {
+    // Clear interrupt for our channel on IRQ_1
+    if (uart_tx_dma_chan >= 0) {
+        dma_hw->ints1 = 1u << uart_tx_dma_chan;
+    }
+    
+    // Mark TX as no longer busy - next transmission can proceed
+    tx_dma_busy = false;
+}
+
+//--------------------------------------------------------------------+
+// UART RX Interrupt Handler
+//--------------------------------------------------------------------+
 
 // UART RX interrupt handler for high-performance non-blocking reception
 // Place in RAM to avoid XIP stalls during heavy serial traffic
@@ -620,6 +669,97 @@ void kmbox_serial_init(void)
 }
 
 //--------------------------------------------------------------------+
+// Post-Boot DMA Initialization
+//--------------------------------------------------------------------+
+
+// Initialize UART TX and RX DMA after USB is fully running
+// This avoids boot-time conflicts with USB/PIO initialization
+void kmbox_serial_init_dma(void) {
+    if (uart_tx_dma_initialized && uart_rx_dma_initialized) {
+        printf("UART DMA already initialized\n");
+        return;
+    }
+    
+    printf("Initializing UART DMA (post-boot)...\n");
+    
+    // Try to claim DMA channel without panicking
+    uart_tx_dma_chan = dma_claim_unused_channel(false); // false = don't panic
+    if (uart_tx_dma_chan < 0) {
+        printf("No DMA channels available, UART will use blocking TX\n");
+        return;
+    }
+    
+    dma_channel_config c = dma_channel_get_default_config(uart_tx_dma_chan);
+    
+    // Configure for 8-bit transfers from memory to UART TX FIFO
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_read_increment(&c, true);   // Increment read address
+    channel_config_set_write_increment(&c, false); // Fixed write to UART DR
+    channel_config_set_dreq(&c, uart_get_dreq(KMBOX_UART, true)); // TX DREQ
+    
+    // Set high priority for low latency
+    channel_config_set_high_priority(&c, true);
+    
+    // Apply configuration (but don't start yet)
+    dma_channel_configure(
+        uart_tx_dma_chan,
+        &c,
+        &uart_get_hw(KMBOX_UART)->dr,  // Write to UART data register
+        NULL,  // Read address set per transfer
+        0,     // Transfer count set per transfer
+        false  // Don't start yet
+    );
+    
+    // Enable DMA completion interrupt on DMA_IRQ_1 (avoid IRQ_0 conflicts)
+    dma_channel_set_irq1_enabled(uart_tx_dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_1, uart_tx_dma_handler);
+    irq_set_priority(DMA_IRQ_1, 0x80); // Lower priority
+    irq_set_enabled(DMA_IRQ_1, true);
+    
+    uart_tx_dma_initialized = true;
+    printf("UART TX DMA initialized on channel %d\n", uart_tx_dma_chan);
+    
+    // Initialize RX DMA for continuous circular reception
+    uart_rx_dma_chan = dma_claim_unused_channel(false);
+    if (uart_rx_dma_chan < 0) {
+        printf("No DMA channel for RX, using interrupt mode\n");
+        kmbox_send_status("DMA TX enabled");
+        return;
+    }
+    
+    dma_channel_config rx_config = dma_channel_get_default_config(uart_rx_dma_chan);
+    
+    // Configure for 8-bit transfers from UART RX FIFO to memory
+    channel_config_set_transfer_data_size(&rx_config, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx_config, false);  // Fixed read from UART DR
+    channel_config_set_write_increment(&rx_config, true);  // Increment write address
+    channel_config_set_dreq(&rx_config, uart_get_dreq(KMBOX_UART, false)); // RX DREQ
+    
+    // Enable ring buffer mode for circular reception
+    channel_config_set_ring(&rx_config, true, 10); // 2^10 = 1024 bytes ring on write
+    
+    // High priority for low latency
+    channel_config_set_high_priority(&rx_config, true);
+    
+    // Configure and start continuous circular DMA
+    dma_channel_configure(
+        uart_rx_dma_chan,
+        &rx_config,
+        uart_rx_dma_buffer,                    // Write to DMA buffer
+        &uart_get_hw(KMBOX_UART)->dr,         // Read from UART data register
+        UART_RX_DMA_BUFFER_SIZE,              // Transfer entire buffer
+        true                                   // Start immediately
+    );
+    
+    // Disable UART RX interrupt since DMA is handling it
+    uart_set_irq_enables(KMBOX_UART, false, false);
+    
+    uart_rx_dma_initialized = true;
+    printf("UART RX DMA initialized on channel %d (circular buffer)\n", uart_rx_dma_chan);
+    kmbox_send_status("DMA TX+RX enabled");
+}
+
+//--------------------------------------------------------------------+
 // Connection State Management
 //--------------------------------------------------------------------+
 
@@ -638,14 +778,98 @@ bool kmbox_is_connected(void) {
 // Status Message Transmission to Bridge
 //--------------------------------------------------------------------+
 
+//--------------------------------------------------------------------+
+// Non-blocking UART TX using DMA (Post-Boot only)
+//--------------------------------------------------------------------+
+
+// Send data via UART using DMA with double-buffering
+// Returns true if queued successfully, false if both buffers full
+static bool uart_send_dma(const uint8_t* data, uint16_t len) {
+    // Check if DMA is initialized
+    if (!uart_tx_dma_initialized || uart_tx_dma_chan < 0 || len == 0 || len > UART_TX_DMA_BUFFER_SIZE) {
+        // Fallback to blocking TX if DMA not ready or data too large
+        for (uint16_t i = 0; i < len; i++) {
+            uart_putc_raw(KMBOX_UART, data[i]);
+        }
+        return true;
+    }
+    
+    // If DMA is busy, queue to inactive buffer (double-buffering)
+    if (tx_dma_busy) {
+        uint8_t inactive_buffer = 1 - active_tx_buffer;
+        volatile uint16_t* inactive_len = (inactive_buffer == 0) ? &tx_buffer_a_len : &tx_buffer_b_len;
+        
+        // Check if inactive buffer has space
+        if (*inactive_len + len > UART_TX_DMA_BUFFER_SIZE) {
+            return false; // Both buffers full, drop data
+        }
+        
+        // Queue to inactive buffer
+        uint8_t* inactive_buf = (inactive_buffer == 0) ? uart_tx_dma_buffer_a : uart_tx_dma_buffer_b;
+        memcpy(inactive_buf + *inactive_len, data, len);
+        *inactive_len += len;
+        return true;
+    }
+    
+    // DMA idle, start immediate transfer
+    uint8_t* active_buf = (active_tx_buffer == 0) ? uart_tx_dma_buffer_a : uart_tx_dma_buffer_b;
+    memcpy(active_buf, data, len);
+    
+    tx_dma_busy = true;
+    
+    // Start DMA transfer
+    dma_channel_transfer_from_buffer_now(uart_tx_dma_chan, active_buf, len);
+    
+    return true;
+}
+
+// Process queued TX buffer (called from main loop)
+static inline void process_uart_tx_queue(void) {
+    if (!uart_tx_dma_initialized || tx_dma_busy || uart_tx_dma_chan < 0) return;
+    
+    // Check if inactive buffer has pending data
+    uint8_t inactive_buffer = 1 - active_tx_buffer;
+    volatile uint16_t* inactive_len = (inactive_buffer == 0) ? &tx_buffer_a_len : &tx_buffer_b_len;
+    
+    if (*inactive_len > 0) {
+        // Swap buffers and transmit queued data
+        active_tx_buffer = inactive_buffer;
+        uint8_t* active_buf = (active_tx_buffer == 0) ? uart_tx_dma_buffer_a : uart_tx_dma_buffer_b;
+        uint16_t len = *inactive_len;
+        
+        *inactive_len = 0; // Clear queued length
+        tx_dma_busy = true;
+        
+        dma_channel_transfer_from_buffer_now(uart_tx_dma_chan, active_buf, len);
+    }
+}
+
 // Send status message to bridge via UART TX
 // This allows the bridge to display KMBox status on its CDC interface
 void kmbox_send_status(const char* message) {
     if (message == NULL) return;
     
-    // Send message over UART (non-blocking)
-    uart_puts(KMBOX_UART, message);
-    uart_putc(KMBOX_UART, '\n');
+    // Try DMA if initialized, otherwise use blocking
+    if (uart_tx_dma_initialized) {
+        size_t len = strlen(message);
+        if (len > UART_TX_DMA_BUFFER_SIZE - 2) {
+            len = UART_TX_DMA_BUFFER_SIZE - 2;
+        }
+        
+        uint8_t buffer[UART_TX_DMA_BUFFER_SIZE];
+        memcpy(buffer, message, len);
+        buffer[len++] = '\n';
+        
+        if (!uart_send_dma(buffer, len)) {
+            // Fallback to blocking if DMA buffers full
+            uart_puts(KMBOX_UART, message);
+            uart_putc(KMBOX_UART, '\n');
+        }
+    } else {
+        // DMA not initialized yet, use blocking
+        uart_puts(KMBOX_UART, message);
+        uart_putc(KMBOX_UART, '\n');
+    }
 }
 
 // Send a response string back to the PC
@@ -653,10 +877,27 @@ void kmbox_send_response(const char *response) {
     if (!response) return;
     
     size_t len = strlen(response);
-    for (size_t i = 0; i < len; i++) {
-        uart_putc_raw(KMBOX_UART, response[i]);
+    
+    // Try DMA if initialized
+    if (uart_tx_dma_initialized && len < UART_TX_DMA_BUFFER_SIZE - 2) {
+        uint8_t buffer[UART_TX_DMA_BUFFER_SIZE];
+        memcpy(buffer, response, len);
+        buffer[len++] = '\n';
+        
+        if (!uart_send_dma(buffer, len)) {
+            // Fallback to blocking if DMA buffers full
+            for (size_t i = 0; i < len - 1; i++) {
+                uart_putc_raw(KMBOX_UART, response[i]);
+            }
+            uart_putc_raw(KMBOX_UART, '\n');
+        }
+    } else {
+        // DMA not initialized or message too long, use blocking
+        for (size_t i = 0; i < len; i++) {
+            uart_putc_raw(KMBOX_UART, response[i]);
+        }
+        uart_putc_raw(KMBOX_UART, '\n');
     }
-    uart_putc_raw(KMBOX_UART, '\n');
 }
 
 // Update connection state and LED indicator
@@ -813,6 +1054,31 @@ void kmbox_serial_task(void)
 {
     // Get current time
     uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
+    
+    // Process UART TX DMA queue if initialized
+    if (uart_tx_dma_initialized) {
+        process_uart_tx_queue();
+    }
+    
+    // Read from DMA buffer if RX DMA is active
+    if (uart_rx_dma_initialized) {
+        // Get current DMA write position
+        uint16_t dma_write_pos = UART_RX_DMA_BUFFER_SIZE - dma_channel_hw_addr(uart_rx_dma_chan)->transfer_count;
+        
+        // Process all available bytes in circular buffer
+        while (uart_rx_dma_read_pos != dma_write_pos) {
+            uint8_t byte = uart_rx_dma_buffer[uart_rx_dma_read_pos];
+            
+            // Copy to ring buffer for command processing
+            uint16_t next_head = (uart_rx_head + 1) & UART_RX_BUFFER_MASK;
+            if (next_head != uart_rx_tail) {
+                uart_rx_buffer[uart_rx_head] = byte;
+                uart_rx_head = next_head;
+            }
+            
+            uart_rx_dma_read_pos = (uart_rx_dma_read_pos + 1) & (UART_RX_DMA_BUFFER_SIZE - 1);
+        }
+    }
     
     // Send periodic ping to bridge every 2 seconds for testing
     if (current_time_ms - last_kmbox_ping_time > 2000) {

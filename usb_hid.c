@@ -249,9 +249,6 @@ static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol)
 static bool process_keyboard_report_internal(const hid_keyboard_report_t *report);
 static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 
-// Debug and logging helpers
-static void print_device_info(uint8_t dev_addr, const tusb_desc_device_t *desc);
-
 // --- Runtime HID descriptor mirroring storage & helpers ---
 #define HID_DESC_BUF_SIZE 256
 
@@ -435,7 +432,7 @@ static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol)
     neopixel_update_status();
 }
 
-static bool __time_critical_func(process_keyboard_report_internal)(const hid_keyboard_report_t *report)
+static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyboard_report_t *report)
 {
     if (report == NULL)
     {
@@ -455,7 +452,7 @@ static bool __time_critical_func(process_keyboard_report_internal)(const hid_key
     }
 }
 
-static bool __time_critical_func(process_mouse_report_internal)(const hid_mouse_report_t *report)
+static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_report_t *report)
 {
     if (report == NULL)
     {
@@ -523,7 +520,7 @@ static bool __time_critical_func(process_mouse_report_internal)(const hid_mouse_
     return success;
 }
 
-void __time_critical_func(process_kbd_report)(const hid_keyboard_report_t *report)
+void __not_in_flash_func(process_kbd_report)(const hid_keyboard_report_t *report)
 {
     if (report == NULL)
     {
@@ -543,7 +540,7 @@ void __time_critical_func(process_kbd_report)(const hid_keyboard_report_t *repor
     }
 }
 
-void __time_critical_func(process_mouse_report)(const hid_mouse_report_t *report)
+void __not_in_flash_func(process_mouse_report)(const hid_mouse_report_t *report)
 {
     if (report == NULL)
     {
@@ -856,7 +853,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
     neopixel_update_status();
 }
 
-void __time_critical_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len)
+void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len)
 {
     if (report == NULL || len == 0)
     {
@@ -870,90 +867,54 @@ void __time_critical_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t 
     switch (itf_protocol)
     {
     case HID_ITF_PROTOCOL_KEYBOARD:
-        // Ensure we have a full keyboard report before processing. Copy to a
-        // local structure to avoid alignment and aliasing issues coming from
-        // the USB buffer.
+        // Process directly from USB buffer - it's already aligned
         if (len >= (int)sizeof(hid_keyboard_report_t))
         {
-            hid_keyboard_report_t kbd_report;
-            memcpy(&kbd_report, report, sizeof(kbd_report));
-            process_kbd_report(&kbd_report);
+            process_kbd_report((const hid_keyboard_report_t*)report);
         }
         break;
 
     case HID_ITF_PROTOCOL_MOUSE:
-        // Process mouse reports through kmbox system instead of raw forwarding
-        if (len > 0)
+        // Process mouse reports through kmbox system - optimize for zero-copy
+        if (len >= 3)
         {
-            // Handle different mouse report formats
-            hid_mouse_report_t mouse_report_local = {0};
-            
-            // Debug: Print first few mouse reports for analysis (limit to first 5 reports)
-            static uint32_t report_count = 0;
-            if (report_count < 5) {
-                printf("Mouse report len=%d: ", len);
-                for (int i = 0; i < len && i < 12; i++) {
-                    printf("%02X ", report[i]);
-                }
-                printf("\n");
-                report_count++;
-            }
+            // Stack-allocated report for fast processing (no heap)
+            hid_mouse_report_t mouse_report_local;
             
             if (len == 8) {
-                // This is a 16-bit coordinate mouse (8-byte report)
-                // Format: [buttons] [pad] [pad] [pad] [x_low] [x_high] [y_low] [y_high]
+                // 16-bit coordinate mouse - direct extraction
                 mouse_report_local.buttons = report[0];
                 
-                // Extract 16-bit X and Y coordinates and convert to 8-bit with scaling
-                int16_t x16 = (int16_t)(report[4] | (report[5] << 8));
-                int16_t y16 = (int16_t)(report[6] | (report[7] << 8));
+                // Extract and scale 16-bit coordinates inline
+                int16_t x16 = (int16_t)(report[4] | (report[5] << 8)) >> 2;
+                int16_t y16 = (int16_t)(report[6] | (report[7] << 8)) >> 2;
                 
-                // Scale down the 16-bit coordinates for smoother movement
-                // Right shift by 2 bits (divide by 4) to reduce sensitivity and prevent overflow
-                x16 >>= 2;
-                y16 >>= 2;
+                // Clamp inline
+                mouse_report_local.x = (x16 > 127) ? 127 : (x16 < -128) ? -128 : (int8_t)x16;
+                mouse_report_local.y = (y16 > 127) ? 127 : (y16 < -128) ? -128 : (int8_t)y16;
                 
-                // Clamp to 8-bit range 
-                if (x16 > 127) mouse_report_local.x = 127;
-                else if (x16 < -128) mouse_report_local.x = -128;
-                else mouse_report_local.x = (int8_t)x16;
-                
-                if (y16 > 127) mouse_report_local.y = 127;
-                else if (y16 < -128) mouse_report_local.y = -128;
-                else mouse_report_local.y = (int8_t)y16;
-                
-                // Try different positions for scroll wheel - check all possible bytes
-                // Most likely candidates are bytes 1, 2, or 3 (after buttons)
-                int8_t wheel_candidate = 0;
-                if (report[1] != 0) wheel_candidate = (int8_t)report[1];
-                else if (report[2] != 0) wheel_candidate = (int8_t)report[2];
-                else if (report[3] != 0) wheel_candidate = (int8_t)report[3];
-                
-                mouse_report_local.wheel = wheel_candidate;
+                // Wheel detection
+                mouse_report_local.wheel = (report[1] != 0) ? (int8_t)report[1] : 
+                                           (report[2] != 0) ? (int8_t)report[2] : (int8_t)report[3];
                 mouse_report_local.pan = 0;
                 
-            } else if (len >= 3) {
-                // Standard mouse report format (3-7 bytes)
-                // Minimum format: [buttons] [x] [y]
-                // Extended: [buttons] [x] [y] [wheel] [pan] ...
+            } else {
+                // Standard format - can cast directly if length allows
+                if (len >= sizeof(hid_mouse_report_t)) {
+                    // Direct cast for standard reports
+                    process_mouse_report((const hid_mouse_report_t*)report);
+                    break;
+                }
+                
+                // Partial report - build manually
                 mouse_report_local.buttons = report[0];
                 mouse_report_local.x = (int8_t)report[1];
                 mouse_report_local.y = (int8_t)report[2];
-                
-                if (len >= 4) {
-                    mouse_report_local.wheel = (int8_t)report[3];
-                }
-                if (len >= 5) {
-                    mouse_report_local.pan = (int8_t)report[4];
-                }
-            } else {
-                // Unknown format - skip
-                printf("Unknown mouse report format, len=%d\n", len);
-                break;
+                mouse_report_local.wheel = (len >= 4) ? (int8_t)report[3] : 0;
+                mouse_report_local.pan = (len >= 5) ? (int8_t)report[4] : 0;
             }
 
-            // Process through kmbox system (this handles movement accumulation,
-            // axis locks, and generates the final report to send)
+            // Process through kmbox system
             process_mouse_report(&mouse_report_local);
         }
         break;
