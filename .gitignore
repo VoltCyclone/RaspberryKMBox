@@ -8,3 +8,4 @@ lib/pio_usb
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/settings.json
+.vscode/*

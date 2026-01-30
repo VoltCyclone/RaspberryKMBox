@@ -1,6 +1,6 @@
 /*
  * KMBox Serial Command Handler Header
- * Handles CP2110 HID-to-UART bridge communication with handshake protocol
+ * Handles RP2350 USB CDC-to-UART bridge communication with handshake protocol
  */
 
 #ifndef KMBOX_SERIAL_HANDLER_H
@@ -12,7 +12,7 @@
 #include "led_control.h"
 
 //--------------------------------------------------------------------+
-// CP2110 Handshake Protocol
+// Bridge Handshake Protocol
 //--------------------------------------------------------------------+
 // 
 // The handshake protocol ensures reliable connection between the PC client
@@ -36,9 +36,9 @@
 //
 
 // Handshake timeout (milliseconds) - disconnect if no data received
-#define CP2110_HEARTBEAT_TIMEOUT_MS     5000
+#define BRIDGE_HEARTBEAT_TIMEOUT_MS     5000
 // Minimum interval between heartbeat checks
-#define CP2110_HEARTBEAT_CHECK_MS       100
+#define BRIDGE_HEARTBEAT_CHECK_MS       100
 
 // Protocol version
 #define KMBOX_PROTOCOL_VERSION          "1.0"
@@ -56,8 +56,8 @@ void kmbox_serial_task(void);
 // Send mouse report with kmbox button states
 bool kmbox_send_mouse_report(void);
 
-// Get current CP2110 connection state
-cp2110_connection_state_t kmbox_get_connection_state(void);
+// Get current bridge connection state
+bridge_connection_state_t kmbox_get_connection_state(void);
 
 // Check if connected and ready for commands
 bool kmbox_is_connected(void);

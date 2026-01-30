@@ -174,7 +174,7 @@ static bool initialize_system(void) {
     stdio_init_all();  // No-op when both UART and USB stdio are disabled
     sleep_ms(100);  // Allow system to stabilize
     
-    // Initialize KMBox serial handler on UART0 (via CP2110 USB UART5 Click)
+    // Initialize KMBox serial handler on UART0 (via RP2350 USB Bridge)
     // Note: stdio is disabled - debug output goes through KMBox interface if needed
     kmbox_serial_init();
     
@@ -242,8 +242,43 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
             }
         }
     } else if (state->button_pressed_last) {
-        // Button just released - could add short press handling here if needed
-        // For now, no action on short press
+        // Button just released - check if it was a short press
+        uint32_t hold_duration = current_time - state->last_button_press_time;
+        
+        if (hold_duration < BUTTON_HOLD_TRIGGER_MS) {
+            // Short press - cycle humanization mode
+            humanization_mode_t new_mode = smooth_cycle_humanization_mode();
+            
+            // Show mode with LED flash
+            uint32_t mode_color;
+            const char* mode_name;
+            switch (new_mode) {
+                case HUMANIZATION_OFF:
+                    mode_color = COLOR_HUMANIZATION_OFF;
+                    mode_name = "OFF";
+                    break;
+                case HUMANIZATION_LOW:
+                    mode_color = COLOR_HUMANIZATION_LOW;
+                    mode_name = "LOW";
+                    break;
+                case HUMANIZATION_MEDIUM:
+                    mode_color = COLOR_HUMANIZATION_MEDIUM;
+                    mode_name = "MEDIUM";
+                    break;
+                case HUMANIZATION_HIGH:
+                    mode_color = COLOR_HUMANIZATION_HIGH;
+                    mode_name = "HIGH";
+                    break;
+                default:
+                    mode_color = COLOR_ERROR;
+                    mode_name = "UNKNOWN";
+                    break;
+            }
+            
+            printf("Humanization mode: %s\n", mode_name);
+            neopixel_set_color(mode_color);
+            neopixel_trigger_mode_flash(mode_color, 500);
+        }
     }
 
     state->button_pressed_last = button_currently_pressed;
@@ -412,11 +447,6 @@ int main(void) {
     }
     
     watchdog_init();
-    // NOTE: For debugging startup hangs we skip the extended, blocking
-    // watchdog_start() sequence which performs long sleeps/prints and
-    // enables the hardware watchdog. If you need the full watchdog
-    // behavior re-enable the call below.
-    // watchdog_start();
     neopixel_enable_power();    
     printf("=== PIOKMBox Ready ===\n");
     

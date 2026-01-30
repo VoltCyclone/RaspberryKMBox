@@ -34,22 +34,22 @@ typedef enum {
     STATUS_USB_RESET_PENDING,
     STATUS_USB_RESET_SUCCESS,
     STATUS_USB_RESET_FAILED,
-    // CP2110 Serial Connection Status
-    STATUS_CP2110_WAITING,
-    STATUS_CP2110_CONNECTING,
-    STATUS_CP2110_CONNECTED,
-    STATUS_CP2110_ACTIVE,
-    STATUS_CP2110_DISCONNECTED
+    // Bridge Serial Connection Status
+    STATUS_BRIDGE_WAITING,
+    STATUS_BRIDGE_CONNECTING,
+    STATUS_BRIDGE_CONNECTED,
+    STATUS_BRIDGE_ACTIVE,
+    STATUS_BRIDGE_DISCONNECTED
 } system_status_t;
 
-// CP2110 Connection state (for serial handler)
+// Bridge Connection state (for serial handler)
 typedef enum {
-    CP2110_STATE_WAITING,       // Waiting for initial connection
-    CP2110_STATE_CONNECTING,    // Handshake in progress
-    CP2110_STATE_CONNECTED,     // Connected and ready
-    CP2110_STATE_ACTIVE,        // Actively receiving commands
-    CP2110_STATE_DISCONNECTED   // Connection lost (timeout)
-} cp2110_connection_state_t;
+    BRIDGE_STATE_WAITING,       // Waiting for initial connection
+    BRIDGE_STATE_CONNECTING,    // Handshake in progress
+    BRIDGE_STATE_CONNECTED,     // Connected and ready
+    BRIDGE_STATE_ACTIVE,        // Actively receiving commands
+    BRIDGE_STATE_DISCONNECTED   // Connection lost (timeout)
+} bridge_connection_state_t;
 
 //--------------------------------------------------------------------+
 // FUNCTION PROTOTYPES
@@ -90,5 +90,9 @@ uint32_t neopixel_apply_brightness_u8(uint32_t color, uint8_t brightness);
 void neopixel_breathing_effect(void);
 // Flush any queued LED frames to the PIO FIFO if space is available
 void neopixel_flush_queue(void);
+
+// nonblocking led
+void neopixel_trigger_mode_flash(uint32_t color, uint32_t duration_ms);
+
 
 #endif // LED_CONTROL_H

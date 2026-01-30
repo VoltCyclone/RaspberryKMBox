@@ -57,6 +57,28 @@ typedef enum {
 } inject_mode_t;
 
 //--------------------------------------------------------------------+
+// Easing Modes for Natural Movement
+//--------------------------------------------------------------------+
+
+typedef enum {
+    EASING_LINEAR = 0,      // No easing (constant velocity)
+    EASING_EASE_IN_OUT,     // Slow start, fast middle, slow end (natural)
+    EASING_EASE_OUT,        // Quick start, slow end (corrections)
+} easing_mode_t;
+
+//--------------------------------------------------------------------+
+// Humanization Modes
+//--------------------------------------------------------------------+
+
+typedef enum {
+    HUMANIZATION_OFF = 0,       // No humanization (legacy linear movement)
+    HUMANIZATION_LOW,           // Minimal jitter, basic easing
+    HUMANIZATION_MEDIUM,        // Balanced (default)
+    HUMANIZATION_HIGH,          // Maximum variation and unpredictability
+    HUMANIZATION_MODE_COUNT
+} humanization_mode_t;
+
+//--------------------------------------------------------------------+
 // Movement Queue Entry
 //--------------------------------------------------------------------+
 
@@ -66,8 +88,15 @@ typedef struct {
     int32_t x_remaining_fp; // Remaining X to inject
     int32_t y_remaining_fp; // Remaining Y to inject
     uint8_t frames_left;    // Frames remaining for this movement
+    uint8_t total_frames;   // Total frames for this movement (for easing calc)
     inject_mode_t mode;     // Injection mode
+    easing_mode_t easing;   // Easing curve to apply
     bool active;            // Is this entry in use?
+    
+    // Overshoot simulation
+    bool will_overshoot;    // Will this movement overshoot?
+    int32_t overshoot_x_fp; // Overshoot amount X
+    int32_t overshoot_y_fp; // Overshoot amount Y
 } smooth_queue_entry_t;
 
 //--------------------------------------------------------------------+
@@ -111,6 +140,17 @@ typedef struct {
     // Configuration
     int16_t max_per_frame;
     bool velocity_matching_enabled;
+    
+    // Humanization settings
+    struct {
+        humanization_mode_t mode;      // Current humanization mode
+        bool jitter_enabled;           // Enable micro-jitter (hand tremor)
+        int32_t jitter_amount_fp;      // Jitter magnitude (fixed-point)
+        uint8_t overshoot_chance;      // % chance of overshoot (0-100)
+        int32_t overshoot_max_fp;      // Max overshoot distance (fixed-point)
+        int32_t vel_slow_threshold_fp; // Velocity threshold for "slow" movement
+        int32_t vel_fast_threshold_fp; // Velocity threshold for "fast" movement
+    } humanization;
 } smooth_injection_state_t;
 
 //--------------------------------------------------------------------+
@@ -199,5 +239,26 @@ void smooth_get_stats(uint32_t *total_injected, uint32_t *frames_processed,
  * @return true if there are movements to process
  */
 bool smooth_has_pending(void);
+
+/**
+ * Set humanization mode (affects jitter, easing, overshoot)
+ * 
+ * @param mode Humanization mode (OFF, LOW, MEDIUM, HIGH)
+ */
+void smooth_set_humanization_mode(humanization_mode_t mode);
+
+/**
+ * Get current humanization mode
+ * 
+ * @return Current humanization mode
+ */
+humanization_mode_t smooth_get_humanization_mode(void);
+
+/**
+ * Cycle to next humanization mode
+ * 
+ * @return New humanization mode
+ */
+humanization_mode_t smooth_cycle_humanization_mode(void);
 
 #endif // SMOOTH_INJECTION_H

@@ -37,13 +37,13 @@
 #define PIN_NEOPIXEL            (21u)   // Neopixel data pin
 #define NEOPIXEL_POWER          (20u)   // Neopixel power pin
 
-// UART configuration for KMBox serial input via CP2110 USB UART5 Click
-// Connected through Feather Click Shield mikroBUS socket 1
-// CP2110 provides USB-to-UART bridge - external PC connects via USB to CP2110,
+// UART configuration for KMBox serial input via RP2350 USB Bridge
+// Connected through Feather Click Shield mikroBUS socket 1 or direct UART
+// RP2350 provides USB CDC-to-UART bridge - external PC connects via USB to RP2350,
 // which converts to UART and connects to these pins on the Feather
 #define KMBOX_UART              uart0    // Use UART0 for KMBox (via Click Shield RX/TX pins)
-#define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to CP2110 RX)
-#define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from CP2110 TX)
+#define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to RP2350 bridge RX)
+#define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from RP2350 bridge TX)
 #define KMBOX_UART_BAUDRATE     115200  // High-speed baud rate for fast commands (2 Mbps)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
@@ -465,12 +465,18 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 #define COLOR_USB_CONNECTION            0x00FF80  // Bright green flash for USB connection
 #define COLOR_USB_DISCONNECTION         0xFF8000  // Orange flash for USB disconnection
 
-// CP2110 Serial Connection Colors
-#define COLOR_CP2110_WAITING            0x0080FF  // Light blue - waiting for connection
-#define COLOR_CP2110_CONNECTING         0xFFFF00  // Yellow - handshake in progress
-#define COLOR_CP2110_CONNECTED          0x00FF00  // Green - connected and ready
-#define COLOR_CP2110_ACTIVE             0x00FFFF  // Cyan - actively receiving commands
-#define COLOR_CP2110_DISCONNECTED       0xFF4000  // Orange-red - connection lost
+// Bridge Serial Connection Colors
+#define COLOR_BRIDGE_WAITING            0x0080FF  // Light blue - waiting for connection
+#define COLOR_BRIDGE_CONNECTING         0xFFFF00  // Yellow - handshake in progress
+#define COLOR_BRIDGE_CONNECTED          0x00FF00  // Green - connected and ready
+#define COLOR_BRIDGE_ACTIVE             0x00FFFF  // Cyan - actively receiving commands
+#define COLOR_BRIDGE_DISCONNECTED       0xFF4000  // Orange-red - connection lost
+
+// Humanization mode colors (for button mode switching)
+#define COLOR_HUMANIZATION_OFF          0xFF0000  // Red - no humanization
+#define COLOR_HUMANIZATION_LOW          0xFFFF00  // Yellow - minimal humanization
+#define COLOR_HUMANIZATION_MEDIUM       0x00FF00  // Green - balanced (default)
+#define COLOR_HUMANIZATION_HIGH         0x00FFFF  // Cyan - maximum humanization
 
 // Brightness constants
 #define MIN_BRIGHTNESS                  0.0f

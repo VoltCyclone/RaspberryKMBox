@@ -1,7 +1,7 @@
 /*
  * KMBox Serial Command Handler
  * Integrates kmbox-commands library with the PIOKMBox firmware
- * Uses CP2110 HID-to-UART bridge via Feather Click Shield
+ * Uses RP2350 USB CDC-to-UART bridge for serial communication
  * Implements handshake protocol for reliable PC connection
  * 
  * FAST BINARY PROTOCOL:
@@ -434,10 +434,10 @@ void fast_cmd_get_stats(uint32_t *count, uint32_t *errors, uint32_t *overflows) 
 }
 
 //--------------------------------------------------------------------+
-// CP2110 Connection State Management
+// Bridge Connection State Management
 //--------------------------------------------------------------------+
 
-static cp2110_connection_state_t g_connection_state = CP2110_STATE_WAITING;
+static bridge_connection_state_t g_connection_state = BRIDGE_STATE_WAITING;
 static uint32_t g_last_data_time_ms = 0;
 static uint32_t g_last_heartbeat_check_ms = 0;
 static bool g_connection_led_updated = false;
@@ -566,7 +566,7 @@ void kmbox_serial_init(void)
     uart_rx_tail = 0;
 
     // Initialize connection state
-    g_connection_state = CP2110_STATE_WAITING;
+    g_connection_state = BRIDGE_STATE_WAITING;
     g_last_data_time_ms = 0;
     g_last_heartbeat_check_ms = 0;
     g_connection_led_updated = false;
@@ -600,11 +600,11 @@ void kmbox_serial_init(void)
     g_last_data_time_ms = init_time_ms;
     
     // Set initial LED status to waiting for connection
-    neopixel_set_status_override(STATUS_CP2110_WAITING);
+    neopixel_set_status_override(STATUS_BRIDGE_WAITING);
     
-    printf("KMBox serial handler initialized on UART%d via CP2110 (TX: GPIO%d, RX: GPIO%d) @ %d baud\n",
+    printf("KMBox serial handler initialized on UART%d via RP2350 bridge (TX: GPIO%d, RX: GPIO%d) @ %d baud\n",
            (KMBOX_UART == uart0) ? 0 : 1, KMBOX_UART_TX_PIN, KMBOX_UART_RX_PIN, KMBOX_UART_BAUDRATE);
-    printf("Waiting for CP2110 connection... (LED: breathing light blue)\n");
+    printf("Waiting for RP2350 bridge connection... (LED: breathing light blue)\n");
     
     // Give UART time to settle
     sleep_ms(100);
@@ -628,14 +628,14 @@ void kmbox_serial_init(void)
 //--------------------------------------------------------------------+
 
 // Get current connection state
-cp2110_connection_state_t kmbox_get_connection_state(void) {
+bridge_connection_state_t kmbox_get_connection_state(void) {
     return g_connection_state;
 }
 
 // Check if connected and ready for commands
 bool kmbox_is_connected(void) {
-    return (g_connection_state == CP2110_STATE_CONNECTED || 
-            g_connection_state == CP2110_STATE_ACTIVE);
+    return (g_connection_state == BRIDGE_STATE_CONNECTED || 
+            g_connection_state == BRIDGE_STATE_ACTIVE);
 }
 
 //--------------------------------------------------------------------+
@@ -664,33 +664,33 @@ void kmbox_send_response(const char *response) {
 }
 
 // Update connection state and LED indicator
-static void set_connection_state(cp2110_connection_state_t new_state) {
+static void set_connection_state(bridge_connection_state_t new_state) {
     if (g_connection_state == new_state) return;
     
-    cp2110_connection_state_t old_state = g_connection_state;
+    bridge_connection_state_t old_state = g_connection_state;
     g_connection_state = new_state;
     
     // Update LED based on new state
     switch (new_state) {
-        case CP2110_STATE_WAITING:
-            neopixel_set_status_override(STATUS_CP2110_WAITING);
-            printf("CP2110: Waiting for connection (LED: breathing light blue)\n");
+        case BRIDGE_STATE_WAITING:
+            neopixel_set_status_override(STATUS_BRIDGE_WAITING);
+            printf("Bridge: Waiting for connection (LED: breathing light blue)\n");
             break;
-        case CP2110_STATE_CONNECTING:
-            neopixel_set_status_override(STATUS_CP2110_CONNECTING);
-            printf("CP2110: Handshake in progress (LED: yellow)\n");
+        case BRIDGE_STATE_CONNECTING:
+            neopixel_set_status_override(STATUS_BRIDGE_CONNECTING);
+            printf("Bridge: Handshake in progress (LED: yellow)\n");
             break;
-        case CP2110_STATE_CONNECTED:
-            neopixel_set_status_override(STATUS_CP2110_CONNECTED);
-            printf("CP2110: Connected and ready (LED: green)\n");
+        case BRIDGE_STATE_CONNECTED:
+            neopixel_set_status_override(STATUS_BRIDGE_CONNECTED);
+            printf("Bridge: Connected and ready (LED: green)\n");
             break;
-        case CP2110_STATE_ACTIVE:
-            neopixel_set_status_override(STATUS_CP2110_ACTIVE);
+        case BRIDGE_STATE_ACTIVE:
+            neopixel_set_status_override(STATUS_BRIDGE_ACTIVE);
             // Don't spam logs for active state transitions
             break;
-        case CP2110_STATE_DISCONNECTED:
-            neopixel_set_status_override(STATUS_CP2110_DISCONNECTED);
-            printf("CP2110: Connection lost (LED: breathing orange-red)\n");
+        case BRIDGE_STATE_DISCONNECTED:
+            neopixel_set_status_override(STATUS_BRIDGE_DISCONNECTED);
+            printf("Bridge: Connection lost (LED: breathing orange-red)\n");
             break;
     }
     
@@ -700,23 +700,23 @@ static void set_connection_state(cp2110_connection_state_t new_state) {
 // Check for connection timeout
 static void check_connection_timeout(uint32_t current_time_ms) {
     // Only check periodically to avoid overhead
-    if (current_time_ms - g_last_heartbeat_check_ms < CP2110_HEARTBEAT_CHECK_MS) {
+    if (current_time_ms - g_last_heartbeat_check_ms < BRIDGE_HEARTBEAT_CHECK_MS) {
         return;
     }
     g_last_heartbeat_check_ms = current_time_ms;
     
     // Check if we've timed out
-    if (g_connection_state == CP2110_STATE_CONNECTED || 
-        g_connection_state == CP2110_STATE_ACTIVE) {
-        if (current_time_ms - g_last_data_time_ms > CP2110_HEARTBEAT_TIMEOUT_MS) {
-            set_connection_state(CP2110_STATE_DISCONNECTED);
+    if (g_connection_state == BRIDGE_STATE_CONNECTED || 
+        g_connection_state == BRIDGE_STATE_ACTIVE) {
+        if (current_time_ms - g_last_data_time_ms > BRIDGE_HEARTBEAT_TIMEOUT_MS) {
+            set_connection_state(BRIDGE_STATE_DISCONNECTED);
         }
     }
     
     // If disconnected for a while, go back to waiting
-    if (g_connection_state == CP2110_STATE_DISCONNECTED) {
-        if (current_time_ms - g_last_data_time_ms > CP2110_HEARTBEAT_TIMEOUT_MS * 2) {
-            set_connection_state(CP2110_STATE_WAITING);
+    if (g_connection_state == BRIDGE_STATE_DISCONNECTED) {
+        if (current_time_ms - g_last_data_time_ms > BRIDGE_HEARTBEAT_TIMEOUT_MS * 2) {
+            set_connection_state(BRIDGE_STATE_WAITING);
         }
     }
 }
@@ -730,7 +730,7 @@ static bool handle_protocol_command(const char *line, size_t len, uint32_t curre
     if (len >= 17 && strncmp(line, "KMBOX_BRIDGE_SYNC", 17) == 0) {
         // Respond with ready message - bridge is looking for this
         kmbox_send_response("KMBOX_READY");
-        set_connection_state(CP2110_STATE_CONNECTED);
+        set_connection_state(BRIDGE_STATE_CONNECTED);
         printf("Bridge sync: Connected via UART bridge\n");
         return true;
     }
@@ -743,9 +743,9 @@ static bool handle_protocol_command(const char *line, size_t len, uint32_t curre
         kmbox_send_response(response);
         
         // If waiting, move to connecting state
-        if (g_connection_state == CP2110_STATE_WAITING || 
-            g_connection_state == CP2110_STATE_DISCONNECTED) {
-            set_connection_state(CP2110_STATE_CONNECTING);
+        if (g_connection_state == BRIDGE_STATE_WAITING || 
+            g_connection_state == BRIDGE_STATE_DISCONNECTED) {
+            set_connection_state(BRIDGE_STATE_CONNECTING);
         }
         return true;
     }
@@ -753,14 +753,14 @@ static bool handle_protocol_command(const char *line, size_t len, uint32_t curre
     if (len >= 13 && strncmp(line, "KMBOX_CONNECT", 13) == 0) {
         // Confirm connection
         kmbox_send_response("KMBOX_READY");
-        set_connection_state(CP2110_STATE_CONNECTED);
+        set_connection_state(BRIDGE_STATE_CONNECTED);
         return true;
     }
     
     if (len >= 16 && strncmp(line, "KMBOX_DISCONNECT", 16) == 0) {
         // Graceful disconnect
         kmbox_send_response("KMBOX_BYE");
-        set_connection_state(CP2110_STATE_WAITING);
+        set_connection_state(BRIDGE_STATE_WAITING);
         return true;
     }
     
@@ -795,17 +795,17 @@ static void process_line_with_protocol(const char *line, size_t len,
     if (!kmbox_is_connected()) {
         // If we receive non-protocol data while not connected, 
         // auto-connect for backwards compatibility
-        if (g_connection_state == CP2110_STATE_WAITING ||
-            g_connection_state == CP2110_STATE_DISCONNECTED) {
+        if (g_connection_state == BRIDGE_STATE_WAITING ||
+            g_connection_state == BRIDGE_STATE_DISCONNECTED) {
             // Auto-connect on any data (backwards compatibility mode)
-            set_connection_state(CP2110_STATE_CONNECTED);
-            printf("CP2110: Auto-connected (received data without handshake)\n");
+            set_connection_state(BRIDGE_STATE_CONNECTED);
+            printf("Bridge: Auto-connected (received data without handshake)\n");
         }
     }
     
     // Mark as active when receiving commands
-    if (g_connection_state == CP2110_STATE_CONNECTED) {
-        set_connection_state(CP2110_STATE_ACTIVE);
+    if (g_connection_state == BRIDGE_STATE_CONNECTED) {
+        set_connection_state(BRIDGE_STATE_ACTIVE);
     }
     
     // Process the command through kmbox
@@ -865,10 +865,10 @@ void kmbox_serial_task(void)
                 
                 // Auto-connect on fast command
                 if (!kmbox_is_connected()) {
-                    set_connection_state(CP2110_STATE_CONNECTED);
+                    set_connection_state(BRIDGE_STATE_CONNECTED);
                 }
-                if (g_connection_state == CP2110_STATE_CONNECTED) {
-                    set_connection_state(CP2110_STATE_ACTIVE);
+                if (g_connection_state == BRIDGE_STATE_CONNECTED) {
+                    set_connection_state(BRIDGE_STATE_ACTIVE);
                 }
                 
                 // Update head/tail for next iteration

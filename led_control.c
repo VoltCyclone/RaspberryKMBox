@@ -60,6 +60,11 @@ typedef struct {
     uint16_t rainbow_hue;  // 0..359
     // Movement-driven rainbow
     uint32_t rainbow_last_update_time_ms;
+    // other non-blocking thing
+    bool mode_flash_active;
+    uint32_t mode_flash_start_time;
+    uint32_t mode_flash_duration;
+    uint32_t mode_flash_color;
 } led_controller_t;
 
 /**
@@ -109,12 +114,12 @@ static const status_config_t g_status_configs[] = {
     [STATUS_USB_RESET_PENDING]    = {COLOR_USB_RESET_PENDING,    true,  "USB_RESET_PENDING"},
     [STATUS_USB_RESET_SUCCESS]    = {COLOR_USB_RESET_SUCCESS,    false, "USB_RESET_SUCCESS"},
     [STATUS_USB_RESET_FAILED]     = {COLOR_USB_RESET_FAILED,     true,  "USB_RESET_FAILED"},
-    // CP2110 connection states
-    [STATUS_CP2110_WAITING]       = {COLOR_CP2110_WAITING,       true,  "CP2110_WAITING"},
-    [STATUS_CP2110_CONNECTING]    = {COLOR_CP2110_CONNECTING,    false, "CP2110_CONNECTING"},
-    [STATUS_CP2110_CONNECTED]     = {COLOR_CP2110_CONNECTED,     false, "CP2110_CONNECTED"},
-    [STATUS_CP2110_ACTIVE]        = {COLOR_CP2110_ACTIVE,        false, "CP2110_ACTIVE"},
-    [STATUS_CP2110_DISCONNECTED]  = {COLOR_CP2110_DISCONNECTED,  true,  "CP2110_DISCONNECTED"}
+    // Bridge connection states
+    [STATUS_BRIDGE_WAITING]       = {COLOR_BRIDGE_WAITING,       true,  "BRIDGE_WAITING"},
+    [STATUS_BRIDGE_CONNECTING]    = {COLOR_BRIDGE_CONNECTING,    false, "BRIDGE_CONNECTING"},
+    [STATUS_BRIDGE_CONNECTED]     = {COLOR_BRIDGE_CONNECTED,     false, "BRIDGE_CONNECTED"},
+    [STATUS_BRIDGE_ACTIVE]        = {COLOR_BRIDGE_ACTIVE,        false, "BRIDGE_ACTIVE"},
+    [STATUS_BRIDGE_DISCONNECTED]  = {COLOR_BRIDGE_DISCONNECTED,  true,  "BRIDGE_DISCONNECTED"}
 };
 
 //--------------------------------------------------------------------+
@@ -232,6 +237,17 @@ void led_set_blink_interval(uint32_t interval_ms)
     if (interval_ms > 0) {
         g_led_controller.last_blink_time = get_current_time_ms();
     }
+}
+
+// --------------------------------------------------------------------+
+// NON-BLOCKING MODE FLASH FUNCTION
+// --------------------------------------------------------------------+
+void neopixel_trigger_mode_flash(uint32_t color, uint32_t duration_ms) {
+    g_led_controller.mode_flash_active = true;
+    g_led_controller.mode_flash_start_time = get_current_time_ms();
+    g_led_controller.mode_flash_duration = duration_ms;
+    g_led_controller.mode_flash_color = color;
+    neopixel_set_color(color);
 }
 
 //--------------------------------------------------------------------+
@@ -613,6 +629,14 @@ void neopixel_status_task(void)
     // Handle other effects if rainbow is not active
     if (!g_led_controller.activity_flash_active && !g_led_controller.caps_lock_flash_active) {
         handle_breathing_effect();
+    }
+
+    if (g_led_controller.mode_flash_active) {
+        if (is_time_elapsed(g_led_controller.mode_flash_start_time, 
+                            g_led_controller.mode_flash_duration)) {
+            g_led_controller.mode_flash_active = false;
+        }
+        return; // Don't process other effects during flash
     }
 }
 
