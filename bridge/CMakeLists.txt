@@ -20,6 +20,10 @@ pico_sdk_init()
 add_executable(kmbox_bridge
     main.c
     tracker.c
+    pio_dma.c
+    core1_translator.c
+    makcu_translator.c
+    ferrum_translator.c
 )
 
 # Add kmbox-commands library for shared utilities
@@ -33,6 +37,8 @@ target_link_libraries(kmbox_bridge
     pico_stdlib
     hardware_pio
     hardware_clocks
+    hardware_dma
+    pico_multicore
     kmbox_commands
 )
 

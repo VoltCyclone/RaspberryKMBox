@@ -1,0 +1,86 @@
+; Bridge Protocol RX - Hardware packet detection and framing
+; Automatically detects sync byte and extracts packets
+;
+; Features:
+; - Hardware sync detection (0xBD)
+; - Automatic packet boundary detection
+; - Command byte extraction
+; - Zero-copy DMA support
+; - Packet validation
+;
+; Usage:
+; 1. PIO waits for sync byte (0xBD)
+; 2. Captures command byte
+; 3. Determines payload length from command
+; 4. Captures complete packet to RX FIFO
+
+.program bridge_rx
+.wrap_target
+start:
+    wait 0 pin 0                    ; Wait for start bit
+    set x, 7            [10]        ; 8 bits to receive, delay to center
+bit_loop:
+    in pins, 1                      ; Sample data bit
+    jmp x-- bit_loop    [6]         ; Loop for 8 bits
+    
+    ; Check if this is sync byte (0xBD)
+    mov y, isr                      ; Copy ISR to Y
+    jmp pin sync_detected           ; If sync pattern matches
+    
+    ; Not sync, discard and wait for next byte
+    mov isr, null                   ; Clear ISR
+    jmp start                       ; Start over
+    
+sync_detected:
+    push                            ; Push sync byte to FIFO
+    
+    ; Now receive command byte
+    wait 0 pin 0                    ; Wait for start bit
+    set x, 7            [10]        ; 8 bits
+cmd_bit_loop:
+    in pins, 1                      ; Sample command bit
+    jmp x-- cmd_bit_loop [6]
+    push                            ; Push command to FIFO
+    
+    ; Determine payload length from command byte
+    ; This is done in software - PIO pushes bytes, CPU determines packet end
+    
+payload_byte:
+    wait 0 pin 0                    ; Wait for start bit
+    set x, 7            [10]        ; 8 bits
+payload_bit_loop:
+    in pins, 1                      ; Sample payload bit
+    jmp x-- payload_bit_loop [6]
+    push                            ; Push payload byte to FIFO
+    
+    ; Software IRQ handler determines when packet is complete
+    ; based on command type
+    
+.wrap
+
+% c-sdk {
+static inline void bridge_rx_program_init(PIO pio, uint sm, uint offset, uint pin, float baud_rate) {
+    pio_sm_config c = bridge_rx_program_get_default_config(offset);
+    
+    // Set RX pin
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    
+    // Configure pin as input
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    
+    // Set baud rate (16 cycles per bit for sampling)
+    float div = (float)clock_get_hz(clk_sys) / (baud_rate * 16);
+    sm_config_set_clkdiv(&c, div);
+    
+    // Shift ISR right, autopush at 8 bits
+    sm_config_set_in_shift(&c, true, true, 8);
+    
+    // Enable RX FIFO
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

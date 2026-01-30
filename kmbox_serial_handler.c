@@ -24,6 +24,7 @@
 
 #include "kmbox_serial_handler.h"
 #include "lib/kmbox-commands/kmbox_commands.h"
+#include "bridge_protocol.h"
 #include "usb_hid.h"
 #include "led_control.h"
 #include "smooth_injection.h"
@@ -108,6 +109,85 @@ static uint32_t last_kmbox_ping_time = 0;
 // Get synchronized timestamp (device time adjusted for PC offset)
 static inline uint64_t get_synced_time_us(void) {
     return time_us_64();
+}
+
+//--------------------------------------------------------------------+
+// Bridge Protocol Parser (Variable-Length Optimized)
+//--------------------------------------------------------------------+
+
+// Parse and process bridge protocol packets
+// Returns number of bytes consumed (0 if incomplete packet)
+static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
+    if (available < 2) return 0;  // Need at least sync + cmd
+    
+    // Check for sync byte
+    if (data[0] != BRIDGE_SYNC_BYTE) {
+        return 1;  // Skip invalid sync byte
+    }
+    
+    uint8_t cmd = data[1];
+    
+    switch (cmd) {
+        case BRIDGE_CMD_MOUSE_MOVE: {
+            // Move: [SYNC][CMD][x_lo][x_hi][y_lo][y_hi] = 6 bytes
+            if (available < 6) return 0;
+            int16_t x = *((int16_t*)(data + 2));
+            int16_t y = *((int16_t*)(data + 4));
+            // Call kmbox API directly to queue movement (bypasses USB ready checks)
+            kmbox_add_mouse_movement(x, y);
+            return 6;
+        }
+        
+        case BRIDGE_CMD_MOUSE_WHEEL: {
+            // Wheel: [SYNC][CMD][wheel] = 3 bytes
+            if (available < 3) return 0;
+            int8_t wheel = (int8_t)data[2];
+            // Call kmbox API directly
+            kmbox_add_wheel_movement(wheel);
+            return 3;
+        }
+        
+        case BRIDGE_CMD_BUTTON_SET: {
+            // Button: [SYNC][CMD][mask][state] = 4 bytes
+            if (available < 4) return 0;
+            uint8_t mask = data[2];
+            uint8_t state = data[3];
+            // Update button state directly
+            kmbox_update_physical_buttons(state ? mask : 0);
+            return 4;
+        }
+        
+        case BRIDGE_CMD_MOUSE_MOVE_WHEEL: {
+            // Move+Wheel: [SYNC][CMD][x_lo][x_hi][y_lo][y_hi][wheel] = 7 bytes
+            if (available < 7) return 0;
+            int16_t x = *((int16_t*)(data + 2));
+            int16_t y = *((int16_t*)(data + 4));
+            int8_t wheel = (int8_t)data[6];
+            // Call kmbox APIs directly
+            kmbox_add_mouse_movement(x, y);
+            kmbox_add_wheel_movement(wheel);
+            return 7;
+        }
+        
+        case BRIDGE_CMD_PING: {
+            // Ping: [SYNC][CMD] = 2 bytes
+            // Could send pong response here if needed
+            return 2;
+        }
+        
+        case BRIDGE_CMD_RESET: {
+            // Reset: [SYNC][CMD] = 2 bytes
+            // Clear all queued movement
+            kmbox_add_mouse_movement(0, 0);  // Clear accumulators
+            kmbox_add_wheel_movement(0);
+            kmbox_update_physical_buttons(0);
+            return 2;
+        }
+        
+        default:
+            // Unknown command, skip sync byte and try again
+            return 1;
+    }
 }
 
 //--------------------------------------------------------------------+
@@ -1093,13 +1173,68 @@ void kmbox_serial_task(void)
     process_pending_timed_move();
     
     //------------------------------------------------------------------
-    // FAST BINARY COMMAND PATH - Ultra-low latency
+    // BRIDGE PROTOCOL PATH - Optimized variable-length packets
     //------------------------------------------------------------------
-    // Check for fast binary commands first (highest priority)
-    // These are 8-byte packets starting with specific command bytes
+    // Check for bridge protocol packets first (SYNC byte = 0xBD)
+    // These are 2-7 byte variable-length packets
     
     uint16_t head = uart_rx_head;
     uint16_t tail = uart_rx_tail;
+    
+    while (head != tail) {
+        uint8_t first_byte = uart_rx_buffer[tail];
+        
+        // Check for bridge protocol sync byte
+        if (first_byte == BRIDGE_SYNC_BYTE) {
+            uint16_t available = (head - tail) & UART_RX_BUFFER_MASK;
+            
+            // Build contiguous buffer for parser
+            uint8_t packet[8];  // Max bridge packet size
+            size_t copy_len = (available < 8) ? available : 8;
+            for (size_t i = 0; i < copy_len; i++) {
+                packet[i] = uart_rx_buffer[(tail + i) & UART_RX_BUFFER_MASK];
+            }
+            
+            // Try to parse bridge packet
+            uint8_t consumed = process_bridge_packet(packet, copy_len);
+            
+            if (consumed > 0) {
+                // Successfully parsed - advance tail
+                uart_rx_tail = (tail + consumed) & UART_RX_BUFFER_MASK;
+                
+                // Update activity timestamp
+                g_last_data_time_ms = current_time_ms;
+                
+                // Auto-connect on bridge command
+                if (!kmbox_is_connected()) {
+                    set_connection_state(BRIDGE_STATE_CONNECTED);
+                }
+                if (g_connection_state == BRIDGE_STATE_CONNECTED) {
+                    set_connection_state(BRIDGE_STATE_ACTIVE);
+                }
+                
+                // Continue processing more packets
+                head = uart_rx_head;
+                tail = uart_rx_tail;
+                continue;
+            } else {
+                // Incomplete packet - wait for more data
+                break;
+            }
+        }
+        
+        // Not a bridge packet - try fast command or text
+        tail = (tail + 1) & UART_RX_BUFFER_MASK;
+    }
+    
+    //------------------------------------------------------------------
+    // FAST BINARY COMMAND PATH - Ultra-low latency (Legacy)
+    //------------------------------------------------------------------
+    // Check for fast binary commands (8-byte fixed packets)
+    // These are for backwards compatibility
+    
+    head = uart_rx_head;
+    tail = uart_rx_tail;
     
     while (head != tail) {
         uint8_t first_byte = uart_rx_buffer[tail];

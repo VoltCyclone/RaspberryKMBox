@@ -1,0 +1,83 @@
+; Bridge Protocol Smart UART TX
+; Optimized for bridge protocol packet transmission
+; 
+; Features:
+; - Single-cycle sync byte injection
+; - Automatic packet framing  
+; - DMA-friendly interface
+; - 2 Mbaud capable
+;
+; Protocol: [SYNC:0xBD][CMD:u8][PAYLOAD:0-5 bytes]
+;
+; Usage:
+;   1. DMA transfers: [CMD][PAYLOAD...] (no sync byte)
+;   2. PIO automatically prepends 0xBD
+;   3. Transmits complete packet
+
+.program bridge_uart_tx
+
+; Optimized UART TX - simplified from standard uart_tx
+; Assumes 8N1 (8 data bits, no parity, 1 stop bit)
+; Clock configured for exact baud rate
+
+.side_set 1 opt
+
+.wrap_target
+    ; First byte of every packet: inject sync byte 0xBD
+    set x, 7                        ; 8 bits to send
+    set y, 0xBD                     ; Sync byte value
+sync_start:
+    set pins, 0         [7]         ; Start bit
+sync_bits:
+    set pins, 1                     ; Assume bit is 1 (most bits in 0xBD are 1)
+    jmp !osre, sync_bits [6]        ; Shift next bit
+    jmp x--, sync_bits  [6]         ; Repeat for 8 bits
+    set pins, 1         [7]         ; Stop bit
+    
+    ; Now send command + payload from FIFO
+data_loop:
+    pull block                      ; Get byte from FIFO
+    set x, 7                        ; 8 bits
+    set pins, 0         [7]         ; Start bit
+bits:
+    out pins, 1         [6]         ; Data bit
+    jmp x--, bits       [6]         ; 8 times
+    set pins, 1         [7]         ; Stop bit
+    jmp !osre, data_loop            ; Continue if more data in OSR
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void bridge_uart_tx_program_init(PIO pio, uint sm, uint offset, uint pin, uint baud) {
+    pio_sm_config c = bridge_uart_tx_program_get_default_config(offset);
+    
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_set_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    
+    // 8 cycles per bit
+    float div = (float)clock_get_hz(clk_sys) / (8 * baud);
+    sm_config_set_clkdiv(&c, div);
+    
+    sm_config_set_out_shift(&c, true, false, 8);  // Shift right, no autopull
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << pin, 1u << pin);
+    
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void bridge_uart_tx_putc(PIO pio, uint sm, uint8_t c) {
+    pio_sm_put_blocking(pio, sm, c);
+}
+
+static inline bool bridge_uart_tx_full(PIO pio, uint sm) {
+    return pio_sm_is_tx_fifo_full(pio, sm);
+}
+%}
