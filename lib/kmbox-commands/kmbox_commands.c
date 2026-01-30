@@ -250,6 +250,13 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     // lock_my() - Get Y axis lock state
     // lock_my(state) - Set Y axis lock (1=locked, 0=unlocked)
     // catch_xy(duration_ms) - Sum x/y input over last duration (0..1000ms)
+    // monitor() - Get monitor state
+    // monitor(state) - Enable (non-zero) or disable (0) monitoring mode
+    // isdown_left() - Query left button state (returns 0 or 1)
+    // isdown_right() - Query right button state
+    // isdown_middle() - Query middle button state
+    // isdown_side1() - Query side button 1 state
+    // isdown_side2() - Query side button 2 state
     // Aliases supported:
     // m(...) -> km.move(...)
 
@@ -260,6 +267,88 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         return;
     }
 
+    // Check if this is a monitor command
+    if (strncmp(cmd + 3, "monitor(", 8) == 0) {
+        // Parse monitor command
+        const char* arg_start = cmd + 11; // Skip "km.monitor("
+        const char* paren_end = strchr(arg_start, ')');
+        
+        if (!paren_end) {
+            return;
+        }
+        
+        // Check if there's an argument
+        size_t arg_len = paren_end - arg_start;
+        if (arg_len == 0) {
+            // No argument - return monitor state with result
+            printf("%d\r\n>>> ", g_kmbox_state.monitor_enabled ? 1 : 0);
+            return;
+        }
+        
+        // Extract state value
+        char state_str[8];
+        if (arg_len >= sizeof(state_str)) {
+            return;
+        }
+        
+        strncpy(state_str, arg_start, arg_len);
+        state_str[arg_len] = '\0';
+        
+        // Parse state - 0 disables, any other value enables
+        int state = atoi(state_str);
+        
+        // Set monitor state (0 = disabled, non-zero = enabled)
+        g_kmbox_state.monitor_enabled = (state != 0);
+        
+        // Send the prompt
+        printf(">>> ");
+        return;
+    }
+    
+    // Check if this is an isdown query command
+    if (strncmp(cmd + 3, "isdown_", 7) == 0) {
+        // Parse isdown command - format: km.isdown_left(), km.isdown_right(), etc.
+        const char* button_name = cmd + 10; // Skip "km.isdown_"
+        const char* paren_start = strchr(button_name, '(');
+        const char* paren_end = paren_start ? strchr(paren_start, ')') : NULL;
+        
+        if (!paren_start || !paren_end || paren_end != paren_start + 1) {
+            return; // Must have empty parentheses
+        }
+        
+        // Extract button name
+        size_t name_len = paren_start - button_name;
+        char btn_name[16];
+        if (name_len >= sizeof(btn_name)) {
+            return;
+        }
+        strncpy(btn_name, button_name, name_len);
+        btn_name[name_len] = '\0';
+        
+        // Check monitor is enabled (some implementations allow queries without monitor)
+        // For compatibility, we'll allow queries regardless
+        
+        // Query the button state and return result
+        int state = 0;
+        if (strcmp(btn_name, "left") == 0) {
+            state = kmbox_isdown_left() ? 1 : 0;
+        } else if (strcmp(btn_name, "right") == 0) {
+            state = kmbox_isdown_right() ? 1 : 0;
+        } else if (strcmp(btn_name, "middle") == 0) {
+            state = kmbox_isdown_middle() ? 1 : 0;
+        } else if (strcmp(btn_name, "side1") == 0) {
+            state = kmbox_isdown_side1() ? 1 : 0;
+        } else if (strcmp(btn_name, "side2") == 0) {
+            state = kmbox_isdown_side2() ? 1 : 0;
+        } else {
+            return; // Unknown button name
+        }
+        
+        // Output format: result then prompt
+        printf("%d\r\n>>> ", state);
+        return;
+    }
+    
     // Check if this is a catch_xy command
     if (strncmp(cmd + 3, "catch_xy(", 9) == 0) {
         const char* num_start = cmd + 12; // Skip "km.catch_xy("
@@ -663,6 +752,9 @@ void kmbox_commands_init(void)
     // Initialize button callback state
     g_kmbox_state.button_callback_enabled = false;
     g_kmbox_state.last_button_state = 0;
+    
+    // Initialize monitor mode (disabled by default)
+    g_kmbox_state.monitor_enabled = false;
     
     // Debug: Log initial axis lock states
     printf("KMBox initialized - lock_mx=%d, lock_my=%d\n", 
@@ -1183,4 +1275,118 @@ bool kmbox_get_lock_mx(void)
 bool kmbox_get_lock_my(void)
 {
     return g_kmbox_state.lock_my;
+}
+
+void kmbox_set_monitor_enabled(bool enabled)
+{
+    g_kmbox_state.monitor_enabled = enabled;
+}
+
+bool kmbox_get_monitor_enabled(void)
+{
+    return g_kmbox_state.monitor_enabled;
+}
+
+// Query functions for monitor mode - return physical button states
+bool kmbox_isdown_left(void)
+{
+    return (g_kmbox_state.physical_buttons & 0x01) != 0;
+}
+
+bool kmbox_isdown_right(void)
+{
+    return (g_kmbox_state.physical_buttons & 0x02) != 0;
+}
+
+bool kmbox_isdown_middle(void)
+{
+    return (g_kmbox_state.physical_buttons & 0x04) != 0;
+}
+
+bool kmbox_isdown_side1(void)
+{
+    return (g_kmbox_state.physical_buttons & 0x08) != 0;
+}
+
+bool kmbox_isdown_side2(void)
+{
+    return (g_kmbox_state.physical_buttons & 0x10) != 0;
+}
+
+//--------------------------------------------------------------------+
+// Utility Functions for Duplicate Code Consolidation
+//--------------------------------------------------------------------+
+
+uint8_t kmbox_map_button_to_hid_mask(uint8_t button_num)
+{
+    // Map button number to HID bit mask compatible with FAST_BTN_* defines
+    // This consolidates the duplicate btn_map logic from kmbox_serial_handler.c
+    static const uint8_t btn_map[] = {
+        KMBOX_HID_BTN_LEFT,     // Button 0: Left
+        KMBOX_HID_BTN_LEFT,     // Button 1: Left (duplicate mapping for compatibility)
+        KMBOX_HID_BTN_RIGHT,    // Button 2: Right  
+        KMBOX_HID_BTN_MIDDLE,   // Button 3: Middle
+        KMBOX_HID_BTN_BACK,     // Button 4: Back/Side1
+        KMBOX_HID_BTN_FORWARD   // Button 5: Forward/Side2
+    };
+    
+    return (button_num < 6) ? btn_map[button_num] : KMBOX_HID_BTN_LEFT; // Default to left button
+}
+
+int8_t kmbox_clamp_movement_i8(int16_t value)
+{
+    // Clamp to int8_t range for mouse movement (-127 to 127)
+    // Note: Using -127 instead of -128 to match existing clamping logic
+    if (value > 127) return 127;
+    if (value < -127) return -127;
+    return (int8_t)value;
+}
+
+int8_t kmbox_clamp_wheel_i8(int16_t value)
+{
+    // Clamp to int8_t range for wheel movement (-128 to 127)
+    if (value > 127) return 127;
+    if (value < -128) return -128;
+    return (int8_t)value;
+}
+
+//--------------------------------------------------------------------+
+// Command Parsing Utilities
+//--------------------------------------------------------------------+
+
+bool kmbox_parse_move_command(const char* cmd, int* x, int* y)
+{
+    if (!cmd || !x || !y) {
+        return false;
+    }
+    
+    // Check for km.move(x,y) format
+    if (strncmp(cmd, "km.move(", 8) != 0) {
+        return false;
+    }
+    
+    return sscanf(cmd, "km.move(%d,%d)", x, y) == 2;
+}
+
+bool kmbox_parse_click_command(const char* cmd, int* button)
+{
+    if (!cmd || !button) {
+        return false;
+    }
+    
+    // Check for km.click(btn) format
+    if (strncmp(cmd, "km.click(", 9) != 0) {
+        return false;
+    }
+    
+    return sscanf(cmd, "km.click(%d)", button) == 1;
+}
+
+bool kmbox_is_version_command(const char* cmd)
+{
+    if (!cmd) {
+        return false;
+    }
+    
+    return strncmp(cmd, "km.version()", 12) == 0;
 }

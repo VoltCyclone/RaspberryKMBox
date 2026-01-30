@@ -33,8 +33,23 @@ typedef enum {
     STATUS_SUSPENDED,
     STATUS_USB_RESET_PENDING,
     STATUS_USB_RESET_SUCCESS,
-    STATUS_USB_RESET_FAILED
+    STATUS_USB_RESET_FAILED,
+    // Bridge Serial Connection Status
+    STATUS_BRIDGE_WAITING,
+    STATUS_BRIDGE_CONNECTING,
+    STATUS_BRIDGE_CONNECTED,
+    STATUS_BRIDGE_ACTIVE,
+    STATUS_BRIDGE_DISCONNECTED
 } system_status_t;
+
+// Bridge Connection state (for serial handler)
+typedef enum {
+    BRIDGE_STATE_WAITING,       // Waiting for initial connection
+    BRIDGE_STATE_CONNECTING,    // Handshake in progress
+    BRIDGE_STATE_CONNECTED,     // Connected and ready
+    BRIDGE_STATE_ACTIVE,        // Actively receiving commands
+    BRIDGE_STATE_DISCONNECTED   // Connection lost (timeout)
+} bridge_connection_state_t;
 
 //--------------------------------------------------------------------+
 // FUNCTION PROTOTYPES
@@ -53,12 +68,8 @@ void neopixel_set_color_with_brightness(uint32_t color, float brightness);
 void neopixel_set_color_with_brightness_u8(uint32_t color, uint8_t brightness);
 void neopixel_update_status(void);
 void neopixel_status_task(void);
-void neopixel_trigger_activity_flash(void);
-void neopixel_trigger_mouse_activity(void);
-void neopixel_trigger_keyboard_activity(void);
+void neopixel_trigger_activity_flash_color(uint32_t color);
 void neopixel_trigger_caps_lock_flash(void);
-void neopixel_trigger_usb_connection_flash(void);
-void neopixel_trigger_usb_disconnection_flash(void);
 void neopixel_trigger_usb_reset_pending(void);
 void neopixel_trigger_usb_reset_success(void);
 void neopixel_trigger_usb_reset_failed(void);
@@ -75,5 +86,9 @@ uint32_t neopixel_apply_brightness_u8(uint32_t color, uint8_t brightness);
 void neopixel_breathing_effect(void);
 // Flush any queued LED frames to the PIO FIFO if space is available
 void neopixel_flush_queue(void);
+
+// nonblocking led
+void neopixel_trigger_mode_flash(uint32_t color, uint32_t duration_ms);
+
 
 #endif // LED_CONTROL_H

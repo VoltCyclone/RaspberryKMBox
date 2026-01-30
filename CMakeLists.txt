@@ -18,6 +18,7 @@ endif()
 set(sdkVersion 2.2.0)
 set(toolchainVersion 14_2_Rel1)
 set(picotoolVersion 2.2.0)
+set(PICO_SDK_PATH $ENV{HOME}/.pico-sdk/sdk/2.2.0-fresh)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -43,6 +44,7 @@ add_executable(PIOKMbox
     init_state_machine.c
     state_management.c
     kmbox_serial_handler.c
+    smooth_injection.c
 )
 
 # generate the header file into the source tree as it is included in the RP2040 datasheet
@@ -52,7 +54,10 @@ pico_set_program_name(PIOKMbox "PIOKMbox")
 pico_set_program_version(PIOKMbox "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(PIOKMbox 1)
+# UART0 is used for KMBox serial input via RP2350 USB Bridge
+# USB CDC is disabled to avoid breaking HID enumeration
+# Debug output can be sent through the KMBox interface if needed
+pico_enable_stdio_uart(PIOKMbox 0)
 pico_enable_stdio_usb(PIOKMbox 0)
 
 # Add the standard library to the build
@@ -65,6 +70,7 @@ target_link_libraries(PIOKMbox
         hardware_dma
         hardware_watchdog
         hardware_uart
+        hardware_spi
         hardware_irq
         pico_unique_id
         pico_multicore

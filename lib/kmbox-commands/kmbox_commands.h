@@ -14,6 +14,13 @@
 // Button Definitions
 //--------------------------------------------------------------------+
 
+// HID Button bit masks (compatible with FAST_BTN_* protocol)
+#define KMBOX_HID_BTN_LEFT      0x01
+#define KMBOX_HID_BTN_RIGHT     0x02
+#define KMBOX_HID_BTN_MIDDLE    0x04
+#define KMBOX_HID_BTN_BACK      0x08
+#define KMBOX_HID_BTN_FORWARD   0x10
+
 typedef enum {
     KMBOX_BUTTON_LEFT = 0,
     KMBOX_BUTTON_RIGHT,
@@ -52,6 +59,9 @@ typedef struct {
     // Axis lock states
     bool lock_mx;  // Lock X axis (left/right movement)
     bool lock_my;  // Lock Y axis (up/down movement)
+    
+    // Monitor mode (polling-based button state queries)
+    bool monitor_enabled;  // True if monitoring is enabled
 } kmbox_state_t;
 
 //--------------------------------------------------------------------+
@@ -113,5 +123,45 @@ const char* kmbox_get_button_name(kmbox_button_t button);
 
 // Update physical button states (call this with actual hardware button states)
 void kmbox_update_physical_buttons(uint8_t physical_buttons);
+
+// Monitor mode control (polling-based button state queries)
+void kmbox_set_monitor_enabled(bool enabled);
+bool kmbox_get_monitor_enabled(void);
+
+// Query button states (for monitor mode - returns physical button state)
+bool kmbox_isdown_left(void);
+bool kmbox_isdown_right(void);
+bool kmbox_isdown_middle(void);
+bool kmbox_isdown_side1(void);
+bool kmbox_isdown_side2(void);
+
+//--------------------------------------------------------------------+
+// Utility Functions for Duplicate Code Consolidation
+//--------------------------------------------------------------------+
+
+// Map button number (0-5) to HID button bit mask (compatible with FAST_BTN_*)
+// Returns 0x01 for button 0 or 1 (left), 0x02 for button 2 (right), etc.
+uint8_t kmbox_map_button_to_hid_mask(uint8_t button_num);
+
+// Clamp movement values to int8_t range (-127 to 127)
+int8_t kmbox_clamp_movement_i8(int16_t value);
+
+// Clamp wheel values to int8_t range (-128 to 127)  
+int8_t kmbox_clamp_wheel_i8(int16_t value);
+
+//--------------------------------------------------------------------+
+// Command Parsing Utilities
+//--------------------------------------------------------------------+
+
+// Parse km.move(x,y) command, returns true if successful
+// Sets x and y to parsed values
+bool kmbox_parse_move_command(const char* cmd, int* x, int* y);
+
+// Parse km.click(btn) command, returns true if successful  
+// Sets button to parsed button number
+bool kmbox_parse_click_command(const char* cmd, int* button);
+
+// Check if command is km.version() - returns true if it matches
+bool kmbox_is_version_command(const char* cmd);
 
 #endif // KMBOX_COMMANDS_H

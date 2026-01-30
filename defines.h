@@ -14,7 +14,10 @@
 #if PICO_PLATFORM == rp2040
 #define DEFAULT_CPU_FREQ 240000
 #elif PICO_PLATFORM == rp2350
-#define DEFAULT_CPU_FREQ 120000
+// Overclock RP2350 to match RP2040 performance for real-time tracking
+// NOTE: This increases power draw and may be unstable on some boards.
+// Default increased from 120 MHz -> 240 MHz (kHz units)
+#define DEFAULT_CPU_FREQ 240000
 #endif
 
 #ifndef CPU_FREQ
@@ -34,17 +37,208 @@
 #define PIN_NEOPIXEL            (21u)   // Neopixel data pin
 #define NEOPIXEL_POWER          (20u)   // Neopixel power pin
 
-// UART configuration for KMBox serial input
-#define KMBOX_UART              uart1    // Use UART1 for KMBox (UART0 is for debug)
-#define KMBOX_UART_TX_PIN       (5u)     // GPIO5 for UART1 TX
-#define KMBOX_UART_RX_PIN       (6u)     // GPIO6 for UART1 RX
-#define KMBOX_UART_BAUDRATE     115200   // Standard baud rate for KMBox
+// UART configuration for KMBox serial input via RP2350 USB Bridge
+// Connected through Feather Click Shield mikroBUS socket 1 or direct UART
+// RP2350 provides USB CDC-to-UART bridge - external PC connects via USB to RP2350,
+// which converts to UART and connects to these pins on the Feather
+#define KMBOX_UART              uart0    // Use UART0 for KMBox (via Click Shield RX/TX pins)
+#define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to RP2350 bridge RX)
+#define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from RP2350 bridge TX)
+#define KMBOX_UART_BAUDRATE     115200  // High-speed baud rate for fast commands (2 Mbps)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
-// UART0 stdio (debug) configuration
-#ifndef STDIO_UART_BAUDRATE
-#define STDIO_UART_BAUDRATE     115200   // High baud for fast non-blocking debug prints
-#endif
+//--------------------------------------------------------------------+
+// FAST BINARY COMMAND PROTOCOL
+//--------------------------------------------------------------------+
+// Ultra-fast binary protocol for minimal latency mouse/keyboard control
+// At 2 Mbps: 8 bytes takes only ~40µs vs ~700µs at 115200
+//
+// Memory-aligned 8-byte packets enable single-cycle struct access
+// Clock-synchronized processing for deterministic timing
+//
+// Command format (8 bytes fixed, 4-byte aligned):
+//   Byte 0: Command type (FAST_CMD_*)
+//   Byte 1-7: Command-specific payload
+//
+// Mouse move:    [0x01][X_lo][X_hi][Y_lo][Y_hi][Buttons][Wheel][0x00]
+// Mouse click:   [0x02][Button][Count][0x00][0x00][0x00][0x00][0x00]
+// Key press:     [0x03][Keycode][Modifiers][0x00][0x00][0x00][0x00][0x00]
+// Key combo:     [0x04][Key1][Key2][Key3][Key4][Modifiers][0x00][0x00]
+// Multi-move:    [0x05][X1][Y1][X2][Y2][X3][Y3][Flags] - 3 moves in 1 packet!
+// Smooth move:   [0x07][X_lo][X_hi][Y_lo][Y_hi][Mode][0x00][0x00]
+// Smooth config: [0x08][MaxPerFrame][VelMatch][0x00][0x00][0x00][0x00][0x00]
+// Smooth clear:  [0x09][0x00][0x00][0x00][0x00][0x00][0x00][0x00]
+// Timed move:    [0x0A][X_lo][X_hi][Y_lo][Y_hi][Time_lo][Time_hi][Mode]
+// Sync:          [0x0B][SeqNum][Time0][Time1][Time2][Time3][0x00][0x00]
+
+#define FAST_CMD_MOUSE_MOVE     0x01    // Relative mouse movement + buttons + wheel
+#define FAST_CMD_MOUSE_CLICK    0x02    // Click with button and count
+#define FAST_CMD_KEY_PRESS      0x03    // Single key press/release
+#define FAST_CMD_KEY_COMBO      0x04    // Multi-key combo (up to 4 keys)
+#define FAST_CMD_MULTI_MOVE     0x05    // 3 mouse moves in one packet
+#define FAST_CMD_MOUSE_ABS      0x06    // Absolute mouse position
+#define FAST_CMD_SMOOTH_MOVE    0x07    // Smooth injection with mode selection
+#define FAST_CMD_SMOOTH_CONFIG  0x08    // Configure smooth injection parameters
+#define FAST_CMD_SMOOTH_CLEAR   0x09    // Clear smooth injection queue
+#define FAST_CMD_TIMED_MOVE     0x0A    // Movement with timestamp for sync
+#define FAST_CMD_SYNC           0x0B    // Clock synchronization packet
+#define FAST_CMD_PING           0xFE    // Fast ping (response: 0xFF)
+#define FAST_CMD_RESPONSE       0xFF    // Response/ACK
+
+#define FAST_CMD_PACKET_SIZE    8       // Fixed 8-byte packet size (4-byte aligned)
+#define FAST_CMD_SYNC_BYTE      0xAA    // Optional sync byte for framing
+#define FAST_CMD_QUEUE_SIZE     16      // Number of packets in aligned ring buffer
+
+// Clock synchronization timing
+// NOTE: Actual HID frame rate depends on connected mouse's bInterval (1-8ms typical)
+// Gaming mice: 1ms (1000Hz), Standard mice: 8ms (125Hz)
+// These are defaults/fallbacks
+#define FAST_CMD_FRAME_US_DEFAULT  1000 // Default 1ms for gaming mice (1000Hz)
+#define FAST_CMD_JITTER_US         100  // Acceptable timing jitter
+#define FAST_CMD_SYNC_INTERVAL     1000 // Sync every 1000 packets (~1 second)
+
+// Button bit flags for FAST_CMD_MOUSE_MOVE
+#define FAST_BTN_LEFT           0x01
+#define FAST_BTN_RIGHT          0x02
+#define FAST_BTN_MIDDLE         0x04
+#define FAST_BTN_BACK           0x08
+#define FAST_BTN_FORWARD        0x10
+
+//--------------------------------------------------------------------+
+// Memory-Aligned Binary Command Structures (packed, 8-byte aligned)
+//--------------------------------------------------------------------+
+// These structures allow direct memory casting from the UART buffer
+// for zero-copy command processing. The compiler will generate
+// optimal single-instruction loads for 16/32-bit fields.
+
+// Generic 8-byte packet (for alignment)
+typedef union __attribute__((packed, aligned(4))) {
+    uint8_t  bytes[8];
+    uint32_t words[2];  // For fast 32-bit copy operations
+    uint64_t qword;     // For single-instruction 64-bit copy (if available)
+} fast_packet_t;
+
+// Mouse move command: 0x01
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x01
+    int16_t  x;         // X movement (little-endian)
+    int16_t  y;         // Y movement (little-endian)
+    uint8_t  buttons;   // Button bit flags
+    int8_t   wheel;     // Wheel movement
+    uint8_t  _pad;      // Padding to 8 bytes
+} fast_cmd_move_t;
+
+// Mouse click command: 0x02
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x02
+    uint8_t  button;    // Button number (0=L, 1=R, 2=M, etc)
+    uint8_t  count;     // Click count
+    uint8_t  _pad[5];   // Padding to 8 bytes
+} fast_cmd_click_t;
+
+// Key press command: 0x03
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x03
+    uint8_t  keycode;   // USB HID keycode
+    uint8_t  modifiers; // Modifier flags
+    uint8_t  _pad[5];   // Padding to 8 bytes
+} fast_cmd_key_t;
+
+// Key combo command: 0x04
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x04
+    uint8_t  keys[4];   // Up to 4 keycodes
+    uint8_t  modifiers; // Modifier flags
+    uint8_t  _pad[2];   // Padding to 8 bytes
+} fast_cmd_combo_t;
+
+// Multi-move command: 0x05 (3 moves in one packet!)
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x05
+    int8_t   x1, y1;    // Move 1
+    int8_t   x2, y2;    // Move 2
+    int8_t   x3, y3;    // Move 3
+    uint8_t  flags;     // Reserved flags
+} fast_cmd_multi_t;
+
+// Smooth move command: 0x07
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x07
+    int16_t  x;         // X movement
+    int16_t  y;         // Y movement
+    uint8_t  mode;      // Injection mode (0-3)
+    uint8_t  _pad[2];   // Padding to 8 bytes
+} fast_cmd_smooth_t;
+
+// Smooth config command: 0x08
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;           // 0x08
+    uint8_t  max_per_frame; // Max pixels per frame (1-127)
+    uint8_t  vel_match;     // Velocity matching enable
+    uint8_t  _pad[5];       // Padding to 8 bytes
+} fast_cmd_config_t;
+
+// Timed move command: 0x0A (for clock-synchronized injection)
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x0A
+    int16_t  x;         // X movement
+    int16_t  y;         // Y movement
+    uint16_t time_us;   // Execution time offset (microseconds from sync)
+    uint8_t  mode;      // Injection mode
+} fast_cmd_timed_t;
+
+// Sync command: 0x0B (clock synchronization)
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0x0B
+    uint8_t  seq_num;   // Sequence number for ordering
+    uint32_t timestamp; // PC timestamp in microseconds (for RTT calc)
+    uint8_t  _pad[2];   // Padding to 8 bytes
+} fast_cmd_sync_t;
+
+// Ping command: 0xFE
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0xFE
+    uint8_t  _pad[7];   // Padding to 8 bytes
+} fast_cmd_ping_t;
+
+// Response command: 0xFF
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cmd;       // 0xFF
+    uint8_t  status;    // Response status
+    uint32_t timestamp; // Device timestamp for sync
+    uint8_t  _pad[2];   // Padding to 8 bytes
+} fast_cmd_response_t;
+
+// Union for type-punned access (cast packet buffer directly)
+typedef union __attribute__((packed, aligned(4))) {
+    fast_packet_t      raw;
+    fast_cmd_move_t    move;
+    fast_cmd_click_t   click;
+    fast_cmd_key_t     key;
+    fast_cmd_combo_t   combo;
+    fast_cmd_multi_t   multi;
+    fast_cmd_smooth_t  smooth;
+    fast_cmd_config_t  config;
+    fast_cmd_timed_t   timed;
+    fast_cmd_sync_t    sync;
+    fast_cmd_ping_t    ping;
+    fast_cmd_response_t response;
+} fast_cmd_union_t;
+
+// Compile-time validation
+_Static_assert(sizeof(fast_cmd_move_t) == 8, "fast_cmd_move_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_click_t) == 8, "fast_cmd_click_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_key_t) == 8, "fast_cmd_key_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_combo_t) == 8, "fast_cmd_combo_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_multi_t) == 8, "fast_cmd_multi_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_smooth_t) == 8, "fast_cmd_smooth_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_config_t) == 8, "fast_cmd_config_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_timed_t) == 8, "fast_cmd_timed_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_sync_t) == 8, "fast_cmd_sync_t must be 8 bytes");
+_Static_assert(sizeof(fast_cmd_union_t) == 8, "fast_cmd_union_t must be 8 bytes");
+_Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
+
+#define DEBUG_OUTPUT_USB_CDC    0        // Always disable debug output over USB CDC
 
 // USB port configuration
 #define USB_DEVICE_PORT         0       // On-board USB controller port (device mode)
@@ -164,10 +358,6 @@
 #define CONFIG_TOTAL_LEN                (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
 #define EPNUM_HID                       HID_ENDPOINT_ADDRESS
 
-// HID report descriptor length is always patched at runtime to match the
-// constructed runtime HID report descriptor which mirrors the attached host
-// mouse. No compile-time static length is used.
-
 //--------------------------------------------------------------------+
 // HID CONFIGURATION
 //--------------------------------------------------------------------+
@@ -203,16 +393,7 @@
 // Mouse button masks
 #define MOUSE_BUTTON_NONE               0x00    // No mouse buttons pressed
 
-//--------------------------------------------------------------------+
-// SERIAL STRING CONFIGURATION
-//--------------------------------------------------------------------+
 
-#define SERIAL_STRING_LENGTH            16      // 16 hex characters for unique ID
-#define SERIAL_STRING_BUFFER_SIZE       17      // 16 chars + null terminator
-#define SERIAL_HEX_CHARS_PER_BYTE       2       // 2 hex characters per byte
-#define SERIAL_SNPRINTF_BUFFER_SIZE     3       // Buffer size for snprintf formatting
-
-//--------------------------------------------------------------------+
 // STRING DESCRIPTOR PROCESSING
 //--------------------------------------------------------------------+
 
@@ -254,6 +435,19 @@
 #define COLOR_KEYBOARD_ACTIVITY         0xFFFF00  // Yellow flash for keyboard
 #define COLOR_USB_CONNECTION            0x00FF80  // Bright green flash for USB connection
 #define COLOR_USB_DISCONNECTION         0xFF8000  // Orange flash for USB disconnection
+
+// Bridge Serial Connection Colors
+#define COLOR_BRIDGE_WAITING            0x0080FF  // Light blue - waiting for connection
+#define COLOR_BRIDGE_CONNECTING         0xFFFF00  // Yellow - handshake in progress
+#define COLOR_BRIDGE_CONNECTED          0x00FF00  // Green - connected and ready
+#define COLOR_BRIDGE_ACTIVE             0x00FFFF  // Cyan - actively receiving commands
+#define COLOR_BRIDGE_DISCONNECTED       0xFF4000  // Orange-red - connection lost
+
+// Humanization mode colors (for button mode switching)
+#define COLOR_HUMANIZATION_OFF          0xFF0000  // Red - no humanization
+#define COLOR_HUMANIZATION_LOW          0xFFFF00  // Yellow - minimal humanization
+#define COLOR_HUMANIZATION_MEDIUM       0x00FF00  // Green - balanced (default)
+#define COLOR_HUMANIZATION_HIGH         0x00FFFF  // Cyan - maximum humanization
 
 // Brightness constants
 #define MIN_BRIGHTNESS                  0.0f
@@ -385,4 +579,4 @@
     #define LOG_ERROR(fmt, ...) ((void)0)
 #endif
 
-#endif // DEFINES_CONSOLIDATED_H
+#endif // DEFINES_H

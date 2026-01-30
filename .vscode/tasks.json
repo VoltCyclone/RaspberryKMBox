@@ -157,6 +157,60 @@
             "windows": {
                 "command": "${env:USERPROFILE}/.pico-sdk/openocd/0.12.0+dev/openocd.exe"
             }
+        },
+        {
+            "label": "Build Bridge (XIAO RP2350)",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["bridge"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Build All (KMBox + Bridge)",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["all"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Clean Build All",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["all", "clean"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Run Bridge (XIAO RP2350)",
+            "type": "process",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
+            "args": [
+                "load",
+                "${workspaceFolder}/bridge/build/kmbox_bridge.uf2",
+                "-fx"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
+            }
         }
     ]
 }

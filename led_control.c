@@ -60,6 +60,11 @@ typedef struct {
     uint16_t rainbow_hue;  // 0..359
     // Movement-driven rainbow
     uint32_t rainbow_last_update_time_ms;
+    // other non-blocking thing
+    bool mode_flash_active;
+    uint32_t mode_flash_start_time;
+    uint32_t mode_flash_duration;
+    uint32_t mode_flash_color;
 } led_controller_t;
 
 /**
@@ -108,7 +113,13 @@ static const status_config_t g_status_configs[] = {
     [STATUS_SUSPENDED]            = {COLOR_SUSPENDED,            true,  "SUSPENDED"},
     [STATUS_USB_RESET_PENDING]    = {COLOR_USB_RESET_PENDING,    true,  "USB_RESET_PENDING"},
     [STATUS_USB_RESET_SUCCESS]    = {COLOR_USB_RESET_SUCCESS,    false, "USB_RESET_SUCCESS"},
-    [STATUS_USB_RESET_FAILED]     = {COLOR_USB_RESET_FAILED,     true,  "USB_RESET_FAILED"}
+    [STATUS_USB_RESET_FAILED]     = {COLOR_USB_RESET_FAILED,     true,  "USB_RESET_FAILED"},
+    // Bridge connection states
+    [STATUS_BRIDGE_WAITING]       = {COLOR_BRIDGE_WAITING,       true,  "BRIDGE_WAITING"},
+    [STATUS_BRIDGE_CONNECTING]    = {COLOR_BRIDGE_CONNECTING,    false, "BRIDGE_CONNECTING"},
+    [STATUS_BRIDGE_CONNECTED]     = {COLOR_BRIDGE_CONNECTED,     false, "BRIDGE_CONNECTED"},
+    [STATUS_BRIDGE_ACTIVE]        = {COLOR_BRIDGE_ACTIVE,        false, "BRIDGE_ACTIVE"},
+    [STATUS_BRIDGE_DISCONNECTED]  = {COLOR_BRIDGE_DISCONNECTED,  true,  "BRIDGE_DISCONNECTED"}
 };
 
 //--------------------------------------------------------------------+
@@ -226,6 +237,17 @@ void led_set_blink_interval(uint32_t interval_ms)
     if (interval_ms > 0) {
         g_led_controller.last_blink_time = get_current_time_ms();
     }
+}
+
+// --------------------------------------------------------------------+
+// NON-BLOCKING MODE FLASH FUNCTION
+// --------------------------------------------------------------------+
+void neopixel_trigger_mode_flash(uint32_t color, uint32_t duration_ms) {
+    g_led_controller.mode_flash_active = true;
+    g_led_controller.mode_flash_start_time = get_current_time_ms();
+    g_led_controller.mode_flash_duration = duration_ms;
+    g_led_controller.mode_flash_color = color;
+    neopixel_set_color(color);
 }
 
 //--------------------------------------------------------------------+
@@ -608,13 +630,21 @@ void neopixel_status_task(void)
     if (!g_led_controller.activity_flash_active && !g_led_controller.caps_lock_flash_active) {
         handle_breathing_effect();
     }
+
+    if (g_led_controller.mode_flash_active) {
+        if (is_time_elapsed(g_led_controller.mode_flash_start_time, 
+                            g_led_controller.mode_flash_duration)) {
+            g_led_controller.mode_flash_active = false;
+        }
+        return; // Don't process other effects during flash
+    }
 }
 
 //--------------------------------------------------------------------+
 // ACTIVITY TRIGGER FUNCTIONS
 //--------------------------------------------------------------------+
 
-static void trigger_activity_flash_internal(uint32_t color)
+void neopixel_trigger_activity_flash_color(uint32_t color)
 {
     if (!g_led_controller.initialized || !validate_color(color)) {
         return;
@@ -625,37 +655,13 @@ static void trigger_activity_flash_internal(uint32_t color)
     g_led_controller.activity_flash_color = color;
 }
 
-void neopixel_trigger_activity_flash(void)
-{
-    trigger_activity_flash_internal(COLOR_ACTIVITY_FLASH);
-}
 
-void neopixel_trigger_mouse_activity(void)
-{
-    trigger_activity_flash_internal(COLOR_MOUSE_ACTIVITY);
-}
-
-void neopixel_trigger_keyboard_activity(void)
-{
-    trigger_activity_flash_internal(COLOR_KEYBOARD_ACTIVITY);
-}
-
-void neopixel_trigger_usb_connection_flash(void)
-{
-    trigger_activity_flash_internal(COLOR_USB_CONNECTION);
-}
-
-void neopixel_trigger_usb_disconnection_flash(void)
-{
-    trigger_activity_flash_internal(COLOR_USB_DISCONNECTION);
-}
 
 void neopixel_trigger_caps_lock_flash(void)
 {
     if (!g_led_controller.initialized) {
         return;
     }
-
     g_led_controller.caps_lock_flash_active = true;
     g_led_controller.caps_lock_flash_start_time = get_current_time_ms();
 }
@@ -669,9 +675,7 @@ void neopixel_trigger_usb_reset_pending(void)
     if (!g_led_controller.initialized) {
         return;
     }
-
     neopixel_set_status_override(STATUS_USB_RESET_PENDING);
-    (void)0; // suppressed status reset pending log
 }
 
 void neopixel_trigger_usb_reset_success(void)
@@ -679,14 +683,8 @@ void neopixel_trigger_usb_reset_success(void)
     if (!g_led_controller.initialized) {
         return;
     }
-
-    // Clear any status override first
     neopixel_clear_status_override();
-    
-    // Trigger success flash
-    trigger_activity_flash_internal(COLOR_USB_RESET_SUCCESS);
-    
-    (void)0; // suppressed status reset success log
+    neopixel_trigger_activity_flash_color(COLOR_USB_RESET_SUCCESS);
 }
 
 void neopixel_trigger_usb_reset_failed(void)
@@ -694,9 +692,7 @@ void neopixel_trigger_usb_reset_failed(void)
     if (!g_led_controller.initialized) {
         return;
     }
-
     neopixel_set_status_override(STATUS_USB_RESET_FAILED);
-    (void)0; // suppressed status reset failed log
 }
 
 //--------------------------------------------------------------------+
@@ -706,14 +702,14 @@ void neopixel_trigger_usb_reset_failed(void)
 void neopixel_set_status_override(system_status_t status)
 {
     if (!g_led_controller.initialized || !validate_status(status)) {
-        (void)status; // suppressed log to avoid blocking hot paths
+        (void)status;
         return;
     }
 
     g_led_controller.status_override = status;
     g_led_controller.status_override_active = true;
 
-    (void)0; // suppressed status override log
+    (void)0;
 }
 
 void neopixel_clear_status_override(void)
@@ -723,7 +719,7 @@ void neopixel_clear_status_override(void)
     }
 
     g_led_controller.status_override_active = false;
-    (void)0; // suppressed status override cleared log
+    (void)0;
 }
 
 //--------------------------------------------------------------------+

@@ -15,7 +15,7 @@
 
 // Default configurations
 const kmbox_uart_config_t KMBOX_UART_DEFAULT_CONFIG = {
-    .baudrate = 250000,
+    .baudrate = 115200,
     .tx_pin = 4,
     .rx_pin = 5,
     .use_dma = true

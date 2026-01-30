@@ -1,0 +1,61 @@
+; PIO UART TX Program for KMBox Bridge
+; Transmits serial data at configured baud rate to RP2040
+; Based on Raspberry Pi Pico SDK examples
+;
+; 8N1 serial format:
+; - 1 start bit (0)
+; - 8 data bits (LSB first)
+; - 1 stop bit (1)
+;
+; Clock divider should be set to: sysclk / (baud * 10)
+; Each bit takes 10 instruction cycles
+
+.program uart_tx
+.side_set 1 opt
+
+; An 8n1 UART transmit program.
+; OUT pin 0 and side-set pin 0 are both mapped to UART TX pin.
+
+    pull       side 1 [7]  ; Assert stop bit, or stall with line in idle state
+    set x, 7   side 0 [7]  ; Preload bit counter, assert start bit for 8 clocks
+bitloop:                   ; This loop will run 8 times (8n1)
+    out pins, 1            ; Shift 1 bit from OSR to the first OUT pin
+    jmp x-- bitloop   [6]  ; Each loop iteration is 8 cycles.
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void uart_tx_program_init(PIO pio, uint sm, uint offset, uint pin, uint baud) {
+    // Tell PIO to initially drive output-high on the selected pin, then map PIO
+    // onto that pin with the IO muxes.
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_gpio_init(pio, pin);
+
+    pio_sm_config c = pio_get_default_sm_config();
+
+    // OUT shifts to right, autopull at 8 bits
+    sm_config_set_out_shift(&c, true, true, 8);
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // We need to clock at 10x the desired baud rate for proper timing
+    float div = (float)clock_get_hz(clk_sys) / (baud * 10);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void uart_tx_program_putc(PIO pio, uint sm, char c) {
+    pio_sm_put_blocking(pio, sm, (uint32_t)c);
+}
+
+static inline void uart_tx_program_puts(PIO pio, uint sm, const char *s) {
+    while (*s) {
+        uart_tx_program_putc(pio, sm, *s++);
+    }
+}
+
+%}
