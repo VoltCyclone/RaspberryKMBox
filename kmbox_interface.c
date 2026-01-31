@@ -270,7 +270,14 @@ bool kmbox_interface_send(const uint8_t* data, size_t len)
     
     // Start transmission if not in progress
     if (!g_interface.tx_in_progress) {
-        // TODO: Implement TX transmission
+        // TODO: Implement TX DMA transmission
+        // Currently, this interface is not actively used - the kmbox_serial_handler
+        // uses direct UART writes via uart_write_blocking() for responses.
+        // If this interface becomes active, implement DMA transfer here:
+        //   1. Configure DMA channel for TX buffer to UART FIFO
+        //   2. Start DMA transfer with completion interrupt
+        //   3. Clear tx_in_progress flag in IRQ handler
+        // For now, data is buffered but not transmitted (safe since unused)
         g_interface.tx_in_progress = true;
     }
     

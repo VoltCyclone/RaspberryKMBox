@@ -435,13 +435,7 @@ static void main_application_loop(void) {
 
 int main(void) {
     
-    // Set system clock to 120MHz or 240MHz (required for PIO USB, speed depends on device type)
-    set_sys_clock_khz(CPU_FREQ, true);
-    
-    // Small delay for clock stabilization
-    sleep_ms(10);
-    
-    // Initialize basic GPIO
+    // Initialize basic GPIO (clock will be set by initialize_system)
     #ifdef PIN_USB_5V
     gpio_init(PIN_USB_5V);
     gpio_set_dir(PIN_USB_5V, GPIO_OUT);
@@ -454,7 +448,7 @@ int main(void) {
     
     printf("=== PIOKMBox Starting ===\n");
     
-    // Initialize system components
+    // Initialize system components (includes clock configuration)
     if (!initialize_system()) {
         printf("CRITICAL: System initialization failed\n");
         return -1;

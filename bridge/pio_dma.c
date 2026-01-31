@@ -74,13 +74,15 @@ bool pio_uart_rx_dma_init(PIO pio, uint sm, uint pin, uint baud, int *dma_chan,
     channel_config_set_high_priority(&c, true);
     
     // Apply config and start continuous transfer
+    // NOTE: PIO RX FIFO with right-shift puts 8-bit data in bits 31:24 (MSB)
+    // For 8-bit DMA reads, we read from rxf[sm] + 3 to get the MSB byte
     dma_channel_configure(
         *dma_chan,
         &c,
-        buffer,         // Write to circular buffer
-        &pio->rxf[sm],  // Read from PIO RX FIFO
-        0xFFFFFFFF,     // Transfer count (continuous)
-        true            // Start immediately
+        buffer,                          // Write to circular buffer
+        ((uint8_t*)&pio->rxf[sm]) + 3,   // Read from PIO RX FIFO MSB (where data lands)
+        0xFFFFFFFF,                      // Transfer count (continuous)
+        true                             // Start immediately
     );
     
     // Store buffer base for position calculation

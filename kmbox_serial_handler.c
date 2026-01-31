@@ -37,6 +37,20 @@
 #include <string.h>
 
 //--------------------------------------------------------------------+
+// Alignment-Safe Memory Access Helpers
+//--------------------------------------------------------------------+
+// ARM Cortex-M supports unaligned access but it's slower.
+// These helpers ensure portable, efficient access.
+
+static inline int16_t read_i16_le(const uint8_t *p) {
+    return (int16_t)(p[0] | (p[1] << 8));
+}
+
+static inline uint16_t read_u16_le(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+//--------------------------------------------------------------------+
 // Memory-Aligned Fast Command Ring Buffer
 //--------------------------------------------------------------------+
 // 4-byte aligned ring buffer for zero-copy command processing
@@ -131,8 +145,8 @@ static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
         case BRIDGE_CMD_MOUSE_MOVE: {
             // Move: [SYNC][CMD][x_lo][x_hi][y_lo][y_hi] = 6 bytes
             if (available < 6) return 0;
-            int16_t x = *((int16_t*)(data + 2));
-            int16_t y = *((int16_t*)(data + 4));
+            int16_t x = read_i16_le(data + 2);
+            int16_t y = read_i16_le(data + 4);
             // Call kmbox API directly to queue movement (bypasses USB ready checks)
             kmbox_add_mouse_movement(x, y);
             return 6;

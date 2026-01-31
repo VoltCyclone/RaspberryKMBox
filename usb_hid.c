@@ -57,7 +57,8 @@ static void utf16_to_utf8(uint16_t *utf16_buf, size_t utf16_buf_bytes, char *utf
     
     // Unroll loop by 4 for better performance (most strings are short)
     size_t i = 0;
-    while (i + 3 < code_units && utf8_pos + 3 < utf8_len - 1) {
+    size_t utf16_buf_len = utf16_buf_bytes / 2;  // Total UTF-16 code units available
+    while (i + 3 < code_units && utf8_pos + 3 < utf8_len - 1 && (1 + i + 3) < utf16_buf_len) {
         uint16_t u0 = utf16_buf[1 + i];
         uint16_t u1 = utf16_buf[1 + i + 1];
         uint16_t u2 = utf16_buf[1 + i + 2];

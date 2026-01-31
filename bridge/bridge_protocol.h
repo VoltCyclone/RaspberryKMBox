@@ -106,8 +106,10 @@ typedef union {
 static inline size_t bridge_build_mouse_move(uint8_t* buf, int16_t x, int16_t y) {
     buf[0] = BRIDGE_SYNC_BYTE;
     buf[1] = BRIDGE_CMD_MOUSE_MOVE;
-    *((int16_t*)(buf + 2)) = x;
-    *((int16_t*)(buf + 4)) = y;
+    buf[2] = (uint8_t)(x & 0xFF);
+    buf[3] = (uint8_t)((x >> 8) & 0xFF);
+    buf[4] = (uint8_t)(y & 0xFF);
+    buf[5] = (uint8_t)((y >> 8) & 0xFF);
     return 6;
 }
 
@@ -129,8 +131,10 @@ static inline size_t bridge_build_button_set(uint8_t* buf, uint8_t mask, uint8_t
 static inline size_t bridge_build_mouse_move_wheel(uint8_t* buf, int16_t x, int16_t y, int8_t wheel) {
     buf[0] = BRIDGE_SYNC_BYTE;
     buf[1] = BRIDGE_CMD_MOUSE_MOVE_WHEEL;
-    *((int16_t*)(buf + 2)) = x;
-    *((int16_t*)(buf + 4)) = y;
+    buf[2] = (uint8_t)(x & 0xFF);
+    buf[3] = (uint8_t)((x >> 8) & 0xFF);
+    buf[4] = (uint8_t)(y & 0xFF);
+    buf[5] = (uint8_t)((y >> 8) & 0xFF);
     buf[6] = wheel;
     return 7;
 }

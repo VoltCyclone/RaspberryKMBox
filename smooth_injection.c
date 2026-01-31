@@ -191,24 +191,24 @@ static smooth_queue_entry_t* queue_alloc(void) {
         return NULL;
     }
     
-    // O(1) allocation using bitmask to track free slots
+    // O(1) allocation using global bitmask to track free slots
     // Check 8 slots at a time using bit operations
-    static uint32_t free_bitmap = 0xFFFFFFFF; // 1 = free, 0 = used
+    // Note: Uses global g_free_bitmap (declared at line 42) for proper synchronization
     
-    if (free_bitmap == 0) {
+    if (g_free_bitmap == 0) {
         // Rebuild bitmap (should rarely happen)
-        free_bitmap = 0;
+        g_free_bitmap = 0;
         for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
             if (!g_smooth.queue[i].active) {
-                free_bitmap |= (1u << i);
+                g_free_bitmap |= (1u << i);
             }
         }
-        if (free_bitmap == 0) return NULL;
+        if (g_free_bitmap == 0) return NULL;
     }
     
     // Find first free slot using count trailing zeros (CTZ)
-    int idx = __builtin_ctz(free_bitmap);
-    free_bitmap &= ~(1u << idx);
+    int idx = __builtin_ctz(g_free_bitmap);
+    g_free_bitmap &= ~(1u << idx);
     
     g_smooth.queue_count++;
     return &g_smooth.queue[idx];
@@ -219,6 +219,11 @@ static void queue_free(smooth_queue_entry_t *entry) {
         entry->active = false;
         if (g_smooth.queue_count > 0) {
             g_smooth.queue_count--;
+        }
+        // Restore bit in free bitmap for reallocation
+        int idx = entry - g_smooth.queue;
+        if (idx >= 0 && idx < SMOOTH_QUEUE_SIZE) {
+            g_free_bitmap |= (1u << idx);
         }
     }
 }

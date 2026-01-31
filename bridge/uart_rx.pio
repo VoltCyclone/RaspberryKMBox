@@ -30,6 +30,7 @@ static inline void uart_rx_program_init(PIO pio, uint sm, uint offset, uint pin,
     sm_config_set_wrap(&c, offset, offset + 4);
     
     // IN shifts right (LSB first), autopush at 8 bits
+    // Data lands in bits 31:24 (MSB) of FIFO word
     sm_config_set_in_shift(&c, true, true, 8);
     sm_config_set_in_pins(&c, pin);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);

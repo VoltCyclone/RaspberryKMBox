@@ -25,9 +25,6 @@ static volatile uint32_t frames_queued = 0;
 static volatile uint32_t cmds_produced = 0;
 static volatile uint32_t queue_overflows = 0;
 
-// Spinlock for safe inter-core synchronization (hardware-backed)
-static spin_lock_t* translation_lock;
-
 // Core1 main translation loop
 static void __not_in_flash_func(core1_main)(void) {
     // Run translation loop at max speed
@@ -81,9 +78,6 @@ void core1_translator_init(void) {
     frames_queued = 0;
     cmds_produced = 0;
     queue_overflows = 0;
-    
-    // Claim spinlock for inter-core synchronization
-    translation_lock = spin_lock_init(spin_lock_claim_unused(true));
     
     // Launch Core1
     multicore_launch_core1(core1_main);

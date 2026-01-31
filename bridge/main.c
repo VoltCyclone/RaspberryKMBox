@@ -45,7 +45,7 @@ static int dma_rx_chan = -1;
 
 // DMA RX circular buffer
 #define DMA_RX_BUFFER_SIZE 256
-static uint8_t dma_rx_buffer[DMA_RX_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint8_t dma_rx_buffer[DMA_RX_BUFFER_SIZE] __attribute__((aligned(DMA_RX_BUFFER_SIZE)));
 static volatile uint32_t dma_rx_read_pos = 0;
 
 // API Mode State (KMBox native, Makcu, or Ferrum)
@@ -56,6 +56,10 @@ static uint32_t last_button_check = 0;
 static bool button_state = false;
 static uint32_t button_press_start = 0;
 static bool button_init_done = false;
+
+// Ferrum line buffer (file scope for mode change reset)
+static char ferrum_line[256];
+static uint8_t ferrum_idx = 0;
 
 #define MODE_BUTTON_PIN 7
 #define BUTTON_DEBOUNCE_MS 50
@@ -150,7 +154,7 @@ static void ws2812_init(void) {
     uint offset = pio_add_program(ws2812_pio, &ws2812_program);
     
     pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_wrap(&c, offset, offset + 3);
+    sm_config_set_wrap(&c, offset, offset + ws2812_program.length - 1);
     sm_config_set_sideset(&c, 1, false, false);
     sm_config_set_out_shift(&c, false, true, 24);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
@@ -190,11 +194,8 @@ static inline uint8_t pio_uart_rx_getc(void) {
 }
 
 static inline void pio_uart_tx_byte(uint8_t c) {
-    // Wait for DMA to be ready, then send single byte
-    while (!pio_uart_tx_dma_ready(dma_tx_chan)) {
-        tight_loop_contents();
-    }
-    pio_uart_tx_dma_send(dma_tx_chan, pio0, sm_tx, &c, 1);
+    // Use PIO FIFO directly for single bytes (more efficient than DMA setup)
+    pio_sm_put_blocking(pio, sm_tx, (uint32_t)c);
 }
 
 // Button handling for API mode toggle
@@ -245,7 +246,14 @@ static void button_task(void) {
         button_state = false;
         
         if (duration < BUTTON_LONG_PRESS_MS) {
+            api_mode_t old_mode = current_api_mode;
             current_api_mode = (current_api_mode + 1) % 3;
+            
+            // Reset Ferrum buffer when switching modes
+            if (old_mode == API_MODE_FERRUM || current_api_mode == API_MODE_FERRUM) {
+                ferrum_idx = 0;
+            }
+            
             printf("API mode: %s\n", 
                 current_api_mode == API_MODE_KMBOX ? "KMBox" :
                 current_api_mode == API_MODE_MAKCU ? "Makcu" : "Ferrum");
@@ -280,20 +288,11 @@ static inline bool send_uart_packet(const uint8_t* data, size_t len) {
 // UART RX Processing - Status Messages from KMBox
 // ============================================================================
 
-// UART statistics (declared here so process_status_message can use them)
+// UART statistics
 static uint32_t uart_rx_bytes_total = 0;
 static uint32_t uart_tx_bytes_total = 0;
-static uint32_t text_messages_received = 0;
-static uint32_t binary_packets_received = 0;
-
-// Debug: track byte types received
-static uint32_t rx_printable_chars = 0;
-static uint32_t rx_control_chars = 0;
-static uint32_t rx_binary_start = 0;
-static uint32_t rx_newlines = 0;
 
 static void process_status_message(const char* msg, size_t len) {
-    text_messages_received++;
     
     // Check for handshake response
     if (len >= 11 && strncmp(msg, "KMBOX_READY", 11) == 0) {
@@ -343,23 +342,16 @@ static void uart_rx_task(void) {
         uint8_t c = pio_uart_rx_getc();
         uart_rx_bytes_total++;
         batch_count++;
-        kmbox_last_rx_time = now;  // Track last RX time
-        
-        // Debug: categorize received bytes
-        if (c == 0xFF || c == 0xFE) {
-            rx_binary_start++;
-        } else if (c == '\n' || c == '\r') {
-            rx_newlines++;
-        } else if (c >= 0x20 && c < 0x7F) {
-            rx_printable_chars++;
-        } else {
-            rx_control_chars++;
-        }
         
         // Reset binary packet state if timeout (stuck packet)
-        if (in_binary_packet && (now - binary_packet_start_time) > 100) {
-            in_binary_packet = false;
-            binary_idx = 0;
+        if (in_binary_packet) {
+            if ((now - binary_packet_start_time) > 100) {
+                in_binary_packet = false;
+                binary_idx = 0;
+            }
+            kmbox_last_rx_time = now;
+        } else {
+            kmbox_last_rx_time = now;
         }
         
         // Check for start of binary response packet (0xFF or 0xFE from KMBox)
@@ -376,7 +368,6 @@ static void uart_rx_task(void) {
             binary_packet[binary_idx++] = c;
             if (binary_idx >= 8) {
                 // Complete packet received - forward to PC and process
-                binary_packets_received++;
                 if (binary_packet[0] == 0xFF) {
                     kmbox_response_count++;
                     
@@ -486,17 +477,16 @@ static void uart_debug_task(void) {
     static uint32_t last_debug_time = 0;
     
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_debug_time >= 5000) {  // Every 5 seconds
+    
+    if (now - last_debug_time >= 10000) {  // Every 10 seconds
         last_debug_time = now;
         if (tud_cdc_connected()) {
             const char* state_str = (kmbox_state == KMBOX_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
             
-            char debug_msg[200];
+            char debug_msg[80];
             snprintf(debug_msg, sizeof(debug_msg), 
-                     "[Bridge] %s | TX:%lu RX:%lu | Print:%lu Ctrl:%lu NL:%lu Bin:%lu | Msg:%lu Pkt:%lu\r\n", 
-                     state_str, uart_tx_bytes_total, uart_rx_bytes_total,
-                     rx_printable_chars, rx_control_chars, rx_newlines, rx_binary_start,
-                     text_messages_received, binary_packets_received);
+                     "[Bridge] %s | TX:%lu RX:%lu\r\n", 
+                     state_str, uart_tx_bytes_total, uart_rx_bytes_total);
             tud_cdc_write_str(debug_msg);
             tud_cdc_write_flush();
         }
@@ -543,6 +533,12 @@ static inline bool is_fast_cmd_byte(uint8_t b) {
 // Text command buffer
 static char cmd_buffer[128];
 static uint8_t cmd_buffer_idx = 0;
+
+// Partial packet state for Makcu/KMBox (to avoid data loss across CDC reads)
+static uint8_t pending_makcu[MAKCU_MAX_PAYLOAD + 4];
+static uint8_t pending_makcu_len = 0;
+static uint8_t pending_kmbox[8];
+static uint8_t pending_kmbox_len = 0;
 
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
@@ -692,9 +688,6 @@ static void cdc_task(void) {
         
         // Ferrum text protocol - line-based
         if (current_api_mode == API_MODE_FERRUM) {
-            static char ferrum_line[256];
-            static uint8_t ferrum_idx = 0;
-            
             if (b == '\n' || b == '\r') {
                 if (ferrum_idx > 0) {
                     ferrum_line[ferrum_idx] = '\0';

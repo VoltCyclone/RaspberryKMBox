@@ -13,7 +13,7 @@
 // Hardware Configuration
 #define UART_TX_PIN          1        // Bridge TX → Doubler → KMBox RX
 #define UART_RX_PIN          0        // Bridge RX ← Doubler ← KMBox TX
-#define UART_BAUD            2000000  // Baud rate for RP2350<->RP2040 communication (2 Mbaud)
+#define UART_BAUD            921600   // Baud rate for RP2350<->RP2040 communication (921600 for reliability)
 #define LED_PIN              PICO_DEFAULT_LED_PIN
 #define WS2812_PIN           PICO_DEFAULT_WS2812_PIN
 #define MODE_BUTTON_PIN      7        // API mode toggle button (same as KMBox reset button)
