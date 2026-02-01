@@ -541,25 +541,13 @@ static void send_text_mouse_move(int16_t dx, int16_t dy) {
     // Flash LED on Bridge side to confirm we're sending
     gpio_put(LED_PIN, 1);
     
-    bool sent = send_uart_packet((const uint8_t*)cmd, len);
+    send_uart_packet((const uint8_t*)cmd, len);
     uart_tx_bytes_total += len;
     tft_mouse_activity_count++;  // Track mouse commands for TFT display
     injection_count++;  // Track successful injections
     
-    // Debug: show UART sends (always now for debugging)
-    if (tud_cdc_connected()) {
-        char dbg[64];
-        snprintf(dbg, sizeof(dbg), "[UART>%s sent=%d len=%d]", cmd, sent, len);
-        // Remove newline from debug output
-        char *nl = strchr(dbg, '\n');
-        if (nl) *nl = ' ';
-        tud_cdc_write_str(dbg);
-        tud_cdc_write_str("\r\n");
-        tud_cdc_write_flush();
-    }
-    
-    // Brief LED pulse
-    sleep_us(100);
+    // Brief LED pulse (no blocking debug output in hot path)
+    sleep_us(50);
     gpio_put(LED_PIN, 0);
 }
 
@@ -614,7 +602,7 @@ static void handle_text_command(const char* cmd) {
         send_mouse_command(x, y, 0);
         if (tud_cdc_connected()) {
             tud_cdc_write_str(">>>\r\n");
-            tud_cdc_write_flush();
+            // No flush - let USB send when ready (non-blocking)
         }
         return;
     }
@@ -1014,6 +1002,7 @@ static void tft_update_task(void) {
     stats.rx_bytes = uart_rx_bytes_total;
     stats.tx_rate_bps = uart_tx_rate_bps;
     stats.rx_rate_bps = uart_rx_rate_bps;
+    stats.uart_baud = UART_BAUD;  // From config.h
     
     // Attached device info from KMBox
     stats.device_vid = attached_vid;

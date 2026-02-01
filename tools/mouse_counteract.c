@@ -191,6 +191,7 @@ void* serial_reader_thread(void* arg) {
 void* serial_sender_thread(void* arg) {
     (void)arg;
     uint32_t send_count = 0;
+    uint32_t drop_count = 0;
     
     printf("[SENDER] Thread started\n");
     
@@ -199,26 +200,45 @@ void* serial_sender_thread(void* arg) {
         uint32_t tail = g_move_queue_tail;
         
         if (head != tail) {
-            // Dequeue movement
-            move_cmd_t cmd = g_move_queue[tail & MOVE_QUEUE_MASK];
-            __sync_synchronize();  // Memory barrier before updating tail
-            g_move_queue_tail = (tail + 1) & MOVE_QUEUE_MASK;
+            // Coalesce all pending movements into one command
+            int32_t total_dx = 0;
+            int32_t total_dy = 0;
+            int coalesced = 0;
             
-            // Send via serial with retry on EAGAIN
+            while (head != tail && coalesced < 32) {
+                move_cmd_t cmd = g_move_queue[tail & MOVE_QUEUE_MASK];
+                total_dx += cmd.dx;
+                total_dy += cmd.dy;
+                tail = (tail + 1) & MOVE_QUEUE_MASK;
+                coalesced++;
+            }
+            
+            // Update tail pointer after coalescing
+            __sync_synchronize();
+            g_move_queue_tail = tail;
+            
+            // Clamp to valid range
+            if (total_dx > 127) total_dx = 127;
+            if (total_dx < -127) total_dx = -127;
+            if (total_dy > 127) total_dy = 127;
+            if (total_dy < -127) total_dy = -127;
+            
+            // Send coalesced movement
             char buf[32];
-            int len = snprintf(buf, sizeof(buf), "km.move(%d, %d)\n", cmd.dx, cmd.dy);
+            int len = snprintf(buf, sizeof(buf), "km.move(%d, %d)\n", (int)total_dx, (int)total_dy);
             
             int offset = 0;
             int retries = 0;
-            while (offset < len && retries < 50) {
+            while (offset < len && retries < 100) {
                 ssize_t written = write(g_serial_fd, buf + offset, len - offset);
                 
                 if (written > 0) {
                     offset += written;
+                    retries = 0;  // Reset retries on successful write
                 } else if (written < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // Buffer full, wait a bit and retry
-                        usleep(500);  // 500µs
+                        // Buffer full, wait longer and retry
+                        usleep(2000);  // 2ms wait for buffer to drain
                         retries++;
                     } else {
                         printf("[SENDER] write() error: %s\n", strerror(errno));
@@ -231,22 +251,26 @@ void* serial_sender_thread(void* arg) {
             if (offset == len) {
                 send_count++;
                 __sync_fetch_and_add(&g_stats.packets_sent, 1);
-                __sync_fetch_and_add(&g_stats.movements_countered, 1);
+                __sync_fetch_and_add(&g_stats.movements_countered, coalesced);
                 if (g_config.verbose && send_count <= 10) {
-                    printf("[SENDER] Sent #%u: km.move(%d, %d)\n", send_count, cmd.dx, cmd.dy);
+                    printf("[SENDER] Sent #%u (coalesced %d): km.move(%d, %d)\n", 
+                           send_count, coalesced, (int)total_dx, (int)total_dy);
                 }
-            } else if (retries >= 50) {
-                printf("[SENDER] Dropped packet after 50 retries\n");
+            } else if (retries >= 100) {
+                drop_count++;
+                if (drop_count <= 5 || drop_count % 100 == 0) {
+                    printf("[SENDER] Dropped packet (total drops: %u)\n", drop_count);
+                }
             }
             
-            // Throttle: limit to ~5000 packets/sec for smooth injection
-            usleep(200);
+            // Throttle: ~250 packets/sec max to stay within USB CDC bandwidth
+            usleep(4000);
         } else {
-            usleep(100);  // 100µs sleep when queue empty
+            usleep(500);  // 500µs sleep when queue empty
         }
     }
     
-    printf("[SENDER] Thread exiting. Total sent: %u\n", send_count);
+    printf("[SENDER] Thread exiting. Total sent: %u, dropped: %u\n", send_count, drop_count);
     return NULL;
 }
 
@@ -277,12 +301,10 @@ int serial_open(const char* port, int baudrate) {
         case 57600:  speed = B57600; break;
         case 115200: speed = B115200; break;
         case 230400: speed = B230400; break;
-        case 460800: speed = B460800; break;
-        case 921600: speed = B921600; break;
         default:
-            fprintf(stderr, "Error: Unsupported baud rate %d\n", baudrate);
-            close(fd);
-            return -1;
+            // For USB CDC, baud rate doesn't matter - it's virtual serial
+            speed = B115200;
+            break;
     }
     
     cfsetospeed(&tty, speed);

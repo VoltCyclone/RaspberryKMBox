@@ -86,6 +86,7 @@ typedef struct {
     uint32_t rx_bytes;
     uint32_t tx_rate_bps;  // Bytes per second
     uint32_t rx_rate_bps;
+    uint32_t uart_baud;    // Actual UART baud rate
     
     // Attached device info (from KMBox)
     uint16_t device_vid;

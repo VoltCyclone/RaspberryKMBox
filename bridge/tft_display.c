@@ -498,8 +498,15 @@ static void draw_data_section(const tft_stats_t *stats, uint16_t y) {
     }
     draw_string(80, y + 22, buf, TFT_CYAN, TFT_BLACK);
     
-    // Baud rate info
-    draw_string(4, y + 32, "115200 8N1", TFT_DARKGRAY, TFT_BLACK);
+    // Baud rate info (dynamic from stats)
+    if (stats->uart_baud >= 1000000) {
+        snprintf(buf, sizeof(buf), "%luM 8N1", stats->uart_baud / 1000000);
+    } else if (stats->uart_baud >= 1000) {
+        snprintf(buf, sizeof(buf), "%luK 8N1", stats->uart_baud / 1000);
+    } else {
+        snprintf(buf, sizeof(buf), "%lu 8N1", stats->uart_baud);
+    }
+    draw_string(4, y + 32, buf, TFT_DARKGRAY, TFT_BLACK);
 }
 
 static void draw_injection_section(const tft_stats_t *stats, uint16_t y) {
@@ -518,16 +525,14 @@ static void draw_injection_section(const tft_stats_t *stats, uint16_t y) {
         prod[20] = '\0';
         draw_string(4, y + 12, prod, TFT_WHITE, TFT_BLACK);
     } else {
-        draw_string(4, y + 12, "No device", TFT_DARKGRAY, TFT_BLACK);
+        draw_string(4, y + 12, "Waiting...", TFT_DARKGRAY, TFT_BLACK);
     }
     
-    // VID:PID
-    if (stats->device_vid != 0 || stats->device_pid != 0) {
-        snprintf(buf, sizeof(buf), "%04X:%04X", stats->device_vid, stats->device_pid);
-        draw_string(4, y + 22, buf, TFT_CYAN, TFT_BLACK);
-    }
+    // VID:PID - always show (0000:0000 if no device)
+    snprintf(buf, sizeof(buf), "%04X:%04X", stats->device_vid, stats->device_pid);
+    draw_string(4, y + 22, buf, stats->device_vid ? TFT_CYAN : TFT_DARKGRAY, TFT_BLACK);
     
-    // Manufacturer (if different from product)
+    // Manufacturer (if available)
     if (stats->device_manufacturer[0]) {
         char mfr[16];
         strncpy(mfr, stats->device_manufacturer, 15);

@@ -740,20 +740,6 @@ void kmbox_serial_init(void)
     
     // Set initial LED status to waiting for connection
     neopixel_set_status_override(STATUS_BRIDGE_WAITING);
-    
-    printf("KMBox serial handler initialized on UART%d via RP2350 bridge (TX: GPIO%d, RX: GPIO%d) @ %d baud\n",
-           (KMBOX_UART == uart0) ? 0 : 1, KMBOX_UART_TX_PIN, KMBOX_UART_RX_PIN, KMBOX_UART_BAUDRATE);
-    
-    // Send startup message to bridge
-    kmbox_send_status("KMBox Ready");
-    kmbox_send_status("Waiting for USB devices...");
-    
-    // Debug: send a simple test byte to verify UART TX is working
-    uart_putc_raw(KMBOX_UART, 'T');
-    uart_putc_raw(KMBOX_UART, 'E');
-    uart_putc_raw(KMBOX_UART, 'S');
-    uart_putc_raw(KMBOX_UART, 'T');
-    uart_putc_raw(KMBOX_UART, '\n');
 }
 
 //--------------------------------------------------------------------+
@@ -1105,7 +1091,8 @@ static bool handle_protocol_command(const char *line, size_t len, uint32_t curre
         if (g_connection_state == BRIDGE_STATE_CONNECTED) {
             set_connection_state(BRIDGE_STATE_ACTIVE);
         }
-        // Silent acknowledgment - no response needed for simple ping
+        // Send pong response so bridge knows we're alive
+        kmbox_send_response("KMBOX_PONG");
         return true;
     }
     
@@ -1290,15 +1277,8 @@ void kmbox_serial_task(void)
     }
     
     // Send periodic ping to bridge every 5 seconds for keepalive
-    // Include RX byte count for debugging UART reception
     if (current_time_ms - last_kmbox_ping_time > 5000) {
         last_kmbox_ping_time = current_time_ms;
-        
-        // Send debug status showing how many UART bytes we've received
-        char debug_msg[64];
-        snprintf(debug_msg, sizeof(debug_msg), "KMBOX_RX:%lu", uart_rx_byte_count);
-        kmbox_send_status(debug_msg);
-        
         kmbox_send_ping_to_bridge();
     }
     
