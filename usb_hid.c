@@ -473,10 +473,14 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
     kmbox_update_physical_buttons(valid_buttons);
 
     // Record physical movement for velocity tracking (smooth injection)
+    // Apply transform to physical mouse movement if enabled
     if (report->x != 0 || report->y != 0)
     {
-        smooth_record_physical_movement(report->x, report->y);
-        kmbox_add_mouse_movement(report->x, report->y);
+        int16_t transformed_x, transformed_y;
+        kmbox_transform_movement(report->x, report->y, &transformed_x, &transformed_y);
+        
+        smooth_record_physical_movement((int8_t)transformed_x, (int8_t)transformed_y);
+        kmbox_add_mouse_movement(transformed_x, transformed_y);
     }
 
     // Add physical wheel movement
@@ -485,9 +489,9 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         kmbox_add_wheel_movement(report->wheel);
     }
 
-    // Now get the final movement and button values from kmbox which include
-    // both any previously queued command movement and the newly added
-    // physical movement.
+    // Always get and send the combined movement (physical + any pending bridge commands)
+    // This ensures bridge movements get sent COMBINED with physical movements
+    // rather than waiting for a separate send opportunity
     uint8_t buttons_to_send;
     int8_t x, y, wheel, pan;
     kmbox_get_mouse_report(&buttons_to_send, &x, &y, &wheel, &pan);
@@ -609,6 +613,18 @@ void hid_device_task(void)
     if (!tud_mounted() || !tud_ready())
     {
         return;
+    }
+
+    // CRITICAL FIX: Always check for pending bridge movements and flush them
+    // This ensures bridge commands work even when physical mouse is connected but idle
+    if (kmbox_has_pending_movement() && tud_hid_ready())
+    {
+        // Flush any pending bridge movements by sending a mouse report
+        uint8_t buttons;
+        int8_t x, y, wheel, pan;
+        kmbox_get_mouse_report(&buttons, &x, &y, &wheel, &pan);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
+        return;  // One report per task call to avoid overwhelming USB
     }
 
     // Only send reports when devices are not connected

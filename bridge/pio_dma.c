@@ -9,6 +9,7 @@
 #include "hardware/clocks.h"
 #include "uart_tx.pio.h"
 #include "uart_rx.pio.h"
+#include <string.h>  // for memcpy
 
 // Track RX buffer base addresses for position calculation
 static uint8_t *rx_buffer_base[12] = {NULL};  // Max 12 DMA channels
@@ -91,15 +92,27 @@ bool pio_uart_rx_dma_init(PIO pio, uint sm, uint pin, uint baud, int *dma_chan,
     return true;
 }
 
-// Send data via TX DMA (non-blocking if ready)
+// Static TX buffer for DMA - data must persist until DMA completes
+#define TX_DMA_BUFFER_SIZE 64
+static uint8_t tx_dma_buffer[TX_DMA_BUFFER_SIZE];
+
+// Send data via direct PIO writes (blocking, for debugging)
 bool pio_uart_tx_dma_send(int dma_chan, PIO pio, uint sm, const uint8_t *data, size_t len) {
-    // Check if DMA is busy
-    if (dma_channel_is_busy(dma_chan)) {
+    // Sanity check
+    if (len == 0 || len > TX_DMA_BUFFER_SIZE) {
         return false;
     }
     
-    // Start transfer
-    dma_channel_transfer_from_buffer_now(dma_chan, data, len);
+    // Use direct PIO writes instead of DMA (for debugging)
+    for (size_t i = 0; i < len; i++) {
+        // Wait for FIFO space
+        while (pio_sm_is_tx_fifo_full(pio, sm)) {
+            tight_loop_contents();
+        }
+        // Write byte directly to TX FIFO
+        pio_sm_put(pio, sm, data[i]);
+    }
+    
     return true;
 }
 

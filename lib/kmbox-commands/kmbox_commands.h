@@ -60,6 +60,12 @@ typedef struct {
     bool lock_mx;  // Lock X axis (left/right movement)
     bool lock_my;  // Lock Y axis (up/down movement)
     
+    // Mouse transform (applied to physical mouse before sending)
+    // Scale is fixed-point: 256 = 1.0x, 0 = disabled, -256 = -1.0x (inverted)
+    int16_t transform_scale_x;  // X axis scale (256 = 1.0, 0 = block, -256 = invert)
+    int16_t transform_scale_y;  // Y axis scale (256 = 1.0, 0 = block, -256 = invert)
+    bool transform_enabled;     // Master enable for transforms
+    
     // Monitor mode (polling-based button state queries)
     bool monitor_enabled;  // True if monitoring is enabled
 } kmbox_state_t;
@@ -104,6 +110,19 @@ void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* whee
 
 // Add mouse movement
 void kmbox_add_mouse_movement(int16_t x, int16_t y);
+
+// Apply mouse transform to physical movement (called internally)
+// Returns transformed X,Y values based on current scale settings
+void kmbox_transform_movement(int16_t in_x, int16_t in_y, int16_t *out_x, int16_t *out_y);
+
+// Set mouse transform scale (256 = 1.0x, 0 = block axis, -256 = invert)
+void kmbox_set_transform(int16_t scale_x, int16_t scale_y, bool enabled);
+
+// Get current transform settings
+void kmbox_get_transform(int16_t *scale_x, int16_t *scale_y, bool *enabled);
+
+// Check if there are pending mouse/wheel movements in accumulator
+bool kmbox_has_pending_movement(void);
 
 // Add wheel movement
 void kmbox_add_wheel_movement(int8_t wheel);

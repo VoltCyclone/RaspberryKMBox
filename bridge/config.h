@@ -3,6 +3,11 @@
  * 
  * This header defines all tunable parameters for the color tracking
  * and mouse control system running on the RP2350 bridge.
+ * 
+ * UART Architecture:
+ * The TX/RX wires are crossed at the hardware level, allowing direct
+ * hardware UART usage. Bridge TX (GPIO1) -> KMBox RX, Bridge RX (GPIO0) <- KMBox TX.
+ * This eliminates the need for PIO-based UART and frees up state machines.
  */
 
 #ifndef CONFIG_H
@@ -11,9 +16,14 @@
 #include "pico/stdlib.h"
 
 // Hardware Configuration
-#define UART_TX_PIN          1        // Bridge TX → Doubler → KMBox RX
-#define UART_RX_PIN          0        // Bridge RX ← Doubler ← KMBox TX
-#define UART_BAUD            921600   // Baud rate for RP2350<->RP2040 communication (921600 for reliability)
+// UART0 on Adafruit Feather RP2350:
+//   GPIO1 = UART0 TX (directly connected to KMBox RX wire)
+//   GPIO0 = UART0 RX (directly connected to KMBox TX wire)  
+// Physical wiring: Bridge TX (GPIO1) → wire → KMBox RX (GPIO1)
+//                  Bridge RX (GPIO0) ← wire ← KMBox TX (GPIO0)
+#define UART_TX_PIN          1        // GPIO1 = UART0 TX on Feather RP2350
+#define UART_RX_PIN          0        // GPIO0 = UART0 RX on Feather RP2350
+#define UART_BAUD            115200   // Baud rate for RP2350<->RP2040 communication
 #define LED_PIN              PICO_DEFAULT_LED_PIN
 #define WS2812_PIN           PICO_DEFAULT_WS2812_PIN
 #define MODE_BUTTON_PIN      7        // API mode toggle button (same as KMBox reset button)

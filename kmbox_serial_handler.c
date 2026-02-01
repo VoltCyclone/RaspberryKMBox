@@ -64,15 +64,13 @@ static fast_cmd_union_t __attribute__((aligned(8))) fast_ring[FAST_RING_SIZE];
 static volatile uint8_t fast_ring_head = 0;  // Write position
 static volatile uint8_t fast_ring_tail = 0;  // Read position
 
-// Temporary accumulation buffer for incoming bytes
-static uint8_t __attribute__((aligned(4))) __attribute__((unused)) fast_accum[8];
-static uint8_t __attribute__((unused)) fast_accum_idx = 0;
-
 // Statistics for fast commands
 static uint32_t fast_cmd_count = 0;
 static uint32_t fast_cmd_errors = 0;
 static uint32_t fast_ring_overflows = 0;
 
+//--------------------------------------------------------------------+
+// Async/Non-blocking State for Timed Operations
 //--------------------------------------------------------------------+
 // Async/Non-blocking State for Timed Operations
 //--------------------------------------------------------------------+
@@ -120,6 +118,9 @@ static clock_sync_t clock_sync = {0};
 static uint32_t kmbox_ping_count = 0;
 static uint32_t last_kmbox_ping_time = 0;
 
+// Debug: count total UART RX bytes received
+static volatile uint32_t uart_rx_byte_count = 0;
+
 // Get synchronized timestamp (device time adjusted for PC offset)
 static inline uint64_t get_synced_time_us(void) {
     return time_us_64();
@@ -147,7 +148,7 @@ static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
             if (available < 6) return 0;
             int16_t x = read_i16_le(data + 2);
             int16_t y = read_i16_le(data + 4);
-            // Call kmbox API directly to queue movement (bypasses USB ready checks)
+            // Add to accumulator - physical mouse callback will send combined result
             kmbox_add_mouse_movement(x, y);
             return 6;
         }
@@ -156,7 +157,6 @@ static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
             // Wheel: [SYNC][CMD][wheel] = 3 bytes
             if (available < 3) return 0;
             int8_t wheel = (int8_t)data[2];
-            // Call kmbox API directly
             kmbox_add_wheel_movement(wheel);
             return 3;
         }
@@ -177,7 +177,7 @@ static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
             int16_t x = *((int16_t*)(data + 2));
             int16_t y = *((int16_t*)(data + 4));
             int8_t wheel = (int8_t)data[6];
-            // Call kmbox APIs directly
+            // Add to accumulator - physical mouse callback will send combined result
             kmbox_add_mouse_movement(x, y);
             kmbox_add_wheel_movement(wheel);
             return 7;
@@ -185,21 +185,20 @@ static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
         
         case BRIDGE_CMD_PING: {
             // Ping: [SYNC][CMD] = 2 bytes
-            // Could send pong response here if needed
             return 2;
         }
         
         case BRIDGE_CMD_RESET: {
             // Reset: [SYNC][CMD] = 2 bytes
             // Clear all queued movement
-            kmbox_add_mouse_movement(0, 0);  // Clear accumulators
+            kmbox_add_mouse_movement(0, 0);
             kmbox_add_wheel_movement(0);
             kmbox_update_physical_buttons(0);
             return 2;
         }
         
         default:
-            // Unknown command, skip sync byte and try again
+            // Unknown command - skip sync byte and try again
             return 1;
     }
 }
@@ -465,7 +464,14 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *packet) {
 }
 
 // Check if a byte could be the start of a fast command
+// NOTE: 0x0A is FAST_CMD_TIMED_MOVE but also '\n' (newline)
+// We exclude 0x0A and 0x0D here to prevent line terminators from being
+// mistaken for fast command starts when using text protocol
 static inline bool is_fast_cmd_start(uint8_t byte) {
+    // Exclude newline (0x0A) and carriage return (0x0D) - they're line terminators
+    if (byte == 0x0A || byte == 0x0D) {
+        return false;
+    }
     return (byte == FAST_CMD_MOUSE_MOVE ||
             byte == FAST_CMD_MOUSE_CLICK ||
             byte == FAST_CMD_KEY_PRESS ||
@@ -475,7 +481,7 @@ static inline bool is_fast_cmd_start(uint8_t byte) {
             byte == FAST_CMD_SMOOTH_MOVE ||
             byte == FAST_CMD_SMOOTH_CONFIG ||
             byte == FAST_CMD_SMOOTH_CLEAR ||
-            byte == FAST_CMD_TIMED_MOVE ||
+            // FAST_CMD_TIMED_MOVE (0x0A) excluded above - conflicts with '\n'
             byte == FAST_CMD_SYNC ||
             byte == FAST_CMD_PING);
 }
@@ -554,8 +560,9 @@ static volatile uint16_t tx_buffer_b_len = 0;
 static volatile uint8_t active_tx_buffer = 0;  // 0=A, 1=B
 
 // RX DMA buffer for continuous circular reception
+// CRITICAL: Buffer MUST be aligned to its size for DMA ring mode!
 #define UART_RX_DMA_BUFFER_SIZE 1024
-static uint8_t __attribute__((aligned(4))) uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
+static uint8_t __attribute__((aligned(UART_RX_DMA_BUFFER_SIZE))) uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
 static volatile uint16_t uart_rx_dma_read_pos = 0;
 
 //--------------------------------------------------------------------+
@@ -595,6 +602,7 @@ static void __not_in_flash_func(uart_tx_dma_handler)(void) {
 static void __not_in_flash_func(on_uart_rx)(void) {
     while (uart_is_readable(KMBOX_UART)) {
         uint8_t ch = uart_getc(KMBOX_UART);
+        uart_rx_byte_count++;  // Debug counter
         
         // Calculate next head position using bitwise AND (faster than modulo)
         uint16_t next_head = (uart_rx_head + 1) & UART_RX_BUFFER_MASK;
@@ -606,17 +614,6 @@ static void __not_in_flash_func(on_uart_rx)(void) {
         }
         // If buffer full, oldest data is discarded
     }
-}
-
-// Get character from ring buffer (non-blocking)
-__attribute__((unused)) static int uart_rx_getchar(void) {
-    if (uart_rx_head == uart_rx_tail) {
-        return -1; // Buffer empty
-    }
-    
-    uint8_t ch = uart_rx_buffer[uart_rx_tail];
-    uart_rx_tail = (uart_rx_tail + 1) & UART_RX_BUFFER_MASK;
-    return ch;
 }
 
 // Peek for a full line in the ring buffer and copy it into dst (no terminator).
@@ -636,7 +633,10 @@ static bool ringbuf_peek_line_and_copy(char *dst, size_t dst_size, size_t *out_l
         if (ch == '\n' || ch == '\r') { found = idx; break; }
         idx = (idx + 1) & UART_RX_BUFFER_MASK;
     }
-    if (found == UINT16_MAX) return false; // no full line
+    
+    if (found == UINT16_MAX) {
+        return false; // no full line yet
+    }
 
     // Determine terminator length (handle \r\n)
     uint8_t tlen = 1;
@@ -836,12 +836,14 @@ void kmbox_serial_init_dma(void) {
     channel_config_set_high_priority(&rx_config, true);
     
     // Configure and start continuous circular DMA
+    // Use maximum transfer count for continuous operation
+    // Ring mode wraps the address, but we need infinite transfers
     dma_channel_configure(
         uart_rx_dma_chan,
         &rx_config,
         uart_rx_dma_buffer,                    // Write to DMA buffer
         &uart_get_hw(KMBOX_UART)->dr,         // Read from UART data register
-        UART_RX_DMA_BUFFER_SIZE,              // Transfer entire buffer
+        0xFFFFFFFF,                            // Maximum transfers for continuous reception
         true                                   // Start immediately
     );
     
@@ -1057,6 +1059,90 @@ static bool handle_protocol_command(const char *line, size_t len, uint32_t curre
     // Update last data time for any received data
     g_last_data_time_ms = current_time_ms;
     
+    // ============================================================
+    // Simple Text Protocol Commands (for reliable bridge communication)
+    // Format: M<x>,<y>  - Mouse move
+    //         W<delta>  - Wheel scroll
+    //         B<mask>   - Button state
+    // ============================================================
+    
+    // Simple mouse move: M<x>,<y>
+    if (len >= 3 && line[0] == 'M') {
+        int x, y;
+        if (sscanf(line, "M%d,%d", &x, &y) == 2) {
+            // Debug: flash green to show M command received
+            neopixel_trigger_activity_flash_color(0x0000FF00);  // Green = M command
+            
+            // Queue movement through kmbox API - this adds to the accumulator
+            // The next physical mouse report will automatically include this
+            // movement combined with the physical movement, achieving the counter effect
+            kmbox_add_mouse_movement((int16_t)x, (int16_t)y);
+            // Auto-connect on command
+            if (!kmbox_is_connected()) {
+                set_connection_state(BRIDGE_STATE_CONNECTED);
+            }
+            if (g_connection_state == BRIDGE_STATE_CONNECTED) {
+                set_connection_state(BRIDGE_STATE_ACTIVE);
+            }
+            return true;
+        }
+    }
+    
+    // Simple wheel: W<delta>
+    if (len >= 2 && line[0] == 'W') {
+        int delta;
+        if (sscanf(line, "W%d", &delta) == 1) {
+            kmbox_add_wheel_movement((int8_t)delta);
+            return true;
+        }
+    }
+    
+    // Simple buttons: B<mask>
+    if (len >= 2 && line[0] == 'B') {
+        int mask;
+        if (sscanf(line, "B%d", &mask) == 1) {
+            kmbox_update_physical_buttons((uint8_t)mask);
+            return true;
+        }
+    }
+    
+    // Simple ping: P (keepalive from bridge in text mode)
+    if (len >= 1 && line[0] == 'P') {
+        // Just a keepalive - update activity timestamp and auto-connect
+        if (!kmbox_is_connected()) {
+            set_connection_state(BRIDGE_STATE_CONNECTED);
+        }
+        if (g_connection_state == BRIDGE_STATE_CONNECTED) {
+            set_connection_state(BRIDGE_STATE_ACTIVE);
+        }
+        // Silent acknowledgment - no response needed for simple ping
+        return true;
+    }
+    
+    // Echo test: E<data> - echo back the data to confirm UART works
+    // Bridge sends "ETEST123", KMBox responds "ECHO:TEST123"
+    if (len >= 2 && line[0] == 'E') {
+        // Flash LED to show we received something
+        neopixel_trigger_activity_flash_color(0x00FFFF00);  // Yellow = echo received
+        
+        // Echo back the data
+        char response[64];
+        snprintf(response, sizeof(response), "ECHO:%s", line + 1);
+        
+        // Send via UART
+        for (const char* p = response; *p; p++) {
+            uart_putc_raw(KMBOX_UART, *p);
+        }
+        uart_putc_raw(KMBOX_UART, '\n');
+        
+        printf("Echo test: received '%s', sent '%s'\n", line, response);
+        return true;
+    }
+    
+    // ============================================================
+    // KMBox Protocol Commands (handshake, status, etc.)
+    // ============================================================
+    
     // Check for bridge sync request first (highest priority)
     if (len >= 17 && strncmp(line, "KMBOX_BRIDGE_SYNC", 17) == 0) {
         // Respond with ready message - bridge is looking for this
@@ -1156,12 +1242,25 @@ void kmbox_serial_task(void)
     
     // Read from DMA buffer if RX DMA is active
     if (uart_rx_dma_initialized) {
-        // Get current DMA write position
-        uint16_t dma_write_pos = UART_RX_DMA_BUFFER_SIZE - dma_channel_hw_addr(uart_rx_dma_chan)->transfer_count;
+        // Get current DMA write position from write_addr register (correct for ring mode)
+        uintptr_t current_addr = (uintptr_t)dma_channel_hw_addr(uart_rx_dma_chan)->write_addr;
+        uintptr_t base_addr = (uintptr_t)uart_rx_dma_buffer;
+        uint16_t dma_write_pos = (uint16_t)((current_addr - base_addr) & (UART_RX_DMA_BUFFER_SIZE - 1));
+        
+        // Debug: track if we receive any UART data at all
+        static uint32_t uart_rx_byte_count = 0;
+        static uint32_t last_debug_flash_count = 0;
         
         // Process all available bytes in circular buffer
         while (uart_rx_dma_read_pos != dma_write_pos) {
             uint8_t byte = uart_rx_dma_buffer[uart_rx_dma_read_pos];
+            uart_rx_byte_count++;
+            
+            // Flash YELLOW every 100 bytes received to show UART RX is working
+            if (uart_rx_byte_count - last_debug_flash_count >= 100) {
+                neopixel_trigger_activity_flash_color(0x00FFFF00);  // Yellow = UART RX active
+                last_debug_flash_count = uart_rx_byte_count;
+            }
             
             // Copy to ring buffer for command processing
             uint16_t next_head = (uart_rx_head + 1) & UART_RX_BUFFER_MASK;
@@ -1174,9 +1273,16 @@ void kmbox_serial_task(void)
         }
     }
     
-    // Send periodic ping to bridge every 2 seconds for testing
-    if (current_time_ms - last_kmbox_ping_time > 2000) {
+    // Send periodic ping to bridge every 5 seconds for keepalive
+    // Include RX byte count for debugging UART reception
+    if (current_time_ms - last_kmbox_ping_time > 5000) {
         last_kmbox_ping_time = current_time_ms;
+        
+        // Send debug status showing how many UART bytes we've received
+        char debug_msg[64];
+        snprintf(debug_msg, sizeof(debug_msg), "KMBOX_RX:%lu", uart_rx_byte_count);
+        kmbox_send_status(debug_msg);
+        
         kmbox_send_ping_to_bridge();
     }
     
@@ -1200,7 +1306,14 @@ void kmbox_serial_task(void)
         
         // Check for bridge protocol sync byte
         if (first_byte == BRIDGE_SYNC_BYTE) {
+            // Re-read head to get latest DMA position
+            head = uart_rx_head;
             uint16_t available = (head - tail) & UART_RX_BUFFER_MASK;
+            
+            // Need at least 6 bytes for smallest variable packet (mouse move)
+            if (available < 6) {
+                break;  // Wait for more data
+            }
             
             // Build contiguous buffer for parser
             uint8_t packet[8];  // Max bridge packet size
@@ -1212,9 +1325,11 @@ void kmbox_serial_task(void)
             // Try to parse bridge packet
             uint8_t consumed = process_bridge_packet(packet, copy_len);
             
-            if (consumed > 0) {
-                // Successfully parsed - advance tail
-                uart_rx_tail = (tail + consumed) & UART_RX_BUFFER_MASK;
+            if (consumed >= 2) {
+                // Successfully parsed a valid packet
+                // Advance tail past the parsed packet
+                tail = (tail + consumed) & UART_RX_BUFFER_MASK;
+                uart_rx_tail = tail;
                 
                 // Update activity timestamp
                 g_last_data_time_ms = current_time_ms;
@@ -1227,25 +1342,33 @@ void kmbox_serial_task(void)
                     set_connection_state(BRIDGE_STATE_ACTIVE);
                 }
                 
-                // Continue processing more packets
+                // Check if there's enough for another packet already
                 head = uart_rx_head;
-                tail = uart_rx_tail;
+                uint16_t remaining = (head - tail) & UART_RX_BUFFER_MASK;
+                if (remaining < 6) {
+                    break;  // Wait for more data
+                }
+                continue;  // Parse next packet if we have enough
+            } else if (consumed == 1) {
+                // Bad command byte, skip past sync and try again
+                tail = (tail + 1) & UART_RX_BUFFER_MASK;
+                uart_rx_tail = tail;
+                head = uart_rx_head;
                 continue;
             } else {
-                // Incomplete packet - wait for more data
+                // Incomplete packet
                 break;
             }
         }
         
-        // Not a bridge packet - try fast command or text
-        tail = (tail + 1) & UART_RX_BUFFER_MASK;
+        // Not a bridge sync byte - let text command path handle it
+        break;
     }
     
     //------------------------------------------------------------------
     // FAST BINARY COMMAND PATH - Ultra-low latency (Legacy)
     //------------------------------------------------------------------
     // Check for fast binary commands (8-byte fixed packets)
-    // These are for backwards compatibility
     
     head = uart_rx_head;
     tail = uart_rx_tail;
@@ -1299,6 +1422,25 @@ void kmbox_serial_task(void)
     //------------------------------------------------------------------
     // TEXT COMMAND PATH - Full line parsing
     //------------------------------------------------------------------
+    // Skip any stray binary bytes (0xFE ping, 0xFF response markers) that got into text stream
+    // These can happen during mode transitions or from legacy binary pings
+    {
+        uint16_t skip_head = uart_rx_head;
+        uint16_t skip_tail = uart_rx_tail;
+        uint16_t skipped = 0;
+        while (skip_tail != skip_head) {
+            uint8_t b = uart_rx_buffer[skip_tail & UART_RX_BUFFER_MASK];
+            // Skip binary protocol markers and NULL bytes
+            if (b == 0xFE || b == 0xFF || b == 0x00) {
+                skip_tail = (skip_tail + 1) & UART_RX_BUFFER_MASK;
+                uart_rx_tail = skip_tail;  // Update global
+                skipped++;
+            } else {
+                break;  // Found a valid text byte
+            }
+        }
+    }
+    
     // Fast path: check for a full line and hand it to parser in one call
     char linebuf[KMBOX_CMD_BUFFER_SIZE];
     size_t line_len = 0;
@@ -1311,6 +1453,23 @@ void kmbox_serial_task(void)
 
     // Fallback: process any remaining partial bytes in chunks to reduce per-byte overhead
     // Only process partial data if we're connected (protocol commands must be complete lines)
+    // IMPORTANT: Don't consume text command data that's waiting for a newline terminator!
+    // Check if first byte looks like a text command start (M, W, B, P, K, etc.)
+    {
+        uint16_t fb_head = uart_rx_head;
+        uint16_t fb_tail = uart_rx_tail;
+        if (fb_head != fb_tail) {
+            uint8_t first = uart_rx_buffer[fb_tail & UART_RX_BUFFER_MASK];
+            // If it looks like the start of a text command, DON'T consume it
+            // Wait for the newline to arrive so ringbuf_peek_line_and_copy can process it
+            if (first == 'M' || first == 'W' || first == 'B' || first == 'P' || 
+                first == 'K' || first == 'm' || first == 'k' ||
+                first >= 0x20) {  // Any printable ASCII - likely text command
+                // Skip the fallback - let text accumulate until we get a newline
+                goto skip_fallback;
+            }
+        }
+    }
     if (kmbox_is_connected()) {
         uint8_t tmp[128];
         size_t n;
@@ -1349,6 +1508,7 @@ void kmbox_serial_task(void)
         }
     }
     
+skip_fallback:
     // Update button states (handles timing for releases)
     kmbox_update_states(current_time_ms);
 }
@@ -1373,15 +1533,15 @@ bool kmbox_send_mouse_report(void)
     // Send the report using TinyUSB
     bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
     
-    if (success) {
-        // Trigger rainbow effect periodically when KMBox commands are processed
-        static uint32_t rainbow_counter = 0;
-        if (++rainbow_counter % 50 == 0) {
-            neopixel_trigger_rainbow_effect();
-        }
-    }
-    
     return success;
+}
+
+// Process pending bridge command injections
+// NOTE: This function is no longer needed - bridge movements are added to the
+// shared accumulator and the physical mouse callback sends combined reports.
+// Kept for API compatibility.
+void kmbox_process_bridge_injections(void) {
+    // No-op: bridge movements go through shared accumulator
 }
 
 // Send ping packet to bridge for bidirectional testing

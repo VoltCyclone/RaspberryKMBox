@@ -1,5 +1,11 @@
 # KMBox Bridge - Advanced Autopilot Firmware
-# RP2350 bridge with color tracking and PIO UART communication
+# RP2350 bridge with color tracking and Hardware UART communication
+# 
+# Architecture change: TX/RX wires are now crossed at hardware level,
+# allowing direct hardware UART usage instead of PIO-based pin swapping.
+# This frees up PIO state machines for timing/latency tracking.
+#
+# Optional: 1.8" ST7735 TFT display support via SPI1
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -20,7 +26,9 @@ pico_sdk_init()
 add_executable(kmbox_bridge
     main.c
     tracker.c
-    pio_dma.c
+    hw_uart.c
+    latency_tracker.c
+    tft_display.c
     core1_translator.c
     makcu_translator.c
     ferrum_translator.c
@@ -29,15 +37,18 @@ add_executable(kmbox_bridge
 # Add kmbox-commands library for shared utilities
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/kmbox-commands kmbox-commands)
 
-# Generate PIO headers
-pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/uart_tx.pio)
-pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/uart_rx.pio)
+# Note: PIO programs removed for UART (now using hardware UART)
+# timestamp.pio is available but not currently generated
+# pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/timestamp.pio)
 
 target_link_libraries(kmbox_bridge
     pico_stdlib
     hardware_pio
     hardware_clocks
     hardware_dma
+    hardware_uart
+    hardware_spi
+    hardware_pwm
     pico_multicore
     kmbox_commands
 )
@@ -51,4 +62,4 @@ pico_add_extra_outputs(kmbox_bridge)
 
 # Binary info
 pico_set_program_name(kmbox_bridge "KMBox Bridge Autopilot")
-pico_set_program_description(kmbox_bridge "Advanced autopilot with color tracking and PIO UART")
+pico_set_program_description(kmbox_bridge "Advanced autopilot with TFT display and Hardware UART")

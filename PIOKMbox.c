@@ -20,7 +20,6 @@
 #include "led_control.h"
 #include "usb_hid.h"
 #include "watchdog.h"
-#include "init_state_machine.h"
 #include "state_management.h"
 #include "kmbox_serial_handler.h"
 #include "smooth_injection.h"
@@ -364,7 +363,6 @@ static void main_application_loop(void) {
     while (true) {
         // TinyUSB device task - highest priority
         tud_task();
-        hid_device_task();
         
         // Initialize DMA after 3 seconds of stable USB operation
         if (!dma_initialized && (current_time - boot_complete_time) > 3000) {
@@ -372,8 +370,13 @@ static void main_application_loop(void) {
             dma_initialized = true;
         }
         
-        // KMBox serial task - high priority for responsiveness
+        // KMBox serial task - process bridge commands
+        // Bridge movements are added to the shared accumulator and combined
+        // with physical mouse movements automatically
         kmbox_serial_task();
+        
+        // HID device task - processes physical mouse/keyboard and sends combined reports
+        hid_device_task();
         
         // Sample time less frequently to reduce overhead
         if (++loop_counter >= 32) {  // Sample every 32 loops
