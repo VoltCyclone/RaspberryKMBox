@@ -108,14 +108,14 @@ void force_usb_reenumeration() {
     // Disconnect from USB host
     tud_disconnect();
     
-    // Wait for host to recognize disconnection (300ms for stability)
-    sleep_ms(300);
+    // Wait for host to recognize disconnection (500ms for Windows/macOS)
+    sleep_ms(500);
     
     // Reconnect with new descriptor
     tud_connect();
     
-    // Wait for reconnection (200ms for stability)
-    sleep_ms(200);
+    // Wait for reconnection (250ms for stability)
+    sleep_ms(250);
 }
 
 // Function to fetch string descriptors from attached device
