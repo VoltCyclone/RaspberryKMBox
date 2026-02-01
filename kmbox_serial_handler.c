@@ -743,16 +743,10 @@ void kmbox_serial_init(void)
     
     printf("KMBox serial handler initialized on UART%d via RP2350 bridge (TX: GPIO%d, RX: GPIO%d) @ %d baud\n",
            (KMBOX_UART == uart0) ? 0 : 1, KMBOX_UART_TX_PIN, KMBOX_UART_RX_PIN, KMBOX_UART_BAUDRATE);
-    printf("Waiting for RP2350 bridge connection... (LED: breathing light blue)\n");
-    
-    // Give UART time to settle
-    sleep_ms(100);
     
     // Send startup message to bridge
     kmbox_send_status("KMBox Ready");
-    sleep_ms(10);
     kmbox_send_status("Waiting for USB devices...");
-    sleep_ms(10);
     
     // Debug: send a simple test byte to verify UART TX is working
     uart_putc_raw(KMBOX_UART, 'T');
@@ -770,16 +764,12 @@ void kmbox_serial_init(void)
 // This avoids boot-time conflicts with USB/PIO initialization
 void kmbox_serial_init_dma(void) {
     if (uart_tx_dma_initialized && uart_rx_dma_initialized) {
-        printf("UART DMA already initialized\n");
         return;
     }
-    
-    printf("Initializing UART DMA (post-boot)...\n");
     
     // Try to claim DMA channel without panicking
     uart_tx_dma_chan = dma_claim_unused_channel(false); // false = don't panic
     if (uart_tx_dma_chan < 0) {
-        printf("No DMA channels available, UART will use blocking TX\n");
         return;
     }
     
@@ -1190,6 +1180,32 @@ static bool handle_protocol_command(const char *line, size_t len, uint32_t curre
         snprintf(response, sizeof(response), "KMBOX_STATE:%s", 
                  state_names[g_connection_state]);
         kmbox_send_response(response);
+        return true;
+    }
+    
+    // Device info command - sends attached mouse VID/PID and name
+    if (len >= 10 && strncmp(line, "KMBOX_INFO", 10) == 0) {
+        char response[128];
+        uint16_t vid = get_attached_vid();
+        uint16_t pid = get_attached_pid();
+        const char *mfr = get_attached_manufacturer();
+        const char *prod = get_attached_product();
+        
+        // Send VID:PID first
+        snprintf(response, sizeof(response), "KMBOX_VID:%04X", vid);
+        kmbox_send_response(response);
+        
+        snprintf(response, sizeof(response), "KMBOX_PID:%04X", pid);
+        kmbox_send_response(response);
+        
+        // Send manufacturer (may be empty)
+        snprintf(response, sizeof(response), "KMBOX_MFR:%s", mfr[0] ? mfr : "Unknown");
+        kmbox_send_response(response);
+        
+        // Send product name (may be empty)
+        snprintf(response, sizeof(response), "KMBOX_PROD:%s", prod[0] ? prod : "Unknown");
+        kmbox_send_response(response);
+        
         return true;
     }
     

@@ -170,14 +170,10 @@ static bool initialize_system(void) {
     // Initialize stdio first for early debug output
     stdio_init_all();
     
-    // Add extended startup delay for cold boot stability
+    // Add startup delay for cold boot stability
     sleep_ms(200);
     
-    printf("PICO PIO KMBox - Starting initialization...\n");
-    printf("Neopixel pins initialized (power OFF for cold boot stability)\n");
-    printf("Setting system clock to %d kHz...\n", CPU_FREQ);
     if (!set_sys_clock_khz(CPU_FREQ, true)) {
-        printf("CRITICAL: Failed to set system clock to %d kHz\n", CPU_FREQ);
         return false;
     }
     
@@ -201,19 +197,15 @@ static bool initialize_system(void) {
     // Initialize watchdog system (but don't start it yet)
     watchdog_init();
 
-    printf("System initialization complete\n");
+    // Initialization complete - proceed to USB init
     return true;
 }
 
 static bool initialize_usb_device(void) {
-    printf("USB Device: Initializing on controller %d (native USB)...\n", USB_DEVICE_PORT);
-    
     const bool device_init_success = tud_init(USB_DEVICE_PORT);
-    printf("USB Device init: %s\n", device_init_success ? "SUCCESS" : "FAILED");
     
     if (device_init_success) {
         usb_device_mark_initialized();
-        printf("USB Device: Initialization complete\n");
     }
     
     return device_init_success;
@@ -245,12 +237,11 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
             state->last_button_press_time = current_time;
         } else {
             // Button being held - check for reset trigger
-            if (is_time_elapsed(current_time, state->last_button_press_time, BUTTON_HOLD_TRIGGER_MS)) {
-                printf("Button held - triggering USB reset\n");
-                usb_stacks_reset();
-                state->usb_reset_cooldown = true;
-                state->usb_reset_cooldown_start = current_time;
-            }
+                if (is_time_elapsed(current_time, state->last_button_press_time, BUTTON_HOLD_TRIGGER_MS)) {
+                    usb_stacks_reset();
+                    state->usb_reset_cooldown = true;
+                    state->usb_reset_cooldown_start = current_time;
+                }
         }
     } else if (state->button_pressed_last) {
         // Button just released - check if it was a short press
@@ -262,31 +253,29 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
             
             // Show mode with LED flash
             uint32_t mode_color;
-            const char* mode_name;
             switch (new_mode) {
                 case HUMANIZATION_OFF:
                     mode_color = COLOR_HUMANIZATION_OFF;
-                    mode_name = "OFF";
+                    
                     break;
                 case HUMANIZATION_LOW:
                     mode_color = COLOR_HUMANIZATION_LOW;
-                    mode_name = "LOW";
+                    
                     break;
                 case HUMANIZATION_MEDIUM:
                     mode_color = COLOR_HUMANIZATION_MEDIUM;
-                    mode_name = "MEDIUM";
+                    
                     break;
                 case HUMANIZATION_HIGH:
                     mode_color = COLOR_HUMANIZATION_HIGH;
-                    mode_name = "HIGH";
+                    
                     break;
                 default:
                     mode_color = COLOR_ERROR;
-                    mode_name = "UNKNOWN";
+                    
                     break;
             }
             
-            printf("Humanization mode: %s\n", mode_name);
             neopixel_set_color(mode_color);
             neopixel_trigger_mode_flash(mode_color, 500);
         }
@@ -306,19 +295,7 @@ static void report_watchdog_status(uint32_t current_time, uint32_t* watchdog_sta
 
     *watchdog_status_timer = current_time;
     
-    const watchdog_status_t watchdog_status = watchdog_get_status();
     
-    printf("=== Watchdog Status ===\n");
-    printf("System healthy: %s\n", watchdog_status.system_healthy ? "YES" : "NO");
-    printf("Core 0: %s (heartbeats: %lu)\n",
-           watchdog_status.core0_responsive ? "RESPONSIVE" : "UNRESPONSIVE",
-           watchdog_status.core0_heartbeat_count);
-    printf("Core 1: %s (heartbeats: %lu)\n",
-           watchdog_status.core1_responsive ? "RESPONSIVE" : "UNRESPONSIVE",
-           watchdog_status.core1_heartbeat_count);
-    printf("Hardware updates: %lu\n", watchdog_status.hardware_updates);
-    printf("Timeout warnings: %lu\n", watchdog_status.timeout_warnings);
-    printf("=======================\n");
 }
 
 //--------------------------------------------------------------------+
@@ -461,8 +438,13 @@ int main(void) {
     usb_host_enable_power();
     sleep_ms(100);  // Brief power stabilization
     
+#if PIO_USB_AVAILABLE
     multicore_reset_core1();
     multicore_launch_core1(core1_main);
+    
+    // Give core1 time to initialize before USB device init
+    sleep_ms(100);
+#endif
     
     if (!initialize_usb_device()) {
         printf("CRITICAL: USB Device initialization failed\n");

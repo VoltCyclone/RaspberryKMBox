@@ -453,62 +453,116 @@ static void draw_status_section(const tft_stats_t *stats, uint16_t y) {
 }
 
 static void draw_data_section(const tft_stats_t *stats, uint16_t y) {
-    char buf[16];
+    char buf[24];
     
-    // Section header
-    fill_rect(0, y, TFT_WIDTH, 22, TFT_BLACK);
-    draw_string(4, y, "Data", TFT_GRAY, TFT_BLACK);
+    // Section header - UART Stats
+    fill_rect(0, y, TFT_WIDTH, 42, TFT_BLACK);
+    draw_string(4, y, "UART Stats", TFT_GRAY, TFT_BLACK);
     draw_separator(y + 9, TFT_DARKGRAY);
     
-    // TX with arrow
-    draw_string(4, y + 12, ">", TFT_GREEN, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%lu", stats->tx_bytes);
-    draw_string(14, y + 12, buf, TFT_GREEN, TFT_BLACK);
+    // TX bytes and rate
+    draw_string(4, y + 12, "TX:", TFT_GREEN, TFT_BLACK);
+    if (stats->tx_bytes >= 1000000) {
+        snprintf(buf, sizeof(buf), "%luM", stats->tx_bytes / 1000000);
+    } else if (stats->tx_bytes >= 1000) {
+        snprintf(buf, sizeof(buf), "%luK", stats->tx_bytes / 1000);
+    } else {
+        snprintf(buf, sizeof(buf), "%lu", stats->tx_bytes);
+    }
+    draw_string(28, y + 12, buf, TFT_GREEN, TFT_BLACK);
     
-    // RX with arrow
-    draw_string(68, y + 12, "<", TFT_CYAN, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%lu", stats->rx_bytes);
-    draw_string(78, y + 12, buf, TFT_CYAN, TFT_BLACK);
+    // TX rate
+    if (stats->tx_rate_bps >= 1000) {
+        snprintf(buf, sizeof(buf), "%luK/s", stats->tx_rate_bps / 1000);
+    } else {
+        snprintf(buf, sizeof(buf), "%luB/s", stats->tx_rate_bps);
+    }
+    draw_string(80, y + 12, buf, TFT_GREEN, TFT_BLACK);
+    
+    // RX bytes and rate
+    draw_string(4, y + 22, "RX:", TFT_CYAN, TFT_BLACK);
+    if (stats->rx_bytes >= 1000000) {
+        snprintf(buf, sizeof(buf), "%luM", stats->rx_bytes / 1000000);
+    } else if (stats->rx_bytes >= 1000) {
+        snprintf(buf, sizeof(buf), "%luK", stats->rx_bytes / 1000);
+    } else {
+        snprintf(buf, sizeof(buf), "%lu", stats->rx_bytes);
+    }
+    draw_string(28, y + 22, buf, TFT_CYAN, TFT_BLACK);
+    
+    // RX rate
+    if (stats->rx_rate_bps >= 1000) {
+        snprintf(buf, sizeof(buf), "%luK/s", stats->rx_rate_bps / 1000);
+    } else {
+        snprintf(buf, sizeof(buf), "%luB/s", stats->rx_rate_bps);
+    }
+    draw_string(80, y + 22, buf, TFT_CYAN, TFT_BLACK);
+    
+    // Baud rate info
+    draw_string(4, y + 32, "115200 8N1", TFT_DARKGRAY, TFT_BLACK);
 }
 
-static void draw_latency_section(const tft_stats_t *stats, uint16_t y) {
-    char buf[16];
+static void draw_injection_section(const tft_stats_t *stats, uint16_t y) {
+    char buf[28];
     
-    // Section header
-    fill_rect(0, y, TFT_WIDTH, 22, TFT_BLACK);
-    draw_string(4, y, "Latency", TFT_GRAY, TFT_BLACK);
-    draw_separator(y + 9, TFT_DARKGRAY);
-    
-    // Latency values in a row
-    snprintf(buf, sizeof(buf), "%lu", stats->latency_min_us);
-    draw_string(4, y + 12, buf, TFT_GREEN, TFT_BLACK);
-    
-    snprintf(buf, sizeof(buf), "%lu", stats->latency_avg_us);
-    draw_string(48, y + 12, buf, TFT_YELLOW, TFT_BLACK);
-    
-    snprintf(buf, sizeof(buf), "%lu", stats->latency_max_us);
-    draw_string(92, y + 12, buf, TFT_RED, TFT_BLACK);
-}
-
-static void draw_mouse_section(const tft_stats_t *stats, uint16_t y) {
-    char buf[20];
-    
-    // Section header  
-    fill_rect(0, y, TFT_WIDTH, 34, TFT_BLACK);
+    // Section header - Device Info
+    fill_rect(0, y, TFT_WIDTH, 42, TFT_BLACK);
     draw_string(4, y, "Mouse", TFT_GRAY, TFT_BLACK);
     draw_separator(y + 9, TFT_DARKGRAY);
     
-    // Move count
-    snprintf(buf, sizeof(buf), "Moves: %lu", stats->mouse_moves);
-    draw_string(4, y + 12, buf, TFT_LIGHTGRAY, TFT_BLACK);
+    // Product name (truncate if needed)
+    if (stats->device_product[0]) {
+        // Truncate to fit display (~20 chars max)
+        char prod[21];
+        strncpy(prod, stats->device_product, 20);
+        prod[20] = '\0';
+        draw_string(4, y + 12, prod, TFT_WHITE, TFT_BLACK);
+    } else {
+        draw_string(4, y + 12, "No device", TFT_DARKGRAY, TFT_BLACK);
+    }
     
-    // Current delta with visual representation
-    // Show dx/dy values
-    snprintf(buf, sizeof(buf), "X:%4d", stats->last_dx);
-    draw_string(4, y + 24, buf, stats->last_dx != 0 ? TFT_CYAN : TFT_GRAY, TFT_BLACK);
+    // VID:PID
+    if (stats->device_vid != 0 || stats->device_pid != 0) {
+        snprintf(buf, sizeof(buf), "%04X:%04X", stats->device_vid, stats->device_pid);
+        draw_string(4, y + 22, buf, TFT_CYAN, TFT_BLACK);
+    }
     
-    snprintf(buf, sizeof(buf), "Y:%4d", stats->last_dy);
-    draw_string(64, y + 24, buf, stats->last_dy != 0 ? TFT_MAGENTA : TFT_GRAY, TFT_BLACK);
+    // Manufacturer (if different from product)
+    if (stats->device_manufacturer[0]) {
+        char mfr[16];
+        strncpy(mfr, stats->device_manufacturer, 15);
+        mfr[15] = '\0';
+        draw_string(64, y + 22, mfr, TFT_DARKGRAY, TFT_BLACK);
+    }
+    
+    // Injection count
+    snprintf(buf, sizeof(buf), "INJ:%lu", stats->mouse_clicks);
+    draw_string(4, y + 32, buf, TFT_YELLOW, TFT_BLACK);
+}
+
+static void draw_mode_section(const tft_stats_t *stats, uint16_t y) {
+    char buf[24];
+    
+    // Section header
+    fill_rect(0, y, TFT_WIDTH, 32, TFT_BLACK);
+    draw_string(4, y, "Bridge", TFT_GRAY, TFT_BLACK);
+    draw_separator(y + 9, TFT_DARKGRAY);
+    
+    // API mode with color coding
+    const char *mode_names[] = {"KMBox", "Makcu", "Ferrum"};
+    uint16_t mode_colors[] = {TFT_CYAN, TFT_MAGENTA, TFT_ORANGE};
+    uint8_t mode = stats->api_mode;
+    if (mode > 2) mode = 0;
+    
+    draw_string(4, y + 12, "API:", TFT_LIGHTGRAY, TFT_BLACK);
+    draw_string(34, y + 12, mode_names[mode], mode_colors[mode], TFT_BLACK);
+    
+    // Command count
+    snprintf(buf, sizeof(buf), "Cmds:%lu", stats->mouse_moves);
+    draw_string(76, y + 12, buf, TFT_LIGHTGRAY, TFT_BLACK);
+    
+    // Board info
+    draw_string(4, y + 22, "Feather RP2350", TFT_DARKGRAY, TFT_BLACK);
 }
 
 static void draw_footer(const tft_stats_t *stats) {
@@ -593,12 +647,12 @@ void tft_update(const tft_stats_t *stats) {
         needs_full_redraw = false;
     }
     
-    // Update sections with new layout
-    // Header: 0-18, Status: 20-32, Data: 34-56, Latency: 58-80, Mouse: 82-116, Footer: 146-160
+    // Update sections with simplified layout
+    // Header: 0-18, Status: 20-32, UART: 34-76, Injection: 78-110, Mode: 112-144, Footer: 146-160
     draw_status_section(stats, 20);
     draw_data_section(stats, 34);
-    draw_latency_section(stats, 58);
-    draw_mouse_section(stats, 82);
+    draw_injection_section(stats, 78);
+    draw_mode_section(stats, 112);
     draw_footer(stats);
     
     // Cache stats

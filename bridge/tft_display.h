@@ -87,16 +87,15 @@ typedef struct {
     uint32_t tx_rate_bps;  // Bytes per second
     uint32_t rx_rate_bps;
     
-    // Latency stats (microseconds)
-    uint32_t latency_min_us;
-    uint32_t latency_avg_us;
-    uint32_t latency_max_us;
+    // Attached device info (from KMBox)
+    uint16_t device_vid;
+    uint16_t device_pid;
+    char device_manufacturer[24];
+    char device_product[24];
     
     // Mouse activity
     uint32_t mouse_moves;
     uint32_t mouse_clicks;
-    int16_t last_dx;
-    int16_t last_dy;
     
     // System info
     uint32_t uptime_sec;

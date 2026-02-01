@@ -542,19 +542,19 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 
 #if BUILD_CONFIG == BUILD_CONFIG_PRODUCTION
     #define ENABLE_VERBOSE_LOGGING      0
-    #define ENABLE_INIT_LOGGING         1
-    #define ENABLE_ERROR_LOGGING        1
-    #define ENABLE_STATS_LOGGING        1
+    #define ENABLE_INIT_LOGGING         0
+    #define ENABLE_ERROR_LOGGING        0
+    #define ENABLE_STATS_LOGGING        0
 #elif BUILD_CONFIG == BUILD_CONFIG_TESTING
-    #define ENABLE_VERBOSE_LOGGING      1
-    #define ENABLE_INIT_LOGGING         1
-    #define ENABLE_ERROR_LOGGING        1
+    #define ENABLE_VERBOSE_LOGGING      0
+    #define ENABLE_INIT_LOGGING         0
+    #define ENABLE_ERROR_LOGGING        0
     #define ENABLE_STATS_LOGGING        0
 #else // Development and Debug
-    #define ENABLE_VERBOSE_LOGGING      1
-    #define ENABLE_INIT_LOGGING         1
-    #define ENABLE_ERROR_LOGGING        1
-    #define ENABLE_STATS_LOGGING        1
+    #define ENABLE_VERBOSE_LOGGING      0
+    #define ENABLE_INIT_LOGGING         0
+    #define ENABLE_ERROR_LOGGING        0
+    #define ENABLE_STATS_LOGGING        0
 #endif
 
 //--------------------------------------------------------------------+

@@ -98,31 +98,24 @@ void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
         attached_vid = vid;
         attached_pid = pid;
         attached_has_serial = false; // Default to no serial number unless device has one
-        printf("Updated attached device VID:PID to %04x:%04x\n", vid, pid);
         
         // Force USB re-enumeration to update descriptor
         force_usb_reenumeration();
-    } else {
-        printf("VID:PID unchanged (%04x:%04x), skipping re-enumeration\n", vid, pid);
     }
 }
 
 void force_usb_reenumeration() {
-    printf("Forcing USB re-enumeration with new descriptor...\n");
-    
     // Disconnect from USB host
     tud_disconnect();
     
-    // Wait for host to recognize disconnection (250ms minimum for Windows/macOS)
-    sleep_ms(500);
+    // Wait for host to recognize disconnection (300ms for stability)
+    sleep_ms(300);
     
     // Reconnect with new descriptor
     tud_connect();
     
-    // Wait for reconnection
-    sleep_ms(250);
-    
-    printf("USB re-enumeration complete\n");
+    // Wait for reconnection (200ms for stability)
+    sleep_ms(200);
 }
 
 // Function to fetch string descriptors from attached device
@@ -146,34 +139,28 @@ static void fetch_device_string_descriptors(uint8_t dev_addr) {
     // Get manufacturer string
     if (tuh_descriptor_get_manufacturer_string_sync(dev_addr, LANGUAGE_ID, temp_manufacturer, sizeof(temp_manufacturer)) == XFER_RESULT_SUCCESS) {
         utf16_to_utf8(temp_manufacturer, sizeof(temp_manufacturer), attached_manufacturer, sizeof(attached_manufacturer));
-        printf("Fetched manufacturer: %s\n", attached_manufacturer);
         kmbox_send_status(attached_manufacturer);
     } else {
         strcpy(attached_manufacturer, MANUFACTURER_STRING);  // Fallback
-        printf("Failed to fetch manufacturer, using fallback: %s\n", attached_manufacturer);
     }
     
     // Get product string
     if (tuh_descriptor_get_product_string_sync(dev_addr, LANGUAGE_ID, temp_product, sizeof(temp_product)) == XFER_RESULT_SUCCESS) {
         utf16_to_utf8(temp_product, sizeof(temp_product), attached_product, sizeof(attached_product));
-        printf("Fetched product: %s\n", attached_product);
         kmbox_send_status(attached_product);
     } else {
         strcpy(attached_product, PRODUCT_STRING);  // Fallback
-        printf("Failed to fetch product, using fallback: %s\n", attached_product);
     }
     
     // Get serial string (optional)
     if (tuh_descriptor_get_serial_string_sync(dev_addr, LANGUAGE_ID, temp_serial, sizeof(temp_serial)) == XFER_RESULT_SUCCESS) {
         utf16_to_utf8(temp_serial, sizeof(temp_serial), attached_serial, sizeof(attached_serial));
-        printf("Fetched serial: %s\n", attached_serial);
         char serial_msg[64];
         snprintf(serial_msg, sizeof(serial_msg), "Serial: %s", attached_serial);
         kmbox_send_status(serial_msg);
         attached_has_serial = (strlen(attached_serial) > 0);
     } else {
         attached_has_serial = false;
-        printf("No serial number available\n");
     }
     
     string_descriptors_fetched = true;
@@ -186,7 +173,6 @@ static void reset_device_string_descriptors(void) {
     memset(attached_serial, 0, sizeof(attached_serial));
     string_descriptors_fetched = false;
     attached_has_serial = false;
-    printf("String descriptors reset\n");
 }
 
 // Function to get the VID of the attached device
@@ -197,6 +183,16 @@ uint16_t get_attached_vid(void) {
 // Function to get the PID of the attached device
 uint16_t get_attached_pid(void) {
     return attached_pid;
+}
+
+// Function to get attached device manufacturer string
+const char* get_attached_manufacturer(void) {
+    return attached_manufacturer;
+}
+
+// Function to get attached device product string
+const char* get_attached_product(void) {
+    return attached_product;
 }
 
 // Function to get dynamic serial string
@@ -759,6 +755,7 @@ void tud_resume_cb(void)
 // Host callbacks with improved error handling
 void tuh_mount_cb(uint8_t dev_addr)
 {
+    (void)dev_addr;
     neopixel_trigger_activity_flash_color(COLOR_USB_CONNECTION);
     neopixel_update_status();
 }

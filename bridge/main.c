@@ -108,6 +108,22 @@ static uint32_t kmbox_connect_attempts = 0;
 static uint32_t boot_time_ms = 0;
 static uint32_t tft_mouse_activity_count = 0;
 
+// UART rate tracking for TFT display
+static uint32_t last_rate_calc_time_ms = 0;
+static uint32_t last_tx_bytes_for_rate = 0;
+static uint32_t last_rx_bytes_for_rate = 0;
+static uint32_t uart_tx_rate_bps = 0;  // Calculated TX rate
+static uint32_t uart_rx_rate_bps = 0;  // Calculated RX rate
+static uint32_t injection_count = 0;   // Number of successful km.move injections
+
+// Attached device info from KMBox
+static uint16_t attached_vid = 0;
+static uint16_t attached_pid = 0;
+static char attached_manufacturer[32] = "";
+static char attached_product[32] = "";
+static uint32_t last_info_request_ms = 0;
+#define INFO_REQUEST_INTERVAL_MS 5000  // Request device info every 5 seconds
+
 // CDC receive state machine
 typedef enum {
     RX_STATE_IDLE,
@@ -206,12 +222,8 @@ static inline void uart_tx_byte(uint8_t c) {
 // Initialize hardware UART for bridge communication
 static void hw_uart_bridge_init(void) {
     if (!hw_uart_init(UART_TX_PIN, UART_RX_PIN, UART_BAUD)) {
-        printf("ERROR: Failed to initialize hardware UART!\n");
         return;
     }
-    printf("Hardware UART initialized on GPIO%d(TX)/%d(RX) at %d baud\n", 
-           UART_TX_PIN, UART_RX_PIN, UART_BAUD);
-    printf("Note: Wires crossed at hardware level for direct UART connection\n");
 }
 
 // Button handling for API mode toggle
@@ -219,7 +231,6 @@ static void button_init(void) {
     gpio_init(MODE_BUTTON_PIN);
     gpio_set_dir(MODE_BUTTON_PIN, GPIO_IN);
     gpio_pull_up(MODE_BUTTON_PIN);
-    sleep_ms(10);  // Let pull-up stabilize
     button_state = !gpio_get(MODE_BUTTON_PIN);  // Read initial state
 }
 
@@ -254,13 +265,6 @@ static void process_status_message(const char* msg, size_t len) {
     // Check for echo response: "ECHO:TEST..."
     if (len >= 5 && strncmp(msg, "ECHO:", 5) == 0) {
         echo_response_count++;
-        if (tud_cdc_connected()) {
-            char dbg[80];
-            snprintf(dbg, sizeof(dbg), "[ECHO_OK] Got response: %s (sent=%lu, recv=%lu)\r\n", 
-                     msg, echo_test_count, echo_response_count);
-            tud_cdc_write_str(dbg);
-            tud_cdc_write_flush();
-        }
         // Auto-connect on successful echo
         if (kmbox_state != KMBOX_CONNECTED) {
             kmbox_state = KMBOX_CONNECTED;
@@ -274,13 +278,7 @@ static void process_status_message(const char* msg, size_t len) {
             kmbox_state = KMBOX_CONNECTED;
             kmbox_response_count++;
         }
-        // Still forward handshake message
-        if (tud_cdc_connected()) {
-            tud_cdc_write_str("[KMBox] ");
-            tud_cdc_write(msg, len);
-            tud_cdc_write_str("\r\n");
-            tud_cdc_write_flush();
-        }
+        // Handshake message processed, no debug output needed
         return;
     }
     
@@ -291,6 +289,26 @@ static void process_status_message(const char* msg, size_t len) {
             kmbox_response_count++;
         }
         // Don't echo pong messages (too frequent)
+        return;
+    }
+    
+    // Parse device info responses from KMBox
+    if (len >= 10 && strncmp(msg, "KMBOX_VID:", 10) == 0) {
+        attached_vid = (uint16_t)strtol(msg + 10, NULL, 16);
+        return;
+    }
+    if (len >= 10 && strncmp(msg, "KMBOX_PID:", 10) == 0) {
+        attached_pid = (uint16_t)strtol(msg + 10, NULL, 16);
+        return;
+    }
+    if (len >= 10 && strncmp(msg, "KMBOX_MFR:", 10) == 0) {
+        strncpy(attached_manufacturer, msg + 10, sizeof(attached_manufacturer) - 1);
+        attached_manufacturer[sizeof(attached_manufacturer) - 1] = '\0';
+        return;
+    }
+    if (len >= 11 && strncmp(msg, "KMBOX_PROD:", 11) == 0) {
+        strncpy(attached_product, msg + 11, sizeof(attached_product) - 1);
+        attached_product[sizeof(attached_product) - 1] = '\0';
         return;
     }
     
@@ -316,16 +334,6 @@ static void uart_rx_task(void) {
         uint32_t now = to_ms_since_boot(get_absolute_time());
         uint8_t c = uart_rx_getc();
         batch_count++;
-        
-        // Debug: show first 100 bytes received
-        if (rx_debug_count < 100 && tud_cdc_connected()) {
-            char dbg[32];
-            snprintf(dbg, sizeof(dbg), "[RX:%02X '%c']", c, (c >= 0x20 && c < 0x7F) ? c : '.');
-            tud_cdc_write_str(dbg);
-            if ((rx_debug_count % 8) == 7) tud_cdc_write_str("\r\n");
-            tud_cdc_write_flush();
-            rx_debug_count++;
-        }
         
         // Update last RX time for EVERY byte received
         kmbox_last_rx_time = now;
@@ -408,6 +416,12 @@ static void send_kmbox_ping(void) {
     }
 }
 
+// Request device info from KMBox (VID, PID, manufacturer, product)
+static void request_kmbox_info(void) {
+    hw_uart_puts("KMBOX_INFO\n");
+    uart_tx_bytes_total += 11;
+}
+
 // UART Echo test - send test string and look for echo response
 uint32_t echo_test_count = 0;
 uint32_t echo_response_count = 0;
@@ -456,10 +470,6 @@ static void kmbox_connection_task(void) {
         // Transition to connected if not already
         if (kmbox_state != KMBOX_CONNECTED) {
             kmbox_state = KMBOX_CONNECTED;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("[Bridge] KMBox connected\r\n");
-                tud_cdc_write_flush();
-            }
         }
     }
     
@@ -472,14 +482,16 @@ static void kmbox_connection_task(void) {
             send_kmbox_ping();
         }
         
+        // Request device info periodically (for TFT display)
+        if (now - last_info_request_ms >= INFO_REQUEST_INTERVAL_MS) {
+            last_info_request_ms = now;
+            request_kmbox_info();
+        }
+        
         // Check for ping timeout (no response after sending ping)
         if (ping_pending && (now - ping_sent_time >= KMBOX_TIMEOUT_MS)) {
             kmbox_state = KMBOX_DISCONNECTED;
             ping_pending = false;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("[Bridge] KMBox disconnected (ping timeout)\r\n");
-                tud_cdc_write_flush();
-            }
         }
     } else {
         // Not connected - try to connect periodically
@@ -532,6 +544,7 @@ static void send_text_mouse_move(int16_t dx, int16_t dy) {
     bool sent = send_uart_packet((const uint8_t*)cmd, len);
     uart_tx_bytes_total += len;
     tft_mouse_activity_count++;  // Track mouse commands for TFT display
+    injection_count++;  // Track successful injections
     
     // Debug: show UART sends (always now for debugging)
     if (tud_cdc_connected()) {
@@ -971,6 +984,21 @@ static void update_status_neopixel(void) {
 // ============================================================================
 
 static void tft_update_task(void) {
+    // Calculate UART rates (once per second)
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t rate_delta_ms = now_ms - last_rate_calc_time_ms;
+    if (rate_delta_ms >= 1000) {
+        // Calculate bytes per second
+        uint32_t tx_delta = uart_tx_bytes_total - last_tx_bytes_for_rate;
+        uint32_t rx_delta = uart_rx_bytes_total - last_rx_bytes_for_rate;
+        uart_tx_rate_bps = (tx_delta * 1000) / rate_delta_ms;
+        uart_rx_rate_bps = (rx_delta * 1000) / rate_delta_ms;
+        
+        last_tx_bytes_for_rate = uart_tx_bytes_total;
+        last_rx_bytes_for_rate = uart_rx_bytes_total;
+        last_rate_calc_time_ms = now_ms;
+    }
+    
     // Gather all statistics
     tft_stats_t stats = {0};  // Zero-initialize all fields
     
@@ -984,26 +1012,20 @@ static void tft_update_task(void) {
     // Data rates
     stats.tx_bytes = uart_tx_bytes_total;
     stats.rx_bytes = uart_rx_bytes_total;
-    // tx_rate_bps and rx_rate_bps would require tracking delta over time
-    // For now, leave at 0 (could add rate calculation later)
+    stats.tx_rate_bps = uart_tx_rate_bps;
+    stats.rx_rate_bps = uart_rx_rate_bps;
     
-    // Latency statistics
-    latency_stats_t lat_stats;
-    latency_get_stats(&lat_stats);
-    stats.latency_min_us = lat_stats.min_us;
-    stats.latency_avg_us = lat_stats.avg_us;
-    stats.latency_max_us = lat_stats.max_us;
+    // Attached device info from KMBox
+    stats.device_vid = attached_vid;
+    stats.device_pid = attached_pid;
+    strncpy(stats.device_manufacturer, attached_manufacturer, sizeof(stats.device_manufacturer) - 1);
+    strncpy(stats.device_product, attached_product, sizeof(stats.device_product) - 1);
     
-    // Tracker statistics (for mouse activity)
-    tracker_stats_t tracker_stats;
-    tracker_get_stats(&tracker_stats);
-    stats.last_dx = tracker_stats.last_dx;
-    stats.last_dy = tracker_stats.last_dy;
+    // Mouse activity
     stats.mouse_moves = tft_mouse_activity_count;
-    // stats.mouse_clicks not tracked yet
+    stats.mouse_clicks = injection_count;  // Repurpose for injection count
     
-    // Uptime
-    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    // Uptime (reuse now_ms from rate calculation)
     stats.uptime_sec = (now_ms - boot_time_ms) / 1000;
     
     // CPU frequency
