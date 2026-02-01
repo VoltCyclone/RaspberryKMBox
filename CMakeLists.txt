@@ -44,6 +44,7 @@ add_executable(PIOKMbox
     state_management.c
     kmbox_serial_handler.c
     smooth_injection.c
+    humanization_lut.c
 )
 
 # generate the header file into the source tree as it is included in the RP2040 datasheet
