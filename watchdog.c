@@ -46,11 +46,6 @@ static void update_hardware_watchdog(void) {
         watchdog_update();
         g_watchdog_status.hardware_updates++;
         g_last_hardware_update_ms = get_time_ms();
-        
-        if (g_debug_enabled) {
-            printf("Watchdog: Hardware watchdog updated (count: %lu)\n", 
-                   g_watchdog_status.hardware_updates);
-        }
     }
 }
 
@@ -73,11 +68,8 @@ static bool is_core_responsive(uint32_t last_heartbeat_ms, uint32_t current_time
 static void handle_timeout_warning(int core_num, uint32_t time_since_heartbeat) {
     g_watchdog_status.timeout_warnings++;
     
-    printf("WATCHDOG WARNING: Core %d unresponsive for %lu ms (timeout: %d ms)\n",
-           core_num, time_since_heartbeat, WATCHDOG_CORE_TIMEOUT_MS);
-    
     if (time_since_heartbeat > WATCHDOG_CORE_TIMEOUT_MS * 2) {
-        printf("WATCHDOG CRITICAL: Core %d severely unresponsive, system reset imminent!\n", core_num);
+        // System is severely unresponsive, prepare for reset
     }
 }
 

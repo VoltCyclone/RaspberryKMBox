@@ -1,0 +1,73 @@
+; Bridge Protocol TX - Hardware packet framing
+; Automatically adds sync byte and handles variable-length packets
+;
+; Features:
+; - Hardware sync byte insertion (0xBD)
+; - Zero-copy DMA support
+; - Automatic packet framing
+; - No CPU involvement after DMA setup
+;
+; Usage:
+; 1. Load command byte + payload to TX FIFO
+; 2. PIO automatically prepends sync byte
+; 3. Transmits complete packet
+
+.program bridge_tx
+.side_set 1 opt
+
+.wrap_target
+public entry_point:
+    pull block          side 1      ; Get packet length (in bytes)
+    out x, 32           side 1      ; Store length in X
+    
+    ; Send sync byte (0xBD) first
+    set y, 0xBD         side 1      ; Load sync byte
+    out null, 24        side 1      ; Clear OSR for next operation
+    
+sync_bit:
+    set pins, 0         side 0 [7]  ; Start bit
+    out pins, 1         side 0 [6]  ; Shift out bit 0
+    jmp x--, sync_bit   side 0 [6]  ; Loop 8 times for sync byte
+    set pins, 1         side 0 [7]  ; Stop bit
+    set pins, 1         side 1 [6]  ; Idle high
+
+payload_loop:
+    pull ifempty block  side 1      ; Get next byte (or wait)
+    set y, 7            side 1      ; 8 bits per byte
+bit_loop:
+    set pins, 0         side 0 [7]  ; Start bit
+    out pins, 1         side 0 [6]  ; Data bit
+    jmp y--, bit_loop   side 0 [6]  ; Loop for 8 bits
+    set pins, 1         side 0 [7]  ; Stop bit
+    set pins, 1         side 1 [6]  ; Idle high
+    jmp x--, payload_loop side 1    ; Next byte if more in packet
+    
+.wrap
+
+% c-sdk {
+static inline void bridge_tx_program_init(PIO pio, uint sm, uint offset, uint pin, float baud_rate) {
+    pio_sm_config c = bridge_tx_program_get_default_config(offset);
+    
+    // Set TX pin
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_set_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    
+    // Configure pin as output
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    
+    // Set baud rate (8 cycles per bit with side-set)
+    float div = (float)clock_get_hz(clk_sys) / (baud_rate * 8);
+    sm_config_set_clkdiv(&c, div);
+    
+    // Shift OSR right, autopull at 8 bits
+    sm_config_set_out_shift(&c, true, true, 8);
+    
+    // Set idle high
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

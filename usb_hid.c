@@ -57,7 +57,8 @@ static void utf16_to_utf8(uint16_t *utf16_buf, size_t utf16_buf_bytes, char *utf
     
     // Unroll loop by 4 for better performance (most strings are short)
     size_t i = 0;
-    while (i + 3 < code_units && utf8_pos + 3 < utf8_len - 1) {
+    size_t utf16_buf_len = utf16_buf_bytes / 2;  // Total UTF-16 code units available
+    while (i + 3 < code_units && utf8_pos + 3 < utf8_len - 1 && (1 + i + 3) < utf16_buf_len) {
         uint16_t u0 = utf16_buf[1 + i];
         uint16_t u1 = utf16_buf[1 + i + 1];
         uint16_t u2 = utf16_buf[1 + i + 2];
@@ -97,31 +98,24 @@ void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
         attached_vid = vid;
         attached_pid = pid;
         attached_has_serial = false; // Default to no serial number unless device has one
-        printf("Updated attached device VID:PID to %04x:%04x\n", vid, pid);
         
         // Force USB re-enumeration to update descriptor
         force_usb_reenumeration();
-    } else {
-        printf("VID:PID unchanged (%04x:%04x), skipping re-enumeration\n", vid, pid);
     }
 }
 
 void force_usb_reenumeration() {
-    printf("Forcing USB re-enumeration with new descriptor...\n");
-    
     // Disconnect from USB host
     tud_disconnect();
     
-    // Wait for host to recognize disconnection (250ms minimum for Windows/macOS)
+    // Wait for host to recognize disconnection (500ms for Windows/macOS)
     sleep_ms(500);
     
     // Reconnect with new descriptor
     tud_connect();
     
-    // Wait for reconnection
+    // Wait for reconnection (250ms for stability)
     sleep_ms(250);
-    
-    printf("USB re-enumeration complete\n");
 }
 
 // Function to fetch string descriptors from attached device
@@ -145,34 +139,28 @@ static void fetch_device_string_descriptors(uint8_t dev_addr) {
     // Get manufacturer string
     if (tuh_descriptor_get_manufacturer_string_sync(dev_addr, LANGUAGE_ID, temp_manufacturer, sizeof(temp_manufacturer)) == XFER_RESULT_SUCCESS) {
         utf16_to_utf8(temp_manufacturer, sizeof(temp_manufacturer), attached_manufacturer, sizeof(attached_manufacturer));
-        printf("Fetched manufacturer: %s\n", attached_manufacturer);
         kmbox_send_status(attached_manufacturer);
     } else {
         strcpy(attached_manufacturer, MANUFACTURER_STRING);  // Fallback
-        printf("Failed to fetch manufacturer, using fallback: %s\n", attached_manufacturer);
     }
     
     // Get product string
     if (tuh_descriptor_get_product_string_sync(dev_addr, LANGUAGE_ID, temp_product, sizeof(temp_product)) == XFER_RESULT_SUCCESS) {
         utf16_to_utf8(temp_product, sizeof(temp_product), attached_product, sizeof(attached_product));
-        printf("Fetched product: %s\n", attached_product);
         kmbox_send_status(attached_product);
     } else {
         strcpy(attached_product, PRODUCT_STRING);  // Fallback
-        printf("Failed to fetch product, using fallback: %s\n", attached_product);
     }
     
     // Get serial string (optional)
     if (tuh_descriptor_get_serial_string_sync(dev_addr, LANGUAGE_ID, temp_serial, sizeof(temp_serial)) == XFER_RESULT_SUCCESS) {
         utf16_to_utf8(temp_serial, sizeof(temp_serial), attached_serial, sizeof(attached_serial));
-        printf("Fetched serial: %s\n", attached_serial);
         char serial_msg[64];
         snprintf(serial_msg, sizeof(serial_msg), "Serial: %s", attached_serial);
         kmbox_send_status(serial_msg);
         attached_has_serial = (strlen(attached_serial) > 0);
     } else {
         attached_has_serial = false;
-        printf("No serial number available\n");
     }
     
     string_descriptors_fetched = true;
@@ -185,7 +173,6 @@ static void reset_device_string_descriptors(void) {
     memset(attached_serial, 0, sizeof(attached_serial));
     string_descriptors_fetched = false;
     attached_has_serial = false;
-    printf("String descriptors reset\n");
 }
 
 // Function to get the VID of the attached device
@@ -196,6 +183,16 @@ uint16_t get_attached_vid(void) {
 // Function to get the PID of the attached device
 uint16_t get_attached_pid(void) {
     return attached_pid;
+}
+
+// Function to get attached device manufacturer string
+const char* get_attached_manufacturer(void) {
+    return attached_manufacturer;
+}
+
+// Function to get attached device product string
+const char* get_attached_product(void) {
+    return attached_product;
 }
 
 // Function to get dynamic serial string
@@ -472,10 +469,14 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
     kmbox_update_physical_buttons(valid_buttons);
 
     // Record physical movement for velocity tracking (smooth injection)
+    // Apply transform to physical mouse movement if enabled
     if (report->x != 0 || report->y != 0)
     {
-        smooth_record_physical_movement(report->x, report->y);
-        kmbox_add_mouse_movement(report->x, report->y);
+        int16_t transformed_x, transformed_y;
+        kmbox_transform_movement(report->x, report->y, &transformed_x, &transformed_y);
+        
+        smooth_record_physical_movement((int8_t)transformed_x, (int8_t)transformed_y);
+        kmbox_add_mouse_movement(transformed_x, transformed_y);
     }
 
     // Add physical wheel movement
@@ -484,9 +485,9 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         kmbox_add_wheel_movement(report->wheel);
     }
 
-    // Now get the final movement and button values from kmbox which include
-    // both any previously queued command movement and the newly added
-    // physical movement.
+    // Always get and send the combined movement (physical + any pending bridge commands)
+    // This ensures bridge movements get sent COMBINED with physical movements
+    // rather than waiting for a separate send opportunity
     uint8_t buttons_to_send;
     int8_t x, y, wheel, pan;
     kmbox_get_mouse_report(&buttons_to_send, &x, &y, &wheel, &pan);
@@ -608,6 +609,18 @@ void hid_device_task(void)
     if (!tud_mounted() || !tud_ready())
     {
         return;
+    }
+
+    // CRITICAL FIX: Always check for pending bridge movements and flush them
+    // This ensures bridge commands work even when physical mouse is connected but idle
+    if (kmbox_has_pending_movement() && tud_hid_ready())
+    {
+        // Flush any pending bridge movements by sending a mouse report
+        uint8_t buttons;
+        int8_t x, y, wheel, pan;
+        kmbox_get_mouse_report(&buttons, &x, &y, &wheel, &pan);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
+        return;  // One report per task call to avoid overwhelming USB
     }
 
     // Only send reports when devices are not connected
@@ -742,6 +755,7 @@ void tud_resume_cb(void)
 // Host callbacks with improved error handling
 void tuh_mount_cb(uint8_t dev_addr)
 {
+    (void)dev_addr;
     neopixel_trigger_activity_flash_color(COLOR_USB_CONNECTION);
     neopixel_update_status();
 }

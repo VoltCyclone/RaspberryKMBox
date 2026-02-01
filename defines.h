@@ -44,7 +44,7 @@
 #define KMBOX_UART              uart0    // Use UART0 for KMBox (via Click Shield RX/TX pins)
 #define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to RP2350 bridge RX)
 #define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from RP2350 bridge TX)
-#define KMBOX_UART_BAUDRATE     115200  // High-speed baud rate for fast commands (2 Mbps)
+#define KMBOX_UART_BAUDRATE     2000000  // Baud rate (2 Mbps for ultra-fast injection)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
 //--------------------------------------------------------------------+
@@ -542,19 +542,19 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 
 #if BUILD_CONFIG == BUILD_CONFIG_PRODUCTION
     #define ENABLE_VERBOSE_LOGGING      0
-    #define ENABLE_INIT_LOGGING         1
-    #define ENABLE_ERROR_LOGGING        1
-    #define ENABLE_STATS_LOGGING        1
+    #define ENABLE_INIT_LOGGING         0
+    #define ENABLE_ERROR_LOGGING        0
+    #define ENABLE_STATS_LOGGING        0
 #elif BUILD_CONFIG == BUILD_CONFIG_TESTING
-    #define ENABLE_VERBOSE_LOGGING      1
-    #define ENABLE_INIT_LOGGING         1
-    #define ENABLE_ERROR_LOGGING        1
+    #define ENABLE_VERBOSE_LOGGING      0
+    #define ENABLE_INIT_LOGGING         0
+    #define ENABLE_ERROR_LOGGING        0
     #define ENABLE_STATS_LOGGING        0
 #else // Development and Debug
-    #define ENABLE_VERBOSE_LOGGING      1
-    #define ENABLE_INIT_LOGGING         1
-    #define ENABLE_ERROR_LOGGING        1
-    #define ENABLE_STATS_LOGGING        1
+    #define ENABLE_VERBOSE_LOGGING      0
+    #define ENABLE_INIT_LOGGING         0
+    #define ENABLE_ERROR_LOGGING        0
+    #define ENABLE_STATS_LOGGING        0
 #endif
 
 //--------------------------------------------------------------------+

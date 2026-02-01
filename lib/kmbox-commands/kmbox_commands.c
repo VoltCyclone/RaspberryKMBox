@@ -249,6 +249,8 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     // lock_mx(state) - Set X axis lock (1=locked, 0=unlocked)
     // lock_my() - Get Y axis lock state
     // lock_my(state) - Set Y axis lock (1=locked, 0=unlocked)
+    // transform() - Get current transform settings
+    // transform(scale_x, scale_y, enabled) - Set mouse transform (256=1.0x, 0=block, -256=invert)
     // catch_xy(duration_ms) - Sum x/y input over last duration (0..1000ms)
     // monitor() - Get monitor state
     // monitor(state) - Enable (non-zero) or disable (0) monitoring mode
@@ -545,6 +547,37 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         return;
     }
     
+    // Check if this is a transform command: km.transform(scale_x, scale_y, enabled)
+    // scale values use fixed-point: 256 = 1.0x, 0 = block axis, -256 = invert
+    if (strncmp(cmd + 3, "transform(", 10) == 0) {
+        const char* arg_start = cmd + 13; // Skip "km.transform("
+        const char* paren_end = strchr(arg_start, ')');
+        
+        if (!paren_end) {
+            return;
+        }
+        
+        // Check if there's an argument
+        size_t arg_len = paren_end - arg_start;
+        if (arg_len == 0) {
+            // No argument - return transform state
+            printf("(%d, %d, %d)\r\n>>> ", 
+                   g_kmbox_state.transform_scale_x,
+                   g_kmbox_state.transform_scale_y,
+                   g_kmbox_state.transform_enabled ? 1 : 0);
+            return;
+        }
+        
+        // Parse: scale_x, scale_y, enabled
+        int scale_x, scale_y, enabled;
+        if (sscanf(arg_start, "%d , %d , %d", &scale_x, &scale_y, &enabled) == 3 ||
+            sscanf(arg_start, "%d,%d,%d", &scale_x, &scale_y, &enabled) == 3) {
+            kmbox_set_transform((int16_t)scale_x, (int16_t)scale_y, enabled != 0);
+            printf(">>> ");
+        }
+        return;
+    }
+    
     // Check if this is a click command
     if (strncmp(cmd + 3, "click(", 6) == 0) {
         // Parse click command
@@ -755,6 +788,11 @@ void kmbox_commands_init(void)
     
     // Initialize monitor mode (disabled by default)
     g_kmbox_state.monitor_enabled = false;
+    
+    // Initialize mouse transform (disabled by default, scale 1.0x)
+    g_kmbox_state.transform_scale_x = 256;  // 1.0x
+    g_kmbox_state.transform_scale_y = 256;  // 1.0x
+    g_kmbox_state.transform_enabled = false;
     
     // Debug: Log initial axis lock states
     printf("KMBox initialized - lock_mx=%d, lock_my=%d\n", 
@@ -1261,6 +1299,13 @@ void kmbox_add_wheel_movement(int8_t wheel)
     }
 }
 
+bool kmbox_has_pending_movement(void)
+{
+    return (g_kmbox_state.mouse_x_accumulator != 0 ||
+            g_kmbox_state.mouse_y_accumulator != 0 ||
+            g_kmbox_state.wheel_accumulator != 0);
+}
+
 void kmbox_set_axis_lock(bool lock_x, bool lock_y)
 {
     g_kmbox_state.lock_mx = lock_x;
@@ -1360,12 +1405,14 @@ bool kmbox_parse_move_command(const char* cmd, int* x, int* y)
         return false;
     }
     
-    // Check for km.move(x,y) format
+    // Check for km.move(x,y) format - allow optional spaces
     if (strncmp(cmd, "km.move(", 8) != 0) {
         return false;
     }
     
-    return sscanf(cmd, "km.move(%d,%d)", x, y) == 2;
+    // sscanf with space in format allows optional whitespace
+    return sscanf(cmd, "km.move(%d , %d)", x, y) == 2 ||
+           sscanf(cmd, "km.move(%d,%d)", x, y) == 2;
 }
 
 bool kmbox_parse_click_command(const char* cmd, int* button)
@@ -1389,4 +1436,48 @@ bool kmbox_is_version_command(const char* cmd)
     }
     
     return strncmp(cmd, "km.version()", 12) == 0;
+}
+
+//--------------------------------------------------------------------+
+// Mouse Transform Functions
+//--------------------------------------------------------------------+
+
+void kmbox_set_transform(int16_t scale_x, int16_t scale_y, bool enabled)
+{
+    g_kmbox_state.transform_scale_x = scale_x;
+    g_kmbox_state.transform_scale_y = scale_y;
+    g_kmbox_state.transform_enabled = enabled;
+    printf("Transform set: scale_x=%d scale_y=%d enabled=%d\n", 
+           scale_x, scale_y, enabled ? 1 : 0);
+}
+
+void kmbox_get_transform(int16_t *scale_x, int16_t *scale_y, bool *enabled)
+{
+    if (scale_x) *scale_x = g_kmbox_state.transform_scale_x;
+    if (scale_y) *scale_y = g_kmbox_state.transform_scale_y;
+    if (enabled) *enabled = g_kmbox_state.transform_enabled;
+}
+
+void kmbox_transform_movement(int16_t in_x, int16_t in_y, int16_t *out_x, int16_t *out_y)
+{
+    if (!g_kmbox_state.transform_enabled) {
+        // No transform, pass through
+        if (out_x) *out_x = in_x;
+        if (out_y) *out_y = in_y;
+        return;
+    }
+    
+    // Apply fixed-point scale: scale 256 = 1.0x
+    // Formula: out = (in * scale) / 256
+    int32_t scaled_x = ((int32_t)in_x * g_kmbox_state.transform_scale_x) / 256;
+    int32_t scaled_y = ((int32_t)in_y * g_kmbox_state.transform_scale_y) / 256;
+    
+    // Clamp to int16_t range
+    if (scaled_x > 32767) scaled_x = 32767;
+    if (scaled_x < -32768) scaled_x = -32768;
+    if (scaled_y > 32767) scaled_y = 32767;
+    if (scaled_y < -32768) scaled_y = -32768;
+    
+    if (out_x) *out_x = (int16_t)scaled_x;
+    if (out_y) *out_y = (int16_t)scaled_y;
 }

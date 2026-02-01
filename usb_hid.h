@@ -104,6 +104,10 @@ uint16_t get_attached_pid(void);
 // Function to set the VID and PID of the attached device
 void set_attached_device_vid_pid(uint16_t vid, uint16_t pid);
 
+// Functions to get attached device string descriptors
+const char* get_attached_manufacturer(void);
+const char* get_attached_product(void);
+
 // Function to get dynamic serial string
 const char* get_dynamic_serial_string(void);
 

@@ -4,12 +4,15 @@
  * This firmware runs on an Adafruit Feather RP2350 and provides:
  * - USB CDC interface for receiving RGB frames from PC
  * - Color-based target tracking with configurable parameters
- * - PIO UART TX to send mouse commands to RP2040 KMBox
- * - PIO UART RX to receive status messages from KMBox
+ * - Hardware UART TX/RX for high-speed communication with RP2040 KMBox
  * - NeoPixel and onboard LED status indicators
+ * - High-precision latency tracking using freed PIO resources
  * 
  * Architecture:
- *   PC (capture tool) -> USB CDC -> RP2350 (this) -> PIO UART -> RP2040 (KMBox)
+ *   PC (capture tool) -> USB CDC -> RP2350 (this) -> HW UART -> RP2040 (KMBox)
+ * 
+ * Note: TX/RX wires are crossed at hardware level, allowing direct
+ * hardware UART usage instead of PIO-based pin swapping.
  */
 
 #include <stdio.h>
@@ -19,20 +22,45 @@
 #include "pico/binary_info.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
+#include "hardware/uart.h"
+#include "hardware/dma.h"
 #include "tusb.h"
 
 #include "config.h"
 #include "tracker.h"
-#include "uart_tx.pio.h"
-#include "uart_rx.pio.h"
+#include "hw_uart.h"
+#include "latency_tracker.h"
+#include "tft_display.h"
+#include "bridge_protocol.h"
+#include "makcu_protocol.h"
+#include "makcu_translator.h"
+#include "ferrum_protocol.h"
+#include "ferrum_translator.h"
+#include "core1_translator.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
 
-// PIO UART state
+// PIO instance (used for WS2812 NeoPixel and timing, UART moved to hardware)
 static PIO pio = pio0;
-static uint sm_tx;
-static uint sm_rx;
-static uint tx_offset;
-static uint rx_offset;
+
+// Hardware UART is now used instead of PIO UART
+// DMA circular buffers are handled internally by hw_uart module
+
+// API Mode State (KMBox native, Makcu, or Ferrum)
+// Note: api_mode_t is defined in makcu_protocol.h
+
+static api_mode_t current_api_mode = API_MODE_KMBOX;
+static uint32_t last_button_check = 0;
+static bool button_state = false;
+static uint32_t button_press_start = 0;
+static bool button_init_done = false;
+
+// Ferrum line buffer (file scope for mode change reset)
+static char ferrum_line[256];
+static uint8_t ferrum_idx = 0;
+
+#define MODE_BUTTON_PIN 7
+#define BUTTON_DEBOUNCE_MS 50
+#define BUTTON_LONG_PRESS_MS 2000
 
 // Frame reception state
 static uint8_t frame_buffer[FRAME_BUFFER_SIZE];
@@ -71,10 +99,30 @@ static uint32_t kmbox_response_count = 0;
 static uint32_t kmbox_connect_attempts = 0;
 
 // Connection timing (milliseconds)
-#define KMBOX_PING_INTERVAL_MS      1000    // Send ping every 1s
-#define KMBOX_TIMEOUT_MS            3000    // Consider disconnected after 3s no RX
-#define KMBOX_CONNECT_RETRY_MS      1000    // Retry connect every 1s
+#define KMBOX_PING_INTERVAL_MS      2000    // Send ping every 2s (was 1s)
+#define KMBOX_TIMEOUT_MS            5000    // Consider disconnected after 5s no RX (was 3s)
+#define KMBOX_CONNECT_RETRY_MS      2000    // Retry connect every 2s
 #define KMBOX_INITIAL_DELAY_MS      500     // Wait for KMBox to boot
+
+// TFT display tracking variables
+static uint32_t boot_time_ms = 0;
+static uint32_t tft_mouse_activity_count = 0;
+
+// UART rate tracking for TFT display
+static uint32_t last_rate_calc_time_ms = 0;
+static uint32_t last_tx_bytes_for_rate = 0;
+static uint32_t last_rx_bytes_for_rate = 0;
+static uint32_t uart_tx_rate_bps = 0;  // Calculated TX rate
+static uint32_t uart_rx_rate_bps = 0;  // Calculated RX rate
+static uint32_t injection_count = 0;   // Number of successful km.move injections
+
+// Attached device info from KMBox
+static uint16_t attached_vid = 0;
+static uint16_t attached_pid = 0;
+static char attached_manufacturer[32] = "";
+static char attached_product[32] = "";
+static uint32_t last_info_request_ms = 0;
+#define INFO_REQUEST_INTERVAL_MS 5000  // Request device info every 5 seconds
 
 // CDC receive state machine
 typedef enum {
@@ -123,7 +171,7 @@ static void ws2812_init(void) {
     uint offset = pio_add_program(ws2812_pio, &ws2812_program);
     
     pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_wrap(&c, offset, offset + 3);
+    sm_config_set_wrap(&c, offset, offset + ws2812_program.length - 1);
     sm_config_set_sideset(&c, 1, false, false);
     sm_config_set_out_shift(&c, false, true, 24);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
@@ -145,49 +193,93 @@ static void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // ============================================================================
-// PIO UART TX/RX Initialization
+// Hardware UART Wrappers (using hw_uart module)
 // ============================================================================
 
-static void pio_uart_tx_init(uint pin, uint baud) {
-    tx_offset = pio_add_program(pio, &uart_tx_program);
-    sm_tx = pio_claim_unused_sm(pio, true);
-    uart_tx_program_init(pio, sm_tx, tx_offset, pin, baud);
+// UART statistics from hw_uart module
+static uint32_t uart_rx_bytes_total = 0;
+static uint32_t uart_tx_bytes_total = 0;
+
+// Wrapper functions for compatibility with existing code
+static inline bool uart_rx_available(void) {
+    return hw_uart_rx_available();
 }
 
-static inline void pio_uart_tx_byte(uint8_t b) {
-    uart_tx_program_putc(pio, sm_tx, b);
+static inline uint8_t uart_rx_getc(void) {
+    int c = hw_uart_getc();
+    if (c >= 0) {
+        uart_rx_bytes_total++;
+        return (uint8_t)c;
+    }
+    return 0;
 }
 
-static void pio_uart_rx_init(uint pin, uint baud) {
-    rx_offset = pio_add_program(pio, &uart_rx_program);
-    sm_rx = pio_claim_unused_sm(pio, true);
-    uart_rx_program_init(pio, sm_rx, rx_offset, pin, baud);
+static inline void uart_tx_byte(uint8_t c) {
+    hw_uart_putc(c);
+    uart_tx_bytes_total++;
 }
 
-static inline bool pio_uart_rx_available(void) {
-    return uart_rx_program_available(pio, sm_rx);
+// Initialize hardware UART for bridge communication
+static void hw_uart_bridge_init(void) {
+    if (!hw_uart_init(UART_TX_PIN, UART_RX_PIN, UART_BAUD)) {
+        return;
+    }
 }
 
-static inline char pio_uart_rx_getc(void) {
-    return uart_rx_program_getc(pio, sm_rx);
+// Button handling for API mode toggle
+static void button_init(void) {
+    gpio_init(MODE_BUTTON_PIN);
+    gpio_set_dir(MODE_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(MODE_BUTTON_PIN);
+    button_state = !gpio_get(MODE_BUTTON_PIN);  // Read initial state
+}
+
+static void button_task(void) {
+    // Button feature disabled - API mode fixed to KMBox
+    // TODO: Fix button debouncing before re-enabling
+    (void)last_button_check;
+    (void)button_state;
+    (void)button_press_start;
+    (void)button_init_done;
+}
+
+// Send packet via Hardware UART (DMA accelerated)
+static inline bool send_uart_packet(const uint8_t* data, size_t len) {
+    if (hw_uart_send(data, len)) {
+        uart_tx_bytes_total += len;
+        return true;
+    }
+    return false;
 }
 
 // ============================================================================
 // UART RX Processing - Status Messages from KMBox
 // ============================================================================
 
+// Echo test tracking (defined earlier in the file)
+extern uint32_t echo_test_count;
+extern uint32_t echo_response_count;
+
 static void process_status_message(const char* msg, size_t len) {
+    
+    // Check for echo response: "ECHO:TEST..."
+    if (len >= 5 && strncmp(msg, "ECHO:", 5) == 0) {
+        echo_response_count++;
+        // Auto-connect on successful echo
+        if (kmbox_state != KMBOX_CONNECTED) {
+            kmbox_state = KMBOX_CONNECTED;
+        }
+        return;
+    }
+    
     // Check for handshake response
     if (len >= 11 && strncmp(msg, "KMBOX_READY", 11) == 0) {
         if (kmbox_state != KMBOX_CONNECTED) {
             kmbox_state = KMBOX_CONNECTED;
             kmbox_response_count++;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("[Bridge] KMBox connected (handshake OK)\r\n");
-                tud_cdc_write_flush();
-            }
         }
-        return;  // Don't echo handshake messages
+        // Handshake message processed, no debug output needed
+        return;
     }
     
     // Check for pong response  
@@ -196,11 +288,31 @@ static void process_status_message(const char* msg, size_t len) {
             kmbox_state = KMBOX_CONNECTED;
             kmbox_response_count++;
         }
-        // Don't echo pong messages
+        // Don't echo pong messages (too frequent)
         return;
     }
     
-    // Forward other status messages to CDC
+    // Parse device info responses from KMBox
+    if (len >= 10 && strncmp(msg, "KMBOX_VID:", 10) == 0) {
+        attached_vid = (uint16_t)strtol(msg + 10, NULL, 16);
+        return;
+    }
+    if (len >= 10 && strncmp(msg, "KMBOX_PID:", 10) == 0) {
+        attached_pid = (uint16_t)strtol(msg + 10, NULL, 16);
+        return;
+    }
+    if (len >= 10 && strncmp(msg, "KMBOX_MFR:", 10) == 0) {
+        strncpy(attached_manufacturer, msg + 10, sizeof(attached_manufacturer) - 1);
+        attached_manufacturer[sizeof(attached_manufacturer) - 1] = '\0';
+        return;
+    }
+    if (len >= 11 && strncmp(msg, "KMBOX_PROD:", 11) == 0) {
+        strncpy(attached_product, msg + 11, sizeof(attached_product) - 1);
+        attached_product[sizeof(attached_product) - 1] = '\0';
+        return;
+    }
+    
+    // Forward ALL other status messages to CDC
     if (tud_cdc_connected()) {
         tud_cdc_write_str("[KMBox] ");
         tud_cdc_write(msg, len);
@@ -209,25 +321,35 @@ static void process_status_message(const char* msg, size_t len) {
     }
 }
 
-static uint32_t uart_rx_bytes_total = 0;
-static uint32_t uart_tx_bytes_total = 0;
-
 static void uart_rx_task(void) {
-    uint32_t now = to_ms_since_boot(get_absolute_time());
     static uint8_t binary_packet[8];
     static uint8_t binary_idx = 0;
     static bool in_binary_packet = false;
+    static uint32_t binary_packet_start_time = 0;
+    static uint32_t rx_debug_count = 0;
     
-    while (pio_uart_rx_available()) {
-        uint8_t c = pio_uart_rx_getc();
-        uart_rx_bytes_total++;
-        kmbox_last_rx_time = now;  // Track last RX time
+    // Batch process up to 64 bytes per call to avoid blocking too long
+    uint8_t batch_count = 0;
+    while (uart_rx_available() && batch_count < 64) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        uint8_t c = uart_rx_getc();
+        batch_count++;
+        
+        // Update last RX time for EVERY byte received
+        kmbox_last_rx_time = now;
+        
+        // Reset binary packet state if timeout (stuck packet)
+        if (in_binary_packet && (now - binary_packet_start_time) > 100) {
+            in_binary_packet = false;
+            binary_idx = 0;
+        }
         
         // Check for start of binary response packet (0xFF or 0xFE from KMBox)
         if (!in_binary_packet && (c == 0xFF || c == 0xFE)) {
             in_binary_packet = true;
             binary_idx = 0;
             binary_packet[binary_idx++] = c;
+            binary_packet_start_time = now;
             continue;
         }
         
@@ -265,6 +387,9 @@ static void uart_rx_task(void) {
         } else if (c >= 0x20 && c < 0x7F) {  // Printable ASCII only
             if (status_buffer_idx < STATUS_BUFFER_SIZE - 1) {
                 status_buffer[status_buffer_idx++] = c;
+            } else {
+                // Buffer overflow - reset
+                status_buffer_idx = 0;
             }
         }
         // Ignore other non-printable bytes
@@ -276,56 +401,100 @@ static void uart_rx_task(void) {
 // ============================================================================
 
 static void send_kmbox_ping(void) {
-    // Send 8-byte ping packet: [0xFE][0][0][0][0][0][0][0]
-    pio_uart_tx_byte(0xFE);  // FAST_CMD_PING
-    for (int i = 0; i < 7; i++) {
-        pio_uart_tx_byte(0x00);
+    // In KMBOX text mode, send a simple text ping instead of binary
+    // This avoids corrupting the text command stream with 0xFE bytes
+    if (current_api_mode == API_MODE_KMBOX) {
+        // Send text ping: "P\n" - simple, won't interfere with M/W/B commands
+        hw_uart_puts("P\n");
+        kmbox_ping_count++;
+        uart_tx_bytes_total += 2;
+    } else {
+        // Binary ping for other modes
+        uint8_t ping_packet[8] = {0xFE, 0, 0, 0, 0, 0, 0, 0};
+        send_uart_packet(ping_packet, 8);
+        kmbox_ping_count++;
     }
-    kmbox_ping_count++;
-    uart_tx_bytes_total += 8;
+}
+
+// Request device info from KMBox (VID, PID, manufacturer, product)
+static void request_kmbox_info(void) {
+    hw_uart_puts("KMBOX_INFO\n");
+    uart_tx_bytes_total += 11;
+}
+
+// UART Echo test - send test string and look for echo response
+uint32_t echo_test_count = 0;
+uint32_t echo_response_count = 0;
+
+static void send_uart_echo_test(void) {
+    echo_test_count++;
+    char test_msg[32];
+    snprintf(test_msg, sizeof(test_msg), "ETEST%lu\n", echo_test_count);
+    
+    // Use direct UART write (not DMA) for reliability test
+    for (const char* p = test_msg; *p; p++) {
+        while (!uart_is_writable(uart0)) {
+            tight_loop_contents();
+        }
+        uart_putc_raw(uart0, *p);
+    }
+    uart_tx_bytes_total += strlen(test_msg);
+    
+    if (tud_cdc_connected()) {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[ECHO_TEST] Sent: %s", test_msg);
+        tud_cdc_write_str(dbg);
+        tud_cdc_write_flush();
+    }
 }
 
 static void send_kmbox_handshake(void) {
     // Send bridge sync request - KMBox responds with "KMBOX_READY"
-    const char* handshake = "KMBOX_BRIDGE_SYNC\n";
-    while (*handshake) {
-        pio_uart_tx_byte(*handshake++);
-    }
+    hw_uart_puts("KMBOX_BRIDGE_SYNC\n");
     uart_tx_bytes_total += 18;
 }
 
 static void kmbox_connection_task(void) {
+    static uint32_t last_rx_count = 0;
+    static uint32_t ping_sent_time = 0;
+    static bool ping_pending = false;
+    
     uint32_t now = to_ms_since_boot(get_absolute_time());
     
-    // Simple logic: any RX data within timeout = connected
-    bool have_recent_data = (uart_rx_bytes_total > 0) && 
-                            (now - kmbox_last_rx_time < KMBOX_TIMEOUT_MS);
-    
-    if (have_recent_data) {
+    // Check if new data has arrived since last check
+    bool got_new_data = (uart_rx_bytes_total > last_rx_count);
+    if (got_new_data) {
+        last_rx_count = uart_rx_bytes_total;
+        ping_pending = false;  // Got response, cancel pending timeout
+        
+        // Transition to connected if not already
         if (kmbox_state != KMBOX_CONNECTED) {
             kmbox_state = KMBOX_CONNECTED;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("[Bridge] KMBox connected\r\n");
-                tud_cdc_write_flush();
-            }
         }
-        
+    }
+    
+    if (kmbox_state == KMBOX_CONNECTED) {
         // Send keepalive ping periodically
         if (now - kmbox_last_ping_time >= KMBOX_PING_INTERVAL_MS) {
             kmbox_last_ping_time = now;
+            ping_sent_time = now;
+            ping_pending = true;
             send_kmbox_ping();
         }
-    } else {
-        // No recent data - disconnected
-        if (kmbox_state == KMBOX_CONNECTED) {
-            kmbox_state = KMBOX_DISCONNECTED;
-            if (tud_cdc_connected()) {
-                tud_cdc_write_str("[Bridge] KMBox disconnected\r\n");
-                tud_cdc_write_flush();
-            }
+        
+        // Request device info periodically (for TFT display)
+        if (now - last_info_request_ms >= INFO_REQUEST_INTERVAL_MS) {
+            last_info_request_ms = now;
+            request_kmbox_info();
         }
         
-        // Try to reconnect periodically
+        // Check for ping timeout (no response after sending ping)
+        if (ping_pending && (now - ping_sent_time >= KMBOX_TIMEOUT_MS)) {
+            kmbox_state = KMBOX_DISCONNECTED;
+            ping_pending = false;
+        }
+    } else {
+        // Not connected - try to connect periodically
         if (now - kmbox_last_ping_time >= KMBOX_CONNECT_RETRY_MS) {
             kmbox_last_ping_time = now;
             kmbox_connect_attempts++;
@@ -344,14 +513,15 @@ static void uart_debug_task(void) {
     static uint32_t last_debug_time = 0;
     
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_debug_time >= 5000) {  // Every 5 seconds
+    
+    if (now - last_debug_time >= 10000) {  // Every 10 seconds
         last_debug_time = now;
         if (tud_cdc_connected()) {
             const char* state_str = (kmbox_state == KMBOX_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
             
-            char debug_msg[128];
+            char debug_msg[80];
             snprintf(debug_msg, sizeof(debug_msg), 
-                     "[Bridge] %s | TX: %lu | RX: %lu bytes\r\n", 
+                     "[Bridge] %s | TX:%lu RX:%lu\r\n", 
                      state_str, uart_tx_bytes_total, uart_rx_bytes_total);
             tud_cdc_write_str(debug_msg);
             tud_cdc_write_flush();
@@ -360,20 +530,54 @@ static void uart_debug_task(void) {
 }
 
 // ============================================================================
-// Mouse Command Protocol - Send to KMBox
+// Mouse Command Protocol - Send to KMBox (Simple Text Protocol)
 // ============================================================================
 
+// Send a simple text command to KMBox: "M<x>,<y>\n"
+static void send_text_mouse_move(int16_t dx, int16_t dy) {
+    char cmd[24];
+    int len = snprintf(cmd, sizeof(cmd), "M%d,%d\n", dx, dy);
+    
+    // Flash LED on Bridge side to confirm we're sending
+    gpio_put(LED_PIN, 1);
+    
+    send_uart_packet((const uint8_t*)cmd, len);
+    uart_tx_bytes_total += len;
+    tft_mouse_activity_count++;  // Track mouse commands for TFT display
+    injection_count++;  // Track successful injections
+    
+    // Brief LED pulse (no blocking debug output in hot path)
+    sleep_us(50);
+    gpio_put(LED_PIN, 0);
+}
+
+// Send transform command to KMBox: "km.transform(scale_x, scale_y, enabled)\n"
+// scale: 256 = 1.0x, 0 = block, -256 = invert, 128 = 0.5x
+static void send_transform_command(int16_t scale_x, int16_t scale_y, bool enabled) {
+    char cmd[48];
+    int len = snprintf(cmd, sizeof(cmd), "km.transform(%d,%d,%d)\n", 
+                       scale_x, scale_y, enabled ? 1 : 0);
+    
+    send_uart_packet((const uint8_t*)cmd, len);
+    uart_tx_bytes_total += len;
+    
+    if (tud_cdc_connected()) {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[UART>transform %d,%d,%d]\r\n", 
+                 scale_x, scale_y, enabled ? 1 : 0);
+        tud_cdc_write_str(dbg);
+        tud_cdc_write_flush();
+    }
+}
+
+// Legacy binary send (keep for now)
 static void send_mouse_command(int16_t dx, int16_t dy, uint8_t buttons) {
-    // 8-byte packet matching KMBox fast_cmd_move_t format
-    pio_uart_tx_byte(CMD_MOUSE_MOVE);
-    pio_uart_tx_byte(dx & 0xFF);
-    pio_uart_tx_byte((dx >> 8) & 0xFF);
-    pio_uart_tx_byte(dy & 0xFF);
-    pio_uart_tx_byte((dy >> 8) & 0xFF);
-    pio_uart_tx_byte(buttons);
-    pio_uart_tx_byte(0);  // wheel
-    pio_uart_tx_byte(0);  // padding
-    uart_tx_bytes_total += 8;
+    // Use simple text protocol instead of binary
+    send_text_mouse_move(dx, dy);
+    
+    // If buttons changed, could send button command
+    // For now, ignore buttons in text mode
+    (void)buttons;
 }
 
 // ============================================================================
@@ -381,8 +585,9 @@ static void send_mouse_command(int16_t dx, int16_t dy, uint8_t buttons) {
 // ============================================================================
 
 // Fast command byte detection (matches KMBox protocol)
+// Note: We exclude 0x0A (\n) and 0x0D (\r) since they are line terminators
 static inline bool is_fast_cmd_byte(uint8_t b) {
-    return (b >= 0x01 && b <= 0x0B) || b == 0xFE;
+    return (b >= 0x01 && b <= 0x0B && b != 0x0A) || b == 0xFE;
 }
 
 // Text command buffer
@@ -396,9 +601,29 @@ static void handle_text_command(const char* cmd) {
     if (kmbox_parse_move_command(cmd, &x, &y)) {
         send_mouse_command(x, y, 0);
         if (tud_cdc_connected()) {
-            tud_cdc_write_str("OK\r\n");
+            tud_cdc_write_str(">>>\r\n");
+            // No flush - let USB send when ready (non-blocking)
+        }
+        return;
+    }
+    
+    // km.transform(scale_x, scale_y, enabled) - set mouse transform on KMBox
+    // scale: 256=1.0x, 0=block, -256=invert, 128=0.5x
+    int scale_x, scale_y, enabled;
+    if (sscanf(cmd, "km.transform(%d , %d , %d)", &scale_x, &scale_y, &enabled) == 3 ||
+        sscanf(cmd, "km.transform(%d,%d,%d)", &scale_x, &scale_y, &enabled) == 3) {
+        send_transform_command((int16_t)scale_x, (int16_t)scale_y, enabled != 0);
+        if (tud_cdc_connected()) {
+            tud_cdc_write_str(">>>\r\n");
             tud_cdc_write_flush();
         }
+        return;
+    }
+    
+    // km.transform() - query current transform (forward to KMBox)
+    if (strncmp(cmd, "km.transform()", 14) == 0) {
+        send_uart_packet((const uint8_t*)"km.transform()\n", 15);
+        uart_tx_bytes_total += 15;
         return;
     }
     
@@ -406,11 +631,8 @@ static void handle_text_command(const char* cmd) {
     int btn;
     if (kmbox_parse_click_command(cmd, &btn)) {
         // Send click packet to KMBox
-        pio_uart_tx_byte(0x02);  // FAST_CMD_MOUSE_CLICK
-        pio_uart_tx_byte(btn);
-        pio_uart_tx_byte(1);     // count
-        for (int i = 0; i < 5; i++) pio_uart_tx_byte(0);
-        uart_tx_bytes_total += 8;
+        uint8_t click_pkt[8] = {0x02, (uint8_t)btn, 1, 0, 0, 0, 0, 0};
+        send_uart_packet(click_pkt, 8);
         if (tud_cdc_connected()) {
             tud_cdc_write_str("OK\r\n");
             tud_cdc_write_flush();
@@ -444,11 +666,17 @@ static void handle_text_command(const char* cmd) {
     // stats - show statistics
     if (strcmp(cmd, "stats") == 0) {
         if (tud_cdc_connected()) {
-            char resp[128];
+            char resp[256];
+            latency_stats_t lat_stats;
+            latency_get_stats(&lat_stats);
+            
             snprintf(resp, sizeof(resp), 
-                     "TX: %lu bytes | RX: %lu bytes | KMBox: %s\r\n",
+                     "TX: %lu bytes | RX: %lu bytes | KMBox: %s\r\n"
+                     "Latency: min=%luus avg=%luus max=%luus jitter=%luus (n=%lu)\r\n",
                      uart_tx_bytes_total, uart_rx_bytes_total,
-                     kmbox_state == KMBOX_CONNECTED ? "connected" : "disconnected");
+                     kmbox_state == KMBOX_CONNECTED ? "connected" : "disconnected",
+                     lat_stats.min_us, lat_stats.avg_us, lat_stats.max_us,
+                     lat_stats.jitter_us, lat_stats.sample_count);
             tud_cdc_write_str(resp);
             tud_cdc_write_flush();
         }
@@ -512,35 +740,113 @@ static void cdc_task(void) {
     uint8_t buf[512];
     uint32_t count = tud_cdc_read(buf, sizeof(buf));
     
+
+    
     uint32_t i = 0;
     while (i < count) {
         uint8_t b = buf[i];
         
-        // Priority 1: Binary fast commands (0x01-0x0B, 0xFE)
-        // Forward directly to KMBox via PIO UART
-        if (is_fast_cmd_byte(b) && rx_state == RX_STATE_IDLE) {
-            if (i + 8 <= count) {
-                // Forward complete 8-byte packet to KMBox
-                for (int j = 0; j < 8; j++) {
-                    pio_uart_tx_byte(buf[i + j]);
+        // Protocol detection and routing based on API mode
+        if (current_api_mode == API_MODE_MAKCU && b == MAKCU_FRAME_START && rx_state == RX_STATE_IDLE) {
+            // Makcu binary frame - Parse header to get full frame
+            // Header: [0x50] [CMD] [LEN_LO] [LEN_HI] [PAYLOAD...]
+            if (i + 4 <= count) {
+                uint8_t cmd = buf[i + 1];
+                uint16_t payload_len = buf[i + 2] | (buf[i + 3] << 8);
+                
+                // Check if full frame available
+                if (i + 4 + payload_len <= count && payload_len <= MAKCU_MAX_PAYLOAD) {
+                    // Queue complete frame to Core1 (just payload, Core1 knows the format)
+                    core1_queue_makcu_frame(cmd, &buf[i + 4], payload_len);
+                    i += 4 + payload_len;
+                    continue;
                 }
-                uart_tx_bytes_total += 8;
+            }
+            break;  // Incomplete frame, wait for more data
+        }
+        
+        // Ferrum text protocol - line-based
+        if (current_api_mode == API_MODE_FERRUM) {
+            if (b == '\n' || b == '\r') {
+                if (ferrum_idx > 0) {
+                    ferrum_line[ferrum_idx] = '\0';
+                    
+                    // Translate Ferrum command to bridge protocol
+                    ferrum_translated_t result;
+                    if (ferrum_translate_line(ferrum_line, ferrum_idx, &result) && result.length > 0) {
+                        // Debug: verify first byte is 0xBD
+                        static uint32_t pkt_count = 0;
+                        pkt_count++;
+                        if (pkt_count <= 5 && tud_cdc_connected()) {
+                            char dbg[64];
+                            snprintf(dbg, sizeof(dbg), "[DBG] PKT#%lu: [%02X %02X %02X %02X %02X %02X] len=%zu\r\n",
+                                     pkt_count, result.buffer[0], result.buffer[1], 
+                                     result.buffer[2], result.buffer[3],
+                                     result.buffer[4], result.buffer[5], result.length);
+                            tud_cdc_write_str(dbg);
+                            tud_cdc_write_flush();
+                        }
+                        
+                        // Send translated bridge protocol packets
+                        send_uart_packet(result.buffer, result.length);
+                        uart_tx_bytes_total += result.length;
+                        
+                        if (result.needs_response && tud_cdc_connected()) {
+                            tud_cdc_write_str(FERRUM_RESPONSE);
+                            tud_cdc_write_flush();
+                            // Force immediate transmission by calling tud_task()
+                            tud_task();
+                            // Blink LED to show response sent
+                            gpio_put(LED_PIN, 1);
+                            sleep_us(100);
+                            gpio_put(LED_PIN, 0);
+                        }
+                    } else if (tud_cdc_connected()) {
+                        tud_cdc_write_str("ERR\r\n");
+                        tud_cdc_write_flush();
+                        tud_task();
+                    }
+                    
+                    ferrum_idx = 0;
+                }
+            } else if (ferrum_idx < sizeof(ferrum_line) - 1) {
+                ferrum_line[ferrum_idx++] = b;
+            }
+            i++;
+            continue;
+        }
+        
+        // KMBox native mode - fast binary commands
+        if (current_api_mode == API_MODE_KMBOX && is_fast_cmd_byte(b) && rx_state == RX_STATE_IDLE) {
+            if (i + 8 <= count) {
+                // Convert 8-byte KMBox command to bridge protocol
+                uint8_t bridge_packet[7];
+                size_t bridge_len = 0;
+                
+                // Fast path: direct mouse move translation
+                if (b == 0x01) {  // FAST_CMD_MOUSE_MOVE
+                    int16_t x = buf[i+1] | (buf[i+2] << 8);
+                    int16_t y = buf[i+3] | (buf[i+4] << 8);
+                    // Ignore buttons and wheel for text protocol
+                    
+                    // Send simple text command
+                    send_text_mouse_move(x, y);
+                }
                 i += 8;
                 continue;
             } else {
-                // Incomplete packet at end - wait for more data
-                break;
+                break;  // Incomplete packet
             }
         }
         
-        // Priority 2: Frame data (in progress or starting with 'F')
+        // Frame data (tracking frames)
         if (rx_state != RX_STATE_IDLE || b == FRAME_MAGIC_0) {
             process_cdc_byte(b);
             i++;
             continue;
         }
         
-        // Priority 3: Text commands (printable ASCII)
+        // Text commands (printable ASCII)
         if (b >= 0x20 && b <= 0x7E) {
             if (cmd_buffer_idx < sizeof(cmd_buffer) - 1) {
                 cmd_buffer[cmd_buffer_idx++] = b;
@@ -549,7 +855,7 @@ static void cdc_task(void) {
             continue;
         }
         
-        // End of text command (CR or LF)
+        // End of text command
         if (b == '\r' || b == '\n') {
             if (cmd_buffer_idx > 0) {
                 cmd_buffer[cmd_buffer_idx] = '\0';
@@ -560,52 +866,7 @@ static void cdc_task(void) {
             continue;
         }
         
-        // Skip unknown bytes
         i++;
-    }
-}
-
-// ============================================================================
-// Configuration Commands from PC
-// ============================================================================
-
-static void handle_config_command(const uint8_t* cmd, size_t len) {
-    if (len < 2) return;
-    
-    switch (cmd[0]) {
-        case CMD_CONFIG:
-            if (len >= 9) {
-                tracker_config_t cfg = {
-                    .r_min = cmd[1],
-                    .r_max = cmd[2],
-                    .g_max = cmd[3],
-                    .b_max = cmd[4],
-                    .gain_x = cmd[5] / 10.0f,
-                    .gain_y = cmd[6] / 10.0f,
-                    .deadzone = cmd[7],
-                    .min_blob_size = cmd[8]
-                };
-                tracker_set_config(&cfg);
-            }
-            break;
-            
-        case CMD_ENABLE:
-            tracker_set_enabled(cmd[1] != 0);
-            break;
-            
-        case CMD_STATUS:
-            {
-                tracker_stats_t stats;
-                tracker_get_stats(&stats);
-                char response[64];
-                int n = snprintf(response, sizeof(response), 
-                    "S:%d,%d,%u,%u\n",
-                    stats.last_dx, stats.last_dy, 
-                    stats.blob_size, stats.fps);
-                tud_cdc_write(response, n);
-                tud_cdc_write_flush();
-            }
-            break;
     }
 }
 
@@ -707,6 +968,63 @@ static void update_status_neopixel(void) {
 }
 
 // ============================================================================
+// TFT Display Update Task (non-blocking, rate-limited)
+// ============================================================================
+
+static void tft_update_task(void) {
+    // Calculate UART rates (once per second)
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t rate_delta_ms = now_ms - last_rate_calc_time_ms;
+    if (rate_delta_ms >= 1000) {
+        // Calculate bytes per second
+        uint32_t tx_delta = uart_tx_bytes_total - last_tx_bytes_for_rate;
+        uint32_t rx_delta = uart_rx_bytes_total - last_rx_bytes_for_rate;
+        uart_tx_rate_bps = (tx_delta * 1000) / rate_delta_ms;
+        uart_rx_rate_bps = (rx_delta * 1000) / rate_delta_ms;
+        
+        last_tx_bytes_for_rate = uart_tx_bytes_total;
+        last_rx_bytes_for_rate = uart_rx_bytes_total;
+        last_rate_calc_time_ms = now_ms;
+    }
+    
+    // Gather all statistics
+    tft_stats_t stats = {0};  // Zero-initialize all fields
+    
+    // Connection status
+    stats.kmbox_connected = (kmbox_state == KMBOX_CONNECTED);
+    stats.cdc_connected = tud_cdc_connected();
+    
+    // API mode (numeric)
+    stats.api_mode = (uint8_t)current_api_mode;
+    
+    // Data rates
+    stats.tx_bytes = uart_tx_bytes_total;
+    stats.rx_bytes = uart_rx_bytes_total;
+    stats.tx_rate_bps = uart_tx_rate_bps;
+    stats.rx_rate_bps = uart_rx_rate_bps;
+    stats.uart_baud = UART_BAUD;  // From config.h
+    
+    // Attached device info from KMBox
+    stats.device_vid = attached_vid;
+    stats.device_pid = attached_pid;
+    strncpy(stats.device_manufacturer, attached_manufacturer, sizeof(stats.device_manufacturer) - 1);
+    strncpy(stats.device_product, attached_product, sizeof(stats.device_product) - 1);
+    
+    // Mouse activity
+    stats.mouse_moves = tft_mouse_activity_count;
+    stats.mouse_clicks = injection_count;  // Repurpose for injection count
+    
+    // Uptime (reuse now_ms from rate calculation)
+    stats.uptime_sec = (now_ms - boot_time_ms) / 1000;
+    
+    // CPU frequency
+    stats.cpu_freq_mhz = clock_get_hz(clk_sys) / 1000000;
+    
+    // Call TFT update (internally rate-limited)
+    tft_update(&stats);
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -719,10 +1037,14 @@ int main(void) {
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0);
     
-    // Initialize peripherals
+    // Initialize peripherals (fast init only)
     ws2812_init();
-    pio_uart_tx_init(UART_TX_PIN, UART_BAUD);
-    pio_uart_rx_init(UART_RX_PIN, UART_BAUD);
+    button_init();
+    hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
+    latency_tracker_init(); // Initialize latency tracking
+    
+    // Initialize Core1 translator
+    core1_translator_init();
     
     // Initialize tracker
     tracker_init();
@@ -731,44 +1053,70 @@ int main(void) {
     ws2812_put_rgb(LED_COLOR_BOOTING);
     set_status(STATUS_BOOTING);
     
-    // TinyUSB initialization
+    // TinyUSB initialization - MUST happen early for CDC to enumerate
     tusb_init();
     
-    // Initialize connection state with current time
+    // Now init TFT (has long delays, but USB is already initializing)
+    tft_init();             // Initialize TFT display (SPI1)
+    tft_show_splash();      // Show splash screen
+    
+    // Initialize connection state
     uint32_t boot_time = to_ms_since_boot(get_absolute_time());
+    boot_time_ms = boot_time;  // Store for TFT uptime display
     kmbox_last_rx_time = boot_time;
     kmbox_last_ping_time = boot_time;
     
-    // Wait for KMBox to boot before trying to connect
+    // Wait for KMBox to boot
     sleep_ms(KMBOX_INITIAL_DELAY_MS);
     
-    // Performance tracking
     uint32_t last_frame_time = 0;
     uint32_t frame_count = 0;
     uint32_t fps_timer = 0;
-    
     bool startup_msg_sent = false;
     
     while (1) {
         tud_task();
         cdc_task();
         uart_rx_task();
-        kmbox_connection_task();  // Handle KMBox connection
+        kmbox_connection_task();
+        button_task();
+        
+        // Periodic UART echo test (every 2 seconds while not connected)
+        static uint32_t last_echo_test = 0;
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (kmbox_state != KMBOX_CONNECTED && (now - last_echo_test >= 2000)) {
+            last_echo_test = now;
+            send_uart_echo_test();
+        }
+        
+        // Dequeue translated commands from Core1 and send
+        uint8_t translated_packet[8];
+        while (core1_has_kmbox_commands()) {
+            if (core1_dequeue_kmbox_command(translated_packet)) {
+                // Translate 8-byte KMBox to optimized bridge protocol
+                // (Core1 outputs old format, we convert to new)
+                int16_t x = translated_packet[1] | (translated_packet[2] << 8);
+                int16_t y = translated_packet[3] | (translated_packet[4] << 8);
+                
+                uint8_t bridge_pkt[7];
+                size_t len = bridge_build_mouse_move(bridge_pkt, x, y);
+                send_uart_packet(bridge_pkt, len);
+            }
+        }
         
         // Send startup message once CDC is connected
         if (tud_cdc_connected() && !startup_msg_sent) {
             sleep_ms(100);
-            printf("\n=== KMBox Bridge Autopilot ===\n");
+            printf("\n=== KMBox Bridge with Hardware UART ===\n");
             printf("Board: Adafruit Feather RP2350\n");
             printf("System clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
-            printf("\nUART TX: GPIO%d @ %d baud\n", UART_TX_PIN, UART_BAUD);
-            printf("  PIO: pio0, SM: %d, Offset: %d\n", sm_tx, tx_offset);
-            printf("\nUART RX: GPIO%d @ %d baud\n", UART_RX_PIN, UART_BAUD);
-            printf("  PIO: pio0, SM: %d, Offset: %d\n", sm_rx, rx_offset);
-            printf("  GPIO%d state: %d (should be 1 when idle)\n", UART_RX_PIN, gpio_get(UART_RX_PIN));
-            printf("\nConnection: Auto-reconnect enabled (ping every %dms, timeout %dms)\n", 
-                   KMBOX_PING_INTERVAL_MS, KMBOX_TIMEOUT_MS);
-            printf("\nWaiting for KMBox connection...\n\n");
+            printf("Core1: Protocol translator active\n");
+            printf("UART: Hardware UART0 @ %d baud (DMA accelerated)\n", UART_BAUD);
+            printf("  TX: GPIO%d -> crossed wire -> KMBox RX\n", UART_TX_PIN);
+            printf("  RX: GPIO%d <- crossed wire <- KMBox TX\n", UART_RX_PIN);
+            printf("PIO: Available for timing/WS2812 (freed from UART duty)\n");
+            printf("Protocols: KMBox, Makcu, Ferrum (button to toggle)\n");
+            printf("Waiting for KMBox connection...\n\n");
             startup_msg_sent = true;
         }
         
@@ -778,6 +1126,9 @@ int main(void) {
             
             uint32_t now = time_us_32();
             
+            // Track command latency
+            uint32_t timing_start = latency_start_timing();
+            
             tracker_result_t result;
             tracker_process_frame(frame_buffer, current_roi_w, current_roi_h, &result);
             
@@ -785,6 +1136,8 @@ int main(void) {
             if (result.valid && tracker_is_enabled() && kmbox_state == KMBOX_CONNECTED) {
                 send_mouse_command(result.dx, result.dy, 0);
             }
+            
+            latency_end_timing(timing_start);
             
             // FPS calculation
             frame_count++;
@@ -801,6 +1154,7 @@ int main(void) {
         heartbeat_task();
         update_status_neopixel();
         uart_debug_task();
+        tft_update_task();  // Update TFT display (non-blocking, rate-limited)
         
         tight_loop_contents();
     }

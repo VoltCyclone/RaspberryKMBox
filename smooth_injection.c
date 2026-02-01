@@ -13,14 +13,22 @@
  */
 
 #include "smooth_injection.h"
+#include "humanization_lut.h"
 #include "pico/stdlib.h"
+#include <stdio.h>
 #include <string.h>
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "pico/multicore.h"
 
 // Persist state
 #define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define HUMANIZATION_MAGIC 0x484D414E  // "HMAN"
+
+// Deferred flash save state (to avoid crashing multicore during button press)
+static volatile bool g_save_pending = false;
+static volatile uint32_t g_save_request_time = 0;
+#define SAVE_DEFER_MS 2000  // Wait 2 seconds after last mode change before saving
 
 // Forward declaration for internal use
 static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool auto_save);
@@ -96,49 +104,12 @@ static inline int8_t clamp_i8(int32_t val) {
 }
 
 //--------------------------------------------------------------------+
-// Bezier Easing Curves for Natural Movement
+// Easing Curves - Now using precomputed LUT for performance
 //--------------------------------------------------------------------+
 
-// Cubic Bezier ease-in-out: slow start, fast middle, slow end (natural human movement)
-// t in range [0, SMOOTH_FP_ONE], returns eased t in same range
-static int32_t ease_in_out_cubic(int32_t t) {
-    // Bezier curve with control points (0,0), (0.42,0), (0.58,1), (1,1)
-    // Simplified cubic: if t < 0.5: 4*t^3, else: 1-4*(1-t)^3
-    
-    int32_t half = SMOOTH_FP_ONE / 2;
-    if (t < half) {
-        // Acceleration phase: 4*t^3
-        int32_t t_scaled = fp_mul(t, int_to_fp(2)); // t*2
-        int32_t t2 = fp_mul(t_scaled, t_scaled);
-        int32_t t3 = fp_mul(t2, t_scaled);
-        return t3 / 2; // 4*t^3 / 2 (since we scaled by 2)
-    } else {
-        // Deceleration phase: 1 - 4*(1-t)^3
-        int32_t inv_t = SMOOTH_FP_ONE - t;
-        int32_t inv_scaled = fp_mul(inv_t, int_to_fp(2));
-        int32_t inv2 = fp_mul(inv_scaled, inv_scaled);
-        int32_t inv3 = fp_mul(inv2, inv_scaled);
-        return SMOOTH_FP_ONE - (inv3 / 2);
-    }
-}
-
-// Ease-out (quick start, slow end) - good for sudden corrections
-static int32_t ease_out_quad(int32_t t) {
-    // 1 - (1-t)^2
-    int32_t inv = SMOOTH_FP_ONE - t;
-    int32_t inv2 = fp_mul(inv, inv);
-    return SMOOTH_FP_ONE - inv2;
-}
-
-// Select easing curve based on movement characteristics
-static int32_t apply_easing(int32_t t, easing_mode_t mode) {
-    switch (mode) {
-        case EASING_LINEAR:     return t;
-        case EASING_EASE_IN_OUT: return ease_in_out_cubic(t);
-        case EASING_EASE_OUT:   return ease_out_quad(t);
-        default:                return t;
-    }
-}
+// apply_easing now uses lut_apply_easing() from humanization_lut.h
+// This provides ~10x speedup and smoother interpolation
+#define apply_easing(t, mode) lut_apply_easing((t), (mode))
 
 //--------------------------------------------------------------------+
 // Velocity Tracking
@@ -184,24 +155,24 @@ static smooth_queue_entry_t* queue_alloc(void) {
         return NULL;
     }
     
-    // O(1) allocation using bitmask to track free slots
+    // O(1) allocation using global bitmask to track free slots
     // Check 8 slots at a time using bit operations
-    static uint32_t free_bitmap = 0xFFFFFFFF; // 1 = free, 0 = used
+    // Note: Uses global g_free_bitmap (declared at line 42) for proper synchronization
     
-    if (free_bitmap == 0) {
+    if (g_free_bitmap == 0) {
         // Rebuild bitmap (should rarely happen)
-        free_bitmap = 0;
+        g_free_bitmap = 0;
         for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
             if (!g_smooth.queue[i].active) {
-                free_bitmap |= (1u << i);
+                g_free_bitmap |= (1u << i);
             }
         }
-        if (free_bitmap == 0) return NULL;
+        if (g_free_bitmap == 0) return NULL;
     }
     
     // Find first free slot using count trailing zeros (CTZ)
-    int idx = __builtin_ctz(free_bitmap);
-    free_bitmap &= ~(1u << idx);
+    int idx = __builtin_ctz(g_free_bitmap);
+    g_free_bitmap &= ~(1u << idx);
     
     g_smooth.queue_count++;
     return &g_smooth.queue[idx];
@@ -212,6 +183,11 @@ static void queue_free(smooth_queue_entry_t *entry) {
         entry->active = false;
         if (g_smooth.queue_count > 0) {
             g_smooth.queue_count--;
+        }
+        // Restore bit in free bitmap for reallocation
+        int idx = entry - g_smooth.queue;
+        if (idx >= 0 && idx < SMOOTH_QUEUE_SIZE) {
+            g_free_bitmap |= (1u << idx);
         }
     }
 }
@@ -323,14 +299,22 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     }
     
     // Overshoot simulation for realism (occasional overshoot then correction)
+    // Now using LUT for faster overshoot magnitude lookup
     bool will_overshoot = false;
     int32_t overshoot_x_fp = 0, overshoot_y_fp = 0;
     if (g_smooth.humanization.jitter_enabled && 
         max_component > int_to_fp(30) && 
         (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
         will_overshoot = true;
-        // Small overshoot in movement direction
-        int32_t overshoot_mag = rng_range_fp(SMOOTH_FP_ONE, g_smooth.humanization.overshoot_max_fp);
+        // Get overshoot magnitude from LUT based on movement size (faster than rng_range)
+        int32_t movement_pixels = fp_to_int(max_component);
+        int32_t overshoot_base = lut_get_overshoot(movement_pixels);
+        // Scale by humanization setting (overshoot_max_fp acts as multiplier)
+        int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
+        // Clamp to max
+        if (overshoot_mag > g_smooth.humanization.overshoot_max_fp) {
+            overshoot_mag = g_smooth.humanization.overshoot_max_fp;
+        }
         overshoot_x_fp = (x_fp > 0) ? overshoot_mag : ((x_fp < 0) ? -overshoot_mag : 0);
         overshoot_y_fp = (y_fp > 0) ? overshoot_mag : ((y_fp < 0) ? -overshoot_mag : 0);
     }
@@ -378,14 +362,14 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
         if (!entry->active) continue;
         
         if (entry->frames_left > 0) {
-            // Calculate progress through movement (0.0 to 1.0 in fixed-point)
+            // Calculate progress using LUT (eliminates division in hot path)
             uint8_t frames_elapsed = entry->total_frames - entry->frames_left;
-            int32_t progress = fp_div(int_to_fp(frames_elapsed), int_to_fp(entry->total_frames));
+            int32_t progress = lut_get_progress(entry->total_frames, frames_elapsed);
             
-            // Apply easing curve for natural acceleration/deceleration
+            // Apply easing curve using LUT with interpolation
             int32_t eased_progress = apply_easing(progress, entry->easing);
             int32_t prev_eased = (frames_elapsed > 0) ? 
-                apply_easing(fp_div(int_to_fp(frames_elapsed - 1), int_to_fp(entry->total_frames)), entry->easing) : 0;
+                apply_easing(lut_get_progress(entry->total_frames, frames_elapsed - 1), entry->easing) : 0;
             
             // Calculate movement for this frame based on easing curve delta
             int32_t progress_delta = eased_progress - prev_eased;
@@ -394,19 +378,19 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
             
             // Add micro-jitter for human tremor simulation (except for MICRO mode)
             if (g_smooth.humanization.jitter_enabled && entry->mode != INJECT_MODE_MICRO) {
-                // Jitter varies: higher during movement, lower when static
-                int32_t jitter_amount = g_smooth.humanization.jitter_amount_fp;
+                // Use LUT-based jitter for consistency and speed
+                int32_t jitter_x, jitter_y;
+                int32_t jitter_scale = g_smooth.humanization.jitter_amount_fp;
                 
                 // More jitter during mid-movement (when hand is actually moving)
-                if (progress > int_to_fp(1)/4 && progress < int_to_fp(3)/4) {
-                    jitter_amount = jitter_amount * 3 / 2; // 1.5x jitter during active movement
+                if (progress > (SMOOTH_FP_ONE >> 2) && progress < ((SMOOTH_FP_ONE * 3) >> 2)) {
+                    jitter_scale = (jitter_scale * 3) >> 1; // 1.5x jitter during active movement
                 }
                 
-                // Apply jitter with 40% probability per frame
-                if (rng_next() % 5 < 2) {
-                    dx_fp += rng_range_fp(-jitter_amount, jitter_amount);
-                    dy_fp += rng_range_fp(-jitter_amount, jitter_amount);
-                }
+                // Get jitter from precomputed LUT (includes application probability)
+                lut_get_jitter(g_smooth.frames_processed, jitter_scale, &jitter_x, &jitter_y);
+                dx_fp += jitter_x;
+                dy_fp += jitter_y;
             }
             
             // Add to frame total
@@ -584,8 +568,10 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
     }
     
     // Save to flash if mode actually changed and auto_save is enabled
+    // NOTE: We defer the save to avoid flash write issues with multicore
     if (auto_save && old_mode != mode) {
-        smooth_save_humanization_mode();
+        g_save_pending = true;
+        g_save_request_time = to_ms_since_boot(get_absolute_time());
     }
 }
 
@@ -604,8 +590,12 @@ humanization_mode_t smooth_cycle_humanization_mode(void) {
 }
 
 // save smooth state to flash
+// WARNING: Flash operations on RP2040 with multicore require careful coordination
+// We use a lockout flag to coordinate with Core1
+extern volatile bool g_flash_operation_in_progress;
 
-void smooth_save_humanization_mode(void) {
+// Internal flash save - called from smooth_process_deferred_save when safe
+static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
     humanization_persist_t data = {
         .magic = HUMANIZATION_MAGIC,
         .mode = g_smooth.humanization.mode,
@@ -625,6 +615,37 @@ void smooth_save_humanization_mode(void) {
     flash_range_program(FLASH_TARGET_OFFSET, (uint8_t*)&data, sizeof(data));
     
     restore_interrupts(ints);
+}
+
+void smooth_save_humanization_mode(void) {
+    // Request deferred save instead of immediate save
+    g_save_pending = true;
+    g_save_request_time = to_ms_since_boot(get_absolute_time());
+}
+
+// Call this periodically from main loop when Core1 is in a safe state
+void smooth_process_deferred_save(void) {
+    if (!g_save_pending) return;
+    
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    // Wait for the defer period to allow rapid button presses
+    if ((current_time - g_save_request_time) < SAVE_DEFER_MS) return;
+    
+    // Signal Core1 to pause - it checks this flag in its tight loop
+    g_flash_operation_in_progress = true;
+    
+    // Small delay to let Core1 notice and pause
+    sleep_ms(5);
+    
+    // Now perform the flash write
+    smooth_save_humanization_mode_internal();
+    
+    // Allow Core1 to resume
+    g_flash_operation_in_progress = false;
+    
+    g_save_pending = false;
+    printf("Humanization mode saved to flash\n");
 }
 
 void smooth_load_humanization_mode(void) {
