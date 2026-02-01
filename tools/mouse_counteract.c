@@ -8,7 +8,7 @@
  *   ./mouse_counteract /dev/tty.usbmodem*
  * 
  * Options:
- *   -b, --baud RATE    Serial baud rate (default: 115200)
+ *   -b, --baud RATE    Serial baud rate (default: 921600)
  *   -g, --gain FLOAT   Counteraction gain 0.0-2.0 (default: 1.0)
  *   -d, --deadzone PX  Ignore movements below this threshold (default: 0)
  *   -v, --verbose      Enable verbose logging
@@ -91,7 +91,7 @@ typedef struct {
 } stats_t;
 
 static config_t g_config = {
-    .baudrate = 115200,
+    .baudrate = 921600,
     .gain = 1.0f,
     .deadzone = 0,
     .verbose = false,
@@ -239,11 +239,10 @@ void* serial_sender_thread(void* arg) {
                 printf("[SENDER] Dropped packet after 50 retries\n");
             }
             
-            // Throttle: don't send faster than 1000 packets/sec 
-            // (USB CDC can't keep up anyway)
-            usleep(1000);
+            // Throttle: limit to ~5000 packets/sec for smooth injection
+            usleep(200);
         } else {
-            usleep(500);  // 500µs sleep when queue empty
+            usleep(100);  // 100µs sleep when queue empty
         }
     }
     
@@ -278,6 +277,8 @@ int serial_open(const char* port, int baudrate) {
         case 57600:  speed = B57600; break;
         case 115200: speed = B115200; break;
         case 230400: speed = B230400; break;
+        case 460800: speed = B460800; break;
+        case 921600: speed = B921600; break;
         default:
             fprintf(stderr, "Error: Unsupported baud rate %d\n", baudrate);
             close(fd);
@@ -804,7 +805,7 @@ void print_usage(const char* prog) {
     printf("Mouse Movement Counteraction Tool (macOS)\n\n");
     printf("Usage: %s [OPTIONS] <serial_port>\n\n", prog);
     printf("Options:\n");
-    printf("  -b, --baud RATE      Serial baud rate (default: 115200)\n");
+    printf("  -b, --baud RATE      Serial baud rate (default: 921600)\n");
     printf("  -g, --gain FLOAT     Counteraction gain 0.0-2.0 (default: 1.0)\n");
     printf("  -d, --deadzone PX    Ignore movements below threshold (default: 0)\n");
     printf("  -v, --verbose        Enable verbose logging\n");

@@ -44,7 +44,7 @@
 #define KMBOX_UART              uart0    // Use UART0 for KMBox (via Click Shield RX/TX pins)
 #define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to RP2350 bridge RX)
 #define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from RP2350 bridge TX)
-#define KMBOX_UART_BAUDRATE     115200   // Baud rate (lowered for debugging)
+#define KMBOX_UART_BAUDRATE     921600   // Baud rate (high speed for smooth injection)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
 //--------------------------------------------------------------------+
