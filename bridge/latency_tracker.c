@@ -54,7 +54,7 @@ void latency_end_timing(uint32_t start_token) {
         elapsed_us = (UINT32_MAX - start_token) + end_time + 1;
     }
     
-    // Update statistics===
+    // Update statistics
     stats.last_us = elapsed_us;
     stats.sample_count++;
     

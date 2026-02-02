@@ -59,6 +59,7 @@ static const uint32_t WATCHDOG_STATUS_INTERVAL_MS = WATCHDOG_STATUS_REPORT_INTER
 // Global state for flash operation coordination
 //--------------------------------------------------------------------+
 volatile bool g_flash_operation_in_progress = false;
+volatile bool g_core1_flash_acknowledged = false;
 
 //--------------------------------------------------------------------+
 // Function Prototypes
@@ -142,6 +143,8 @@ static void core1_task_loop(void) {
         // CRITICAL: Pause during flash operations to prevent crash
         // This runs from RAM so it's safe even while flash is being written
         while (g_flash_operation_in_progress) {
+            // Acknowledge that we've paused - Core0 waits for this before flash write
+            g_core1_flash_acknowledged = true;
             // Just spin - flash write is very fast (~5ms)
             // DO NOT call any functions here that might be in flash
             tight_loop_contents();

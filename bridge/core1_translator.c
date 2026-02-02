@@ -106,6 +106,9 @@ bool core1_queue_makcu_frame(uint8_t cmd, const uint8_t* payload, uint16_t len) 
         memcpy(frame->payload, payload, len);
     }
     
+    // Fix #4: Data memory barrier - ensure all writes complete before publishing index
+    __dmb();
+    
     // Advance head (publish frame)
     makcu_head = next_head;
     __atomic_add_fetch(&frames_queued, 1, __ATOMIC_RELAXED);

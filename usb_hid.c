@@ -109,13 +109,21 @@ void force_usb_reenumeration() {
     tud_disconnect();
     
     // Wait for host to recognize disconnection (500ms for Windows/macOS)
-    sleep_ms(500);
+    // Feed watchdog during long wait to prevent reset
+    for (int i = 0; i < 50; i++) {
+        sleep_ms(10);
+        watchdog_core0_heartbeat();
+    }
     
     // Reconnect with new descriptor
     tud_connect();
     
     // Wait for reconnection (250ms for stability)
-    sleep_ms(250);
+    // Feed watchdog during wait
+    for (int i = 0; i < 25; i++) {
+        sleep_ms(10);
+        watchdog_core0_heartbeat();
+    }
 }
 
 // Function to fetch string descriptors from attached device

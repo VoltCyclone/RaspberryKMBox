@@ -189,7 +189,14 @@ bool hw_uart_rx_available(void) {
 
 size_t hw_uart_rx_count(void) {
     uint32_t write_pos = get_rx_write_pos();
-    return (write_pos - rx_read_pos) & (HW_UART_RX_BUFFER_SIZE - 1);
+    size_t available = (write_pos - rx_read_pos) & (HW_UART_RX_BUFFER_SIZE - 1);
+    
+    // Fix #2: Detect potential overflow - if buffer nearly full, data may have been lost
+    // DMA ring buffer overwrites oldest data silently when full
+    if (available >= HW_UART_RX_BUFFER_SIZE - 16) {
+        rx_overflows++;
+    }
+    return available;
 }
 
 int hw_uart_getc(void) {

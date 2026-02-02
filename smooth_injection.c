@@ -115,6 +115,10 @@ static inline int8_t clamp_i8(int32_t val) {
 // Velocity Tracking
 //--------------------------------------------------------------------+
 
+// Persistent fixed-point accumulators to avoid precision loss during conversion
+static int32_t g_velocity_sum_x_fp = 0;
+static int32_t g_velocity_sum_y_fp = 0;
+
 static void velocity_update(int8_t x, int8_t y) {
     velocity_tracker_t *v = &g_smooth.velocity;
     
@@ -127,15 +131,14 @@ static void velocity_update(int8_t x, int8_t y) {
     v->y_history[v->history_index] = y;
     v->history_index = (v->history_index + 1) % SMOOTH_VELOCITY_WINDOW;
     
-    // Update running sum (remove old, add new) - O(1) instead of O(n)
-    int32_t sum_x = (v->avg_velocity_x_fp * SMOOTH_VELOCITY_WINDOW) >> SMOOTH_FP_SHIFT;
-    int32_t sum_y = (v->avg_velocity_y_fp * SMOOTH_VELOCITY_WINDOW) >> SMOOTH_FP_SHIFT;
-    sum_x = sum_x - old_x + x;
-    sum_y = sum_y - old_y + y;
+    // Update running sum in fixed-point (remove old, add new) - O(1)
+    // Keep accumulators in fixed-point to preserve precision across cycles
+    g_velocity_sum_x_fp = g_velocity_sum_x_fp - int_to_fp(old_x) + int_to_fp(x);
+    g_velocity_sum_y_fp = g_velocity_sum_y_fp - int_to_fp(old_y) + int_to_fp(y);
     
-    // Store as fixed-point average
-    v->avg_velocity_x_fp = int_to_fp(sum_x) / SMOOTH_VELOCITY_WINDOW;
-    v->avg_velocity_y_fp = int_to_fp(sum_y) / SMOOTH_VELOCITY_WINDOW;
+    // Store as fixed-point average (no precision loss)
+    v->avg_velocity_x_fp = g_velocity_sum_x_fp / SMOOTH_VELOCITY_WINDOW;
+    v->avg_velocity_y_fp = g_velocity_sum_y_fp / SMOOTH_VELOCITY_WINDOW;
 }
 
 // smooth state accessor for external use
@@ -198,6 +201,11 @@ static void queue_free(smooth_queue_entry_t *entry) {
 
 void smooth_injection_init(void) {
     memset(&g_smooth, 0, sizeof(g_smooth));
+    
+    // Reset global state that's outside g_smooth structure
+    g_free_bitmap = 0xFFFFFFFF;  // All slots free
+    g_velocity_sum_x_fp = 0;     // Reset velocity accumulators
+    g_velocity_sum_y_fp = 0;
     
     // Seed RNG with hardware time for per-session variation
     uint64_t time_us = time_us_64();
@@ -490,6 +498,9 @@ void smooth_clear_queue(void) {
     g_smooth.x_accumulator_fp = 0;
     g_smooth.y_accumulator_fp = 0;
     g_free_bitmap = 0xFFFFFFFF;
+    // Also reset velocity tracking accumulators for consistency
+    g_velocity_sum_x_fp = 0;
+    g_velocity_sum_y_fp = 0;
 }
 
 void smooth_get_stats(uint32_t *total_injected, uint32_t *frames_processed, 
@@ -623,6 +634,9 @@ void smooth_save_humanization_mode(void) {
     g_save_request_time = to_ms_since_boot(get_absolute_time());
 }
 
+// Core1 acknowledgment flag for safe flash operations
+extern volatile bool g_core1_flash_acknowledged;
+
 // Call this periodically from main loop when Core1 is in a safe state
 void smooth_process_deferred_save(void) {
     if (!g_save_pending) return;
@@ -635,14 +649,21 @@ void smooth_process_deferred_save(void) {
     // Signal Core1 to pause - it checks this flag in its tight loop
     g_flash_operation_in_progress = true;
     
-    // Small delay to let Core1 notice and pause
-    sleep_ms(5);
+    // Send event to wake Core1 from any WFI state
+    __sev();
+    
+    // Wait for Core1 to acknowledge with timeout
+    uint32_t timeout = time_us_32() + 10000;  // 10ms timeout
+    while (!g_core1_flash_acknowledged && time_us_32() < timeout) {
+        tight_loop_contents();
+    }
     
     // Now perform the flash write
     smooth_save_humanization_mode_internal();
     
     // Allow Core1 to resume
     g_flash_operation_in_progress = false;
+    g_core1_flash_acknowledged = false;  // Reset for next time
     
     g_save_pending = false;
     printf("Humanization mode saved to flash\n");

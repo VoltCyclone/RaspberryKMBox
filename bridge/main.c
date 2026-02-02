@@ -25,6 +25,7 @@
 #include "hardware/uart.h"
 #include "hardware/dma.h"
 #include "tusb.h"
+#include "ws2812.pio.h"
 
 #include "config.h"
 #include "tracker.h"
@@ -39,9 +40,6 @@
 #include "core1_translator.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
 
-// PIO instance (used for WS2812 NeoPixel and timing, UART moved to hardware)
-static PIO pio = pio0;
-
 // Hardware UART is now used instead of PIO UART
 // DMA circular buffers are handled internally by hw_uart module
 
@@ -49,10 +47,14 @@ static PIO pio = pio0;
 // Note: api_mode_t is defined in makcu_protocol.h
 
 static api_mode_t current_api_mode = API_MODE_KMBOX;
+
+// Button handling - disabled, variables kept for future re-enablement
+#if 0  // Fix #11: Button feature disabled - wrap in #if 0 instead of silencing warnings
 static uint32_t last_button_check = 0;
 static bool button_state = false;
 static uint32_t button_press_start = 0;
 static bool button_init_done = false;
+#endif
 
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
@@ -61,6 +63,10 @@ static uint8_t ferrum_idx = 0;
 #define MODE_BUTTON_PIN 7
 #define BUTTON_DEBOUNCE_MS 50
 #define BUTTON_LONG_PRESS_MS 2000
+
+// Protocol constants (#12: avoid magic numbers)
+#define KMBOX_PACKET_SIZE 8
+#define ECHO_PREFIX_LEN 5
 
 // Frame reception state
 static uint8_t frame_buffer[FRAME_BUFFER_SIZE];
@@ -146,48 +152,28 @@ typedef struct __attribute__((packed)) {
 static frame_header_t pending_header;
 static uint8_t header_bytes_received = 0;
 
-// WS2812 NeoPixel PIO program (minimal inline version)
-static const uint16_t ws2812_program_instructions[] = {
-    0x6221, //  0: out    x, 1            side 0 [2]
-    0x1123, //  1: jmp    !x, 3           side 1 [1]
-    0x1400, //  2: jmp    0               side 1 [4]
-    0xa442, //  3: nop                    side 0 [4]
-};
-
-static const struct pio_program ws2812_program = {
-    .instructions = ws2812_program_instructions,
-    .length = 4,
-    .origin = -1,
-};
-
-static PIO ws2812_pio = pio1;
+// WS2812 NeoPixel state (using SDK PIO program)
+static PIO ws2812_pio = pio0;
 static uint ws2812_sm = 0;
+static uint ws2812_offset = 0;
 
 // ============================================================================
-// WS2812 NeoPixel Control
+// WS2812 NeoPixel Control (using SDK ws2812.pio)
 // ============================================================================
 
 static void ws2812_init(void) {
-    uint offset = pio_add_program(ws2812_pio, &ws2812_program);
+    // Add the SDK ws2812 program to PIO
+    ws2812_offset = pio_add_program(ws2812_pio, &ws2812_program);
     
-    pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_wrap(&c, offset, offset + ws2812_program.length - 1);
-    sm_config_set_sideset(&c, 1, false, false);
-    sm_config_set_out_shift(&c, false, true, 24);
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    // Claim a state machine
+    ws2812_sm = pio_claim_unused_sm(ws2812_pio, true);
     
-    pio_gpio_init(ws2812_pio, WS2812_PIN);
-    pio_sm_set_consecutive_pindirs(ws2812_pio, ws2812_sm, WS2812_PIN, 1, true);
-    sm_config_set_sideset_pins(&c, WS2812_PIN);
-    
-    float div = clock_get_hz(clk_sys) / (800000.0f * 10.0f);
-    sm_config_set_clkdiv(&c, div);
-    
-    pio_sm_init(ws2812_pio, ws2812_sm, offset, &c);
-    pio_sm_set_enabled(ws2812_pio, ws2812_sm, true);
+    // Initialize using SDK helper function (800kHz, RGB not RGBW)
+    ws2812_program_init(ws2812_pio, ws2812_sm, ws2812_offset, WS2812_PIN, 800000, false);
 }
 
-static void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
+static inline void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
     uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
     pio_sm_put_blocking(ws2812_pio, ws2812_sm, grb << 8);
 }
@@ -196,9 +182,16 @@ static void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
 // Hardware UART Wrappers (using hw_uart module)
 // ============================================================================
 
-// UART statistics from hw_uart module
+// UART statistics - synced from hw_uart module periodically
+// These shadow variables are used for display and rate calculation
 static uint32_t uart_rx_bytes_total = 0;
 static uint32_t uart_tx_bytes_total = 0;
+static uint32_t uart_rx_overflows = 0;
+
+// Sync stats from hw_uart module (called periodically)
+static void sync_uart_stats(void) {
+    hw_uart_get_stats(&uart_tx_bytes_total, &uart_rx_bytes_total, &uart_rx_overflows);
+}
 
 // Wrapper functions for compatibility with existing code
 static inline bool uart_rx_available(void) {
@@ -208,7 +201,6 @@ static inline bool uart_rx_available(void) {
 static inline uint8_t uart_rx_getc(void) {
     int c = hw_uart_getc();
     if (c >= 0) {
-        uart_rx_bytes_total++;
         return (uint8_t)c;
     }
     return 0;
@@ -216,7 +208,6 @@ static inline uint8_t uart_rx_getc(void) {
 
 static inline void uart_tx_byte(uint8_t c) {
     hw_uart_putc(c);
-    uart_tx_bytes_total++;
 }
 
 // Initialize hardware UART for bridge communication
@@ -231,25 +222,19 @@ static void button_init(void) {
     gpio_init(MODE_BUTTON_PIN);
     gpio_set_dir(MODE_BUTTON_PIN, GPIO_IN);
     gpio_pull_up(MODE_BUTTON_PIN);
-    button_state = !gpio_get(MODE_BUTTON_PIN);  // Read initial state
+    // Button state tracking disabled - see #if 0 block above
 }
 
 static void button_task(void) {
-    // Button feature disabled - API mode fixed to KMBox
-    // TODO: Fix button debouncing before re-enabling
-    (void)last_button_check;
-    (void)button_state;
-    (void)button_press_start;
-    (void)button_init_done;
+    // Fix #11: Button feature disabled - API mode fixed to KMBox
+    // TODO: Fix button debouncing before re-enabling (see #if 0 block)
 }
 
 // Send packet via Hardware UART (DMA accelerated)
+// Note: Don't increment uart_tx_bytes_total here - hw_uart_send() tracks via total_tx_bytes
+// and we sync in tft_update_task() via hw_uart_get_stats()
 static inline bool send_uart_packet(const uint8_t* data, size_t len) {
-    if (hw_uart_send(data, len)) {
-        uart_tx_bytes_total += len;
-        return true;
-    }
-    return false;
+    return hw_uart_send(data, len);
 }
 
 // ============================================================================
@@ -263,7 +248,7 @@ extern uint32_t echo_response_count;
 static void process_status_message(const char* msg, size_t len) {
     
     // Check for echo response: "ECHO:TEST..."
-    if (len >= 5 && strncmp(msg, "ECHO:", 5) == 0) {
+    if (len >= ECHO_PREFIX_LEN && strncmp(msg, "ECHO:", ECHO_PREFIX_LEN) == 0) {
         echo_response_count++;
         // Auto-connect on successful echo
         if (kmbox_state != KMBOX_CONNECTED) {
@@ -407,7 +392,7 @@ static void send_kmbox_ping(void) {
         // Send text ping: "P\n" - simple, won't interfere with M/W/B commands
         hw_uart_puts("P\n");
         kmbox_ping_count++;
-        uart_tx_bytes_total += 2;
+        // Don't add to uart_tx_bytes_total - hw_uart tracks internally
     } else {
         // Binary ping for other modes
         uint8_t ping_packet[8] = {0xFE, 0, 0, 0, 0, 0, 0, 0};
@@ -419,7 +404,7 @@ static void send_kmbox_ping(void) {
 // Request device info from KMBox (VID, PID, manufacturer, product)
 static void request_kmbox_info(void) {
     hw_uart_puts("KMBOX_INFO\n");
-    uart_tx_bytes_total += 11;
+    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
 }
 
 // UART Echo test - send test string and look for echo response
@@ -431,14 +416,9 @@ static void send_uart_echo_test(void) {
     char test_msg[32];
     snprintf(test_msg, sizeof(test_msg), "ETEST%lu\n", echo_test_count);
     
-    // Use direct UART write (not DMA) for reliability test
-    for (const char* p = test_msg; *p; p++) {
-        while (!uart_is_writable(uart0)) {
-            tight_loop_contents();
-        }
-        uart_putc_raw(uart0, *p);
-    }
-    uart_tx_bytes_total += strlen(test_msg);
+    // Use hw_uart_puts to avoid conflicting with DMA transfers
+    hw_uart_puts(test_msg);
+    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
     
     if (tud_cdc_connected()) {
         char dbg[64];
@@ -451,7 +431,7 @@ static void send_uart_echo_test(void) {
 static void send_kmbox_handshake(void) {
     // Send bridge sync request - KMBox responds with "KMBOX_READY"
     hw_uart_puts("KMBOX_BRIDGE_SYNC\n");
-    uart_tx_bytes_total += 18;
+    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
 }
 
 static void kmbox_connection_task(void) {
@@ -538,17 +518,20 @@ static void send_text_mouse_move(int16_t dx, int16_t dy) {
     char cmd[24];
     int len = snprintf(cmd, sizeof(cmd), "M%d,%d\n", dx, dy);
     
-    // Flash LED on Bridge side to confirm we're sending
+    // Non-blocking LED pulse using timestamp comparison
+    static uint32_t led_off_time = 0;
     gpio_put(LED_PIN, 1);
+    led_off_time = time_us_32() + 50;  // Schedule LED off
     
     send_uart_packet((const uint8_t*)cmd, len);
-    uart_tx_bytes_total += len;
+    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
     tft_mouse_activity_count++;  // Track mouse commands for TFT display
     injection_count++;  // Track successful injections
     
-    // Brief LED pulse (no blocking debug output in hot path)
-    sleep_us(50);
-    gpio_put(LED_PIN, 0);
+    // Non-blocking LED off (check in next iteration or turn off now if time passed)
+    if (time_us_32() >= led_off_time) {
+        gpio_put(LED_PIN, 0);
+    }
 }
 
 // Send transform command to KMBox: "km.transform(scale_x, scale_y, enabled)\n"
@@ -559,7 +542,7 @@ static void send_transform_command(int16_t scale_x, int16_t scale_y, bool enable
                        scale_x, scale_y, enabled ? 1 : 0);
     
     send_uart_packet((const uint8_t*)cmd, len);
-    uart_tx_bytes_total += len;
+    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
     
     if (tud_cdc_connected()) {
         char dbg[64];
@@ -589,6 +572,10 @@ static void send_mouse_command(int16_t dx, int16_t dy, uint8_t buttons) {
 static inline bool is_fast_cmd_byte(uint8_t b) {
     return (b >= 0x01 && b <= 0x0B && b != 0x0A) || b == 0xFE;
 }
+
+// Partial Makcu frame buffer for incomplete frames (#5)
+static uint8_t makcu_partial_buf[4 + MAKCU_MAX_PAYLOAD];  // Header + max payload
+static uint16_t makcu_partial_len = 0;
 
 // Text command buffer
 static char cmd_buffer[128];
@@ -623,7 +610,7 @@ static void handle_text_command(const char* cmd) {
     // km.transform() - query current transform (forward to KMBox)
     if (strncmp(cmd, "km.transform()", 14) == 0) {
         send_uart_packet((const uint8_t*)"km.transform()\n", 15);
-        uart_tx_bytes_total += 15;
+        // Don't add to uart_tx_bytes_total - hw_uart tracks internally
         return;
     }
     
@@ -740,9 +727,62 @@ static void cdc_task(void) {
     uint8_t buf[512];
     uint32_t count = tud_cdc_read(buf, sizeof(buf));
     
-
-    
     uint32_t i = 0;
+    
+    // Fix #5: Handle partial Makcu frames from previous call
+    if (makcu_partial_len > 0 && current_api_mode == API_MODE_MAKCU) {
+        // Continue building the partial frame
+        if (makcu_partial_len >= 4) {
+            // We have the header, need more payload
+            uint16_t payload_len = makcu_partial_buf[2] | (makcu_partial_buf[3] << 8);
+            uint16_t total_needed = 4 + payload_len;
+            uint16_t still_need = total_needed - makcu_partial_len;
+            
+            if (count >= still_need) {
+                // Complete the frame
+                memcpy(&makcu_partial_buf[makcu_partial_len], buf, still_need);
+                core1_queue_makcu_frame(makcu_partial_buf[1], &makcu_partial_buf[4], payload_len);
+                i = still_need;
+                makcu_partial_len = 0;
+            } else {
+                // Still not enough, buffer what we have
+                memcpy(&makcu_partial_buf[makcu_partial_len], buf, count);
+                makcu_partial_len += count;
+                return;  // Need more data
+            }
+        } else {
+            // Need more header bytes
+            uint16_t header_need = 4 - makcu_partial_len;
+            if (count >= header_need) {
+                memcpy(&makcu_partial_buf[makcu_partial_len], buf, header_need);
+                makcu_partial_len = 4;
+                i = header_need;
+                // Now check if we have the full payload too
+                uint16_t payload_len = makcu_partial_buf[2] | (makcu_partial_buf[3] << 8);
+                if (payload_len > MAKCU_MAX_PAYLOAD) {
+                    // Invalid frame, discard
+                    makcu_partial_len = 0;
+                } else if (count - i >= payload_len) {
+                    // Complete frame available
+                    memcpy(&makcu_partial_buf[4], &buf[i], payload_len);
+                    core1_queue_makcu_frame(makcu_partial_buf[1], &makcu_partial_buf[4], payload_len);
+                    i += payload_len;
+                    makcu_partial_len = 0;
+                } else {
+                    // Buffer partial payload
+                    memcpy(&makcu_partial_buf[4], &buf[i], count - i);
+                    makcu_partial_len = 4 + (count - i);
+                    return;  // Need more data
+                }
+            } else {
+                // Buffer partial header
+                memcpy(&makcu_partial_buf[makcu_partial_len], buf, count);
+                makcu_partial_len += count;
+                return;  // Need more data
+            }
+        }
+    }
+    
     while (i < count) {
         uint8_t b = buf[i];
         
@@ -754,15 +794,32 @@ static void cdc_task(void) {
                 uint8_t cmd = buf[i + 1];
                 uint16_t payload_len = buf[i + 2] | (buf[i + 3] << 8);
                 
+                // Validate payload length
+                if (payload_len > MAKCU_MAX_PAYLOAD) {
+                    i++;  // Skip invalid start byte
+                    continue;
+                }
+                
                 // Check if full frame available
-                if (i + 4 + payload_len <= count && payload_len <= MAKCU_MAX_PAYLOAD) {
+                if (i + 4 + payload_len <= count) {
                     // Queue complete frame to Core1 (just payload, Core1 knows the format)
                     core1_queue_makcu_frame(cmd, &buf[i + 4], payload_len);
                     i += 4 + payload_len;
                     continue;
+                } else {
+                    // Fix #5: Buffer incomplete frame instead of dropping remaining bytes
+                    uint16_t remaining = count - i;
+                    memcpy(makcu_partial_buf, &buf[i], remaining);
+                    makcu_partial_len = remaining;
+                    return;  // Process rest on next call
                 }
+            } else {
+                // Incomplete header - buffer it
+                uint16_t remaining = count - i;
+                memcpy(makcu_partial_buf, &buf[i], remaining);
+                makcu_partial_len = remaining;
+                return;  // Process rest on next call
             }
-            break;  // Incomplete frame, wait for more data
         }
         
         // Ferrum text protocol - line-based
@@ -789,7 +846,7 @@ static void cdc_task(void) {
                         
                         // Send translated bridge protocol packets
                         send_uart_packet(result.buffer, result.length);
-                        uart_tx_bytes_total += result.length;
+                        // Don't add to uart_tx_bytes_total - hw_uart tracks internally
                         
                         if (result.needs_response && tud_cdc_connected()) {
                             tud_cdc_write_str(FERRUM_RESPONSE);
@@ -818,7 +875,7 @@ static void cdc_task(void) {
         
         // KMBox native mode - fast binary commands
         if (current_api_mode == API_MODE_KMBOX && is_fast_cmd_byte(b) && rx_state == RX_STATE_IDLE) {
-            if (i + 8 <= count) {
+            if (i + KMBOX_PACKET_SIZE <= count) {
                 // Convert 8-byte KMBox command to bridge protocol
                 uint8_t bridge_packet[7];
                 size_t bridge_len = 0;
@@ -832,7 +889,7 @@ static void cdc_task(void) {
                     // Send simple text command
                     send_text_mouse_move(x, y);
                 }
-                i += 8;
+                i += KMBOX_PACKET_SIZE;
                 continue;
             } else {
                 break;  // Incomplete packet
@@ -972,6 +1029,9 @@ static void update_status_neopixel(void) {
 // ============================================================================
 
 static void tft_update_task(void) {
+    // Sync UART stats from hw_uart module (single source of truth for byte counts)
+    sync_uart_stats();
+    
     // Calculate UART rates (once per second)
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     uint32_t rate_delta_ms = now_ms - last_rate_calc_time_ms;
@@ -1078,6 +1138,7 @@ int main(void) {
         tud_task();
         cdc_task();
         uart_rx_task();
+        
         kmbox_connection_task();
         button_task();
         

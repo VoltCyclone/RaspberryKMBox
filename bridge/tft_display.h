@@ -20,33 +20,20 @@
 // ============================================================================
 // Pin Configuration for Adafruit Feather RP2350
 // ============================================================================
-// Using SPI1 pins on the RIGHT side of the Feather header
-// All pins accessible from main headers (no HSTX connector needed)
-//
-// Wiring (TFT -> Feather silkscreen label):
-//   VCC  -> 3V
-//   GND  -> GND  
-//   CS   -> D9   (GPIO9)
-//   DC   -> D6   (GPIO6)
-//   RST  -> D5   (GPIO5) - or tie to 3V for always-on
-//   MOSI -> D11  (GPIO11, SPI1 TX)
-//   SCK  -> D10  (GPIO10, SPI1 SCK)
-//   LED  -> D13  (GPIO7) - or tie to 3V for always-on backlight
 
-#define TFT_SPI_PORT    spi1
-#define TFT_PIN_CS      9    // D9
-#define TFT_PIN_DC      6    // D6
-#define TFT_PIN_RST     5    // D5
-#define TFT_PIN_MOSI    11   // D11
-#define TFT_PIN_SCK     10   // D10
-#define TFT_PIN_BL      7    // D13
+#define TFT_SPI_PORT    spi0
+#define TFT_PIN_SCK     PICO_DEFAULT_SPI_SCK_PIN   // SPI0 SCK
+#define TFT_PIN_MOSI    PICO_DEFAULT_SPI_TX_PIN   // SPI0 TX (MOSI)
+#define TFT_PIN_CS      9    // Directly driven GPIO
+#define TFT_PIN_DC      10   // Data/Command
+#define TFT_PIN_RST     6    // Reset
+#define TFT_PIN_BL      7    // Backlight PWM
 
-// SPI clock speed (40 MHz for fast updates)
-#define TFT_SPI_FREQ    40000000
+// SPI clock speed (further lowered for signal integrity on flying leads)
+#define TFT_SPI_FREQ    4000000
 
-// Display dimensions (ST7735 1.8")
-#define TFT_WIDTH       128
-#define TFT_HEIGHT      160
+// Note: Display dimensions (TFT_WIDTH, TFT_HEIGHT) are defined by pico-tft library
+// ST7735 1.8" is 128x160
 
 // ============================================================================
 // Color Definitions (RGB565 format)

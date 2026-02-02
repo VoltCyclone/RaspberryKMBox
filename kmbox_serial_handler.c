@@ -72,8 +72,6 @@ static uint32_t fast_ring_overflows = 0;
 //--------------------------------------------------------------------+
 // Async/Non-blocking State for Timed Operations
 //--------------------------------------------------------------------+
-// Async/Non-blocking State for Timed Operations
-//--------------------------------------------------------------------+
 // These replace blocking sleep calls to avoid stalling USB tasks
 
 typedef struct {
@@ -174,8 +172,8 @@ static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
         case BRIDGE_CMD_MOUSE_MOVE_WHEEL: {
             // Move+Wheel: [SYNC][CMD][x_lo][x_hi][y_lo][y_hi][wheel] = 7 bytes
             if (available < 7) return 0;
-            int16_t x = *((int16_t*)(data + 2));
-            int16_t y = *((int16_t*)(data + 4));
+            int16_t x = read_i16_le(data + 2);  // Safe aligned access
+            int16_t y = read_i16_le(data + 4);  // Safe aligned access
             int8_t wheel = (int8_t)data[6];
             // Add to accumulator - physical mouse callback will send combined result
             kmbox_add_mouse_movement(x, y);
@@ -496,8 +494,9 @@ static inline bool fast_ring_enqueue(const uint8_t *packet) {
         return false;
     }
     
-    // Copy 8 bytes using 64-bit copy if possible
-    fast_ring[fast_ring_head].raw.qword = *(const uint64_t *)packet;
+    // Copy 8 bytes atomically - memcpy is optimized by compiler and avoids
+    // non-atomic 64-bit access on 32-bit ARM (which uses two 32-bit loads)
+    memcpy(&fast_ring[fast_ring_head], packet, 8);
     fast_ring_head = next_head;
     
     return true;
@@ -610,6 +609,7 @@ static void __not_in_flash_func(on_uart_rx)(void) {
         // Store character if buffer not full
         if (next_head != uart_rx_tail) {
             uart_rx_buffer[uart_rx_head] = ch;
+            __dmb();  // Memory barrier: ensure write completes before index update
             uart_rx_head = next_head;
         }
         // If buffer full, oldest data is discarded
@@ -1451,6 +1451,7 @@ void kmbox_serial_task(void)
     // Only process partial data if we're connected (protocol commands must be complete lines)
     // IMPORTANT: Don't consume text command data that's waiting for a newline terminator!
     // Check if first byte looks like a text command start (M, W, B, P, K, etc.)
+    bool skip_fallback_processing = false;
     {
         uint16_t fb_head = uart_rx_head;
         uint16_t fb_tail = uart_rx_tail;
@@ -1462,11 +1463,11 @@ void kmbox_serial_task(void)
                 first == 'K' || first == 'm' || first == 'k' ||
                 first >= 0x20) {  // Any printable ASCII - likely text command
                 // Skip the fallback - let text accumulate until we get a newline
-                goto skip_fallback;
+                skip_fallback_processing = true;
             }
         }
     }
-    if (kmbox_is_connected()) {
+    if (kmbox_is_connected() && !skip_fallback_processing) {
         uint8_t tmp[128];
         size_t n;
         while ((n = ringbuf_read_chunk(tmp, sizeof(tmp))) > 0) {
@@ -1504,7 +1505,6 @@ void kmbox_serial_task(void)
         }
     }
     
-skip_fallback:
     // Update button states (handles timing for releases)
     kmbox_update_states(current_time_ms);
 }

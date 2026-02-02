@@ -21,8 +21,8 @@
 //   GPIO0 = UART0 RX (directly connected to KMBox TX wire)  
 // Physical wiring: Bridge TX (GPIO1) → wire → KMBox RX (GPIO1)
 //                  Bridge RX (GPIO0) ← wire ← KMBox TX (GPIO0)
-#define UART_TX_PIN          1        // GPIO1 = UART0 TX on Feather RP2350
-#define UART_RX_PIN          0        // GPIO0 = UART0 RX on Feather RP2350
+#define UART_TX_PIN          PICO_DEFAULT_UART_TX_PIN        // GPIO1 = UART0 TX on Feather RP2350
+#define UART_RX_PIN          PICO_DEFAULT_UART_RX_PIN        // GPIO0 = UART0 RX on Feather RP2350
 #define UART_BAUD            2000000  // Baud rate for RP2350<->RP2040 communication (2 Mbps)
 #define LED_PIN              PICO_DEFAULT_LED_PIN
 #define WS2812_PIN           PICO_DEFAULT_WS2812_PIN
