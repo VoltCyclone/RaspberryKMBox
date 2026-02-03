@@ -51,6 +51,7 @@ target_link_libraries(kmbox_bridge
     hardware_uart
     hardware_spi
     hardware_pwm
+    hardware_adc
     pico_multicore
     kmbox_commands
 )

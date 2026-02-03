@@ -205,7 +205,6 @@ Fallbacks: If no device is attached or descriptors aren’t available, defaults 
 
 ## Using KMBox serial
 
-- Port: UART1 (GPIO 5/6), 115200 8N1 (or UART0 via RP2350 USB bridge @ 115200)
 - Capabilities: movement injection, button press/release, timed clicks, wheel, axis locks, monitor mode
 
 ### Basic Commands

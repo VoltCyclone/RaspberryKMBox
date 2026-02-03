@@ -1,10 +1,7 @@
 /**
- * TFT Configuration for pico-tft library
+ * TFT Configuration for KMBox Bridge
  * 
- * This file configures the pico-tft library for use with the KMBox Bridge
- * using the ST7735 1.8" display on the Adafruit Feather RP2350.
- * 
- * Pin assignments use PICO_DEFAULT_SPI_* definitions where possible.
+ * ST7735 1.8" 128x160 display on SPI0
  */
 
 #ifndef TFT_CONFIG_H
@@ -13,45 +10,44 @@
 #include "pico/stdlib.h"
 
 // ============================================================================
-// Driver Selection
+// Driver
 // ============================================================================
-#define TFT_DRIVER TFT_DRIVER_ST7735  // ST7735 1.8" display
+
+#define TFT_DRIVER      TFT_DRIVER_ST7735
 
 // ============================================================================
-// Display Scaling and Orientation
+// Display Settings
 // ============================================================================
-#define TFT_SCALE 1        // No scaling (1:1 pixel mapping)
-#define TFT_SWAP_XY 0      // No axis swap
-#define TFT_FLIP_X 0       // No horizontal flip
-#define TFT_FLIP_Y 0       // No vertical flip
-#define TFT_VSYNC 0        // Disable vsync
+
+#define TFT_SCALE       1       // 1:1 pixel mapping
+#define TFT_SWAP_XY     0       // No axis swap
+#define TFT_FLIP_X      0       // No horizontal flip
+#define TFT_FLIP_Y      0       // No vertical flip
+#define TFT_VSYNC       0       // No vsync
+#define TFT_HW_ACCEL    0       // Software rendering (simpler, reliable)
 
 // ============================================================================
-// Hardware Acceleration
+// SPI Configuration
 // ============================================================================
-#define TFT_HW_ACCEL 0     // Disable PIO hardware acceleration (simpler, more reliable)
-#define TFT_PIO pio0       // PIO instance (not used if HW_ACCEL is 0)
+
+#define TFT_SPI_DEV     spi0
+#define TFT_BAUDRATE    8000000                     // 8 MHz (increase if stable)
+#define TFT_SCK_PIN     PICO_DEFAULT_SPI_SCK_PIN    // SPI0 SCK
+#define TFT_MOSI_PIN    PICO_DEFAULT_SPI_TX_PIN     // SPI0 TX
 
 // ============================================================================
-// SPI Configuration using Pico SDK defaults
+// Control Pins
 // ============================================================================
-#define TFT_SPI_DEV      spi0
-#define TFT_BAUDRATE     4000000  // 4 MHz for signal integrity on flying leads
 
-// Pin definitions using PICO_DEFAULT_SPI_* where possible
-#define TFT_SCK_PIN      PICO_DEFAULT_SPI_SCK_PIN   // SPI0 SCK
-#define TFT_MOSI_PIN     PICO_DEFAULT_SPI_TX_PIN    // SPI0 TX (MOSI)
-// No MISO needed for write-only display
-
-// Control pins (directly driven GPIOs)
-#define TFT_CS_PIN       9    // Chip Select
-#define TFT_RS_PIN       10   // Register Select (Data/Command)
-#define TFT_RST_PIN      6    // Reset
-#define TFT_BL_PIN       7    // Backlight (PWM capable)
+#define TFT_CS_PIN      9       // Chip Select
+#define TFT_RS_PIN      10      // Data/Command
+#define TFT_RST_PIN     6       // Reset
+#define TFT_BL_PIN      7       // Backlight (PWM)
 
 // ============================================================================
-// Timing Configuration
+// Timing
 // ============================================================================
-#define TFT_RST_DELAY    50   // Reset delay in milliseconds
+
+#define TFT_RST_DELAY   50      // Reset delay (ms)
 
 #endif // TFT_CONFIG_H

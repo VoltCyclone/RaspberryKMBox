@@ -1,5 +1,4 @@
 /**
- * Ferrum KM API Translator Implementation (Mouse-Only)
  * Translates Ferrum text protocol to efficient binary bridge protocol
  */
 

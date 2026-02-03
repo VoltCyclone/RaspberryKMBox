@@ -8,11 +8,12 @@
  *   ./mouse_counteract /dev/tty.usbmodem*
  * 
  * Options:
- *   -b, --baud RATE    Serial baud rate (default: 921600)
+ *   -b, --baud RATE    Serial baud rate (default: 2000000)
  *   -g, --gain FLOAT   Counteraction gain 0.0-2.0 (default: 1.0)
  *   -d, --deadzone PX  Ignore movements below this threshold (default: 0)
  *   -v, --verbose      Enable verbose logging
  *   -p, --paused       Start in paused mode
+ *   -t, --test MODE    Run test mode: rapid, precise, flicks, sweep, mixed, all
  *   -h, --help         Show this help
  * 
  * Keyboard Controls:
@@ -75,6 +76,7 @@ typedef struct {
     bool verbose;
     volatile bool running;
     volatile bool active;
+    char test_mode[32];  // Test mode name if -t specified
 } config_t;
 
 typedef struct {
@@ -91,12 +93,13 @@ typedef struct {
 } stats_t;
 
 static config_t g_config = {
-    .baudrate = 921600,
+    .baudrate = 2000000,
     .gain = 1.0f,
     .deadzone = 0,
     .verbose = false,
     .running = true,
-    .active = true
+    .active = true,
+    .test_mode = ""
 };
 
 // Direct mouse movement settings
@@ -827,7 +830,7 @@ void print_usage(const char* prog) {
     printf("Mouse Movement Counteraction Tool (macOS)\n\n");
     printf("Usage: %s [OPTIONS] <serial_port>\n\n", prog);
     printf("Options:\n");
-    printf("  -b, --baud RATE      Serial baud rate (default: 921600)\n");
+    printf("  -b, --baud RATE      Serial baud rate (default: 2000000)\n");
     printf("  -g, --gain FLOAT     Counteraction gain 0.0-2.0 (default: 1.0)\n");
     printf("  -d, --deadzone PX    Ignore movements below threshold (default: 0)\n");
     printf("  -v, --verbose        Enable verbose logging\n");
@@ -849,7 +852,16 @@ void print_usage(const char* prog) {
     printf("  IJKL     Alternative (vim-style)\n\n");
     printf("Examples:\n");
     printf("  %s /dev/tty.usbmodem1234\n", prog);
-    printf("  %s -g 1.2 -d 2 -v /dev/tty.usbserial-1234\n\n", prog);
+    printf("  %s -g 1.2 -d 2 -v /dev/tty.usbserial-1234\n", prog);
+    printf("  %s -t rapid /dev/tty.usbmodem1234    # Run rapid test\n", prog);
+    printf("  %s -t all /dev/tty.usbmodem1234      # Run all tests\n\n", prog);
+    printf("Test Modes:\n");
+    printf("  rapid    10,000 rapid ±10px movements (most common KMBox pattern)\n");
+    printf("  precise  Small 1-5px movements (humanization visibility test)\n");
+    printf("  flicks   Large 100-300px flicks (minimal jitter test)\n");
+    printf("  sweep    Smooth horizontal tracking\n");
+    printf("  mixed    Real-world combined pattern\n");
+    printf("  all      Run all tests sequentially\n\n");
     printf("Note: Requires Accessibility permissions in System Preferences.\n");
 }
 
@@ -862,6 +874,12 @@ bool parse_args(int argc, char** argv) {
             g_config.verbose = true;
         } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--paused") == 0) {
             g_config.active = false;
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: Missing test mode\n");
+                return false;
+            }
+            strncpy(g_config.test_mode, argv[i], sizeof(g_config.test_mode) - 1);
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--baud") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Error: Missing baud rate\n");
@@ -899,6 +917,216 @@ bool parse_args(int argc, char** argv) {
 }
 
 // ============================================================================
+// Test Functions - Based on Real KMBox Patterns
+// ============================================================================
+
+void send_move_blocking(int dx, int dy) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "km.move(%d, %d)\n", dx, dy);
+    write(g_serial_fd, buf, len);
+    usleep(500);  // Small delay to avoid overwhelming
+}
+
+void test_rapid_small_movements() {
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST 1: Rapid Small Movements                              ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Pattern: 10,000 iterations of ±10px back-and-forth         ║\n");
+    printf("║  Purpose: Most common real KMBox usage pattern              ║\n");
+    printf("║  Expect:  Light jitter on small movements (GOOD)            ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    time_t start = time(NULL);
+    int64_t start_packets = g_stats.packets_sent;
+    
+    for (int i = 0; i < 10000; i++) {
+        send_move_blocking(0, 10);
+        send_move_blocking(0, -10);
+        
+        if (i % 1000 == 0) {
+            printf("  Progress: %d/10000 iterations\n", i);
+        }
+    }
+    
+    time_t elapsed = time(NULL) - start;
+    int64_t packets = g_stats.packets_sent - start_packets;
+    
+    printf("\n  ✅ Complete!\n");
+    printf("  Time:     %ld seconds\n", elapsed);
+    printf("  Rate:     %.0f commands/sec\n", 20000.0 / elapsed);
+    printf("  Packets:  %lld\n", packets);
+    printf("  Result:   %s\n\n", (20000.0 / elapsed > 500) ? "✅ PASS" : "❌ SLOW");
+}
+
+void test_small_precise_movements() {
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST 2: Small Precise Movements                            ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Pattern: 1-5px movements in all directions                 ║\n");
+    printf("║  Purpose: Humanization visibility test                      ║\n");
+    printf("║  Expect:  Slight jitter = GOOD, No jitter = robotic         ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    int movements[][2] = {
+        {1,0}, {0,1}, {-1,0}, {0,-1},
+        {2,0}, {0,2}, {-2,0}, {0,-2},
+        {3,3}, {-3,3}, {-3,-3}, {3,-3},
+        {5,0}, {0,5}, {-5,0}, {0,-5}
+    };
+    int num_movements = sizeof(movements) / sizeof(movements[0]);
+    
+    printf("  Watch cursor closely - should see LIGHT jitter\n");
+    usleep(2000000);  // 2 second delay
+    
+    for (int repeat = 0; repeat < 20; repeat++) {
+        for (int i = 0; i < num_movements; i++) {
+            send_move_blocking(movements[i][0], movements[i][1]);
+            usleep(10000);  // 10ms between movements
+        }
+    }
+    
+    printf("\n  ✅ Complete!\n");
+    printf("  Result:   Watch for light jitter (humanized)\n\n");
+}
+
+void test_large_fast_flicks() {
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST 3: Large Fast Flicks                                  ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Pattern: 100-300px rapid movements                         ║\n");
+    printf("║  Purpose: Verify minimal jitter on large movements          ║\n");
+    printf("║  Expect:  SNAPPY, smooth, fast                              ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    int flicks[][2] = {
+        {200, 0}, {-200, 0}, {0, 150}, {0, -150},
+        {150, 150}, {-150, -150}, {100, -100}, {-100, 100},
+        {300, 0}, {0, 300}, {-300, 0}, {0, -300}
+    };
+    int num_flicks = sizeof(flicks) / sizeof(flicks[0]);
+    
+    printf("  Watch cursor - should feel SNAPPY with minimal jitter\n");
+    usleep(2000000);  // 2 second delay
+    
+    for (int repeat = 0; repeat < 10; repeat++) {
+        for (int i = 0; i < num_flicks; i++) {
+            send_move_blocking(flicks[i][0], flicks[i][1]);
+            usleep(50000);  // 50ms between flicks
+        }
+    }
+    
+    printf("\n  ✅ Complete!\n");
+    printf("  Result:   Should feel snappy and responsive\n\n");
+}
+
+void test_horizontal_sweep() {
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST 4: Horizontal Sweep                                   ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Pattern: Smooth left-to-right tracking                     ║\n");
+    printf("║  Purpose: Verify smooth continuous movement                 ║\n");
+    printf("║  Expect:  Smooth line with light texture                    ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    printf("  Sweeping right...\n");
+    for (int i = 0; i < 100; i++) {
+        send_move_blocking(10, 0);
+        usleep(10000);  // 10ms = smooth 100Hz
+    }
+    
+    usleep(500000);  // 500ms pause
+    
+    printf("  Sweeping left...\n");
+    for (int i = 0; i < 100; i++) {
+        send_move_blocking(-10, 0);
+        usleep(10000);
+    }
+    
+    printf("\n  ✅ Complete!\n");
+    printf("  Result:   Should see smooth line with natural texture\n\n");
+}
+
+void test_mixed_pattern() {
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST 5: Mixed Real-World Pattern                           ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Pattern: Combination of all movement types                 ║\n");
+    printf("║  Purpose: Simulate actual usage                             ║\n");
+    printf("║  Expect:  Natural, responsive feel                          ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    // Simulate aiming: small adjustments + occasional flicks
+    for (int cycle = 0; cycle < 5; cycle++) {
+        printf("  Cycle %d/5: Small adjustments\n", cycle + 1);
+        
+        // Small tracking movements
+        for (int i = 0; i < 50; i++) {
+            send_move_blocking(2, 1);
+            usleep(20000);  // 20ms = 50Hz
+        }
+        
+        // Quick flick
+        send_move_blocking(-100, -50);
+        usleep(100000);  // 100ms pause
+        
+        // More small adjustments
+        for (int i = 0; i < 30; i++) {
+            send_move_blocking(-1, 2);
+            usleep(15000);  // 15ms
+        }
+        
+        // Another flick
+        send_move_blocking(80, 40);
+        usleep(200000);  // 200ms pause
+    }
+    
+    printf("\n  ✅ Complete!\n");
+    printf("  Result:   Should feel natural and responsive\n\n");
+}
+
+void run_test_mode() {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  KMBOX STRESS TEST MODE                                     ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║  Mode:   %-50s ║\n", g_config.test_mode);
+    printf("║  Port:   %-50s ║\n", g_config.port);
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    
+    // Give device time to settle
+    sleep(1);
+    
+    if (strcmp(g_config.test_mode, "rapid") == 0) {
+        test_rapid_small_movements();
+    } else if (strcmp(g_config.test_mode, "precise") == 0) {
+        test_small_precise_movements();
+    } else if (strcmp(g_config.test_mode, "flicks") == 0) {
+        test_large_fast_flicks();
+    } else if (strcmp(g_config.test_mode, "sweep") == 0) {
+        test_horizontal_sweep();
+    } else if (strcmp(g_config.test_mode, "mixed") == 0) {
+        test_mixed_pattern();
+    } else if (strcmp(g_config.test_mode, "all") == 0) {
+        test_rapid_small_movements();
+        sleep(2);
+        test_small_precise_movements();
+        sleep(2);
+        test_large_fast_flicks();
+        sleep(2);
+        test_horizontal_sweep();
+        sleep(2);
+        test_mixed_pattern();
+    } else {
+        fprintf(stderr, "Unknown test mode: %s\n", g_config.test_mode);
+        fprintf(stderr, "Valid modes: rapid, precise, flicks, sweep, mixed, all\n");
+    }
+    
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST COMPLETE                                               ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -918,6 +1146,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("Serial port opened.\n");
+    
+    g_stats.start_time = time(NULL);
+    g_stats.last_response_time = time(NULL);
+    
+    // Check if test mode
+    if (g_config.test_mode[0] != '\0') {
+        run_test_mode();
+        close(g_serial_fd);
+        return 0;
+    }
     
     // Setup event tap
     printf("Setting up mouse event capture...\n");

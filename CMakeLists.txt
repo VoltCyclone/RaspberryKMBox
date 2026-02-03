@@ -57,7 +57,7 @@ pico_set_program_version(PIOKMbox "0.1")
 # UART0 is used for KMBox serial input via RP2350 USB Bridge
 # USB CDC is disabled to avoid breaking HID enumeration
 # Debug output can be sent through the KMBox interface if needed
-pico_enable_stdio_uart(PIOKMbox 0)
+pico_enable_stdio_uart(PIOKMbox 1)
 pico_enable_stdio_usb(PIOKMbox 0)
 
 # Add the standard library to the build
@@ -72,6 +72,7 @@ target_link_libraries(PIOKMbox
         hardware_uart
         hardware_spi
         hardware_irq
+        hardware_adc
         pico_unique_id
         pico_multicore
         m)

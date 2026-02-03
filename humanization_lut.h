@@ -134,6 +134,43 @@ extern const int32_t g_accel_curve_lut[ACCEL_LUT_SIZE];
 extern const int32_t g_subpixel_dither_lut[SUBPIXEL_DITHER_SIZE];
 
 //--------------------------------------------------------------------+
+// Movement-Type Jitter Scale LUT
+//
+// Human hands have different tremor characteristics based on movement type:
+// - Small adjustments (0-20px): High tremor (stationary hand, precise)
+// - Medium moves (20-100px): Moderate tremor (controlled movement)
+// - Large flicks (100-200px): Low tremor (intentional, tremor suppressed)
+// - Very large (200+px): Minimal tremor (fast, ballistic movement)
+//
+// Index = movement_magnitude / 10 (clamped to 0-31)
+// Output: jitter scale multiplier in 16.16 fixed-point
+//--------------------------------------------------------------------+
+
+#define JITTER_SCALE_LUT_SIZE   32
+
+// Jitter scale by movement size (decreases with larger movements)
+// Range: 1.5x (small) to 0.1x (large)
+extern const int32_t g_jitter_scale_by_movement_lut[JITTER_SCALE_LUT_SIZE];
+
+//--------------------------------------------------------------------+
+// Movement-Type Frame Spread LUT
+//
+// Different movement types need different timing:
+// - Small: Spread over more frames (careful, slow)
+// - Medium: Balanced spread
+// - Large: Faster spread (ballistic, quick)
+//
+// Index = movement_magnitude / 10 (clamped to 0-31)
+// Output: frame multiplier in 16.16 fixed-point
+//--------------------------------------------------------------------+
+
+#define FRAME_SPREAD_LUT_SIZE   32
+
+// Frame spread multiplier by movement size
+// Range: 1.3x (small, spread out) to 0.7x (large, compress)
+extern const int32_t g_frame_spread_by_movement_lut[FRAME_SPREAD_LUT_SIZE];
+
+//--------------------------------------------------------------------+
 // Fast Lookup Functions (inline for zero overhead)
 //--------------------------------------------------------------------+
 
@@ -223,6 +260,34 @@ static inline void lut_get_jitter(uint32_t frame_counter, int32_t jitter_scale,
     
     *out_x = (int32_t)(jx >> SMOOTH_FP_SHIFT);
     *out_y = (int32_t)(jy >> SMOOTH_FP_SHIFT);
+}
+
+/**
+ * Get jitter scale based on movement magnitude
+ * Small movements = more jitter (1.5x), large = less jitter (0.1x)
+ * 
+ * @param movement_magnitude Movement size in pixels
+ * @return Jitter scale multiplier in 16.16 fixed-point
+ */
+static inline int32_t lut_get_jitter_scale_for_movement(int32_t movement_magnitude) {
+    // Convert magnitude to LUT index (0-31)
+    uint32_t idx = (uint32_t)movement_magnitude / 10;
+    if (idx >= JITTER_SCALE_LUT_SIZE) idx = JITTER_SCALE_LUT_SIZE - 1;
+    return g_jitter_scale_by_movement_lut[idx];
+}
+
+/**
+ * Get frame spread multiplier based on movement magnitude
+ * Small movements = slower (1.3x frames), large = faster (0.7x frames)
+ * 
+ * @param movement_magnitude Movement size in pixels
+ * @return Frame multiplier in 16.16 fixed-point
+ */
+static inline int32_t lut_get_frame_spread_for_movement(int32_t movement_magnitude) {
+    // Convert magnitude to LUT index (0-31)
+    uint32_t idx = (uint32_t)movement_magnitude / 10;
+    if (idx >= FRAME_SPREAD_LUT_SIZE) idx = FRAME_SPREAD_LUT_SIZE - 1;
+    return g_frame_spread_by_movement_lut[idx];
 }
 
 /**

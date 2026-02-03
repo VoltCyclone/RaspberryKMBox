@@ -1,147 +1,205 @@
 /**
- * TFT Display Wrapper for KMBox Bridge
+ * TFT Display Implementation for KMBox Bridge
  * 
- * Adapts the pico-tft library to provide the tft_display.h API expected
- * by the bridge application. Uses ST7735 1.8" display on SPI with DMA.
+ * Uses pico-tft library with ST7735 128x160 display.
+ * Compact status display with 10 FPS update rate.
  */
 
-#include "tft.h"  // pico-tft library
 #include "tft_display.h"
+#include "tft.h"
+#include "tft_config.h"
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 #include <stdio.h>
 #include <string.h>
 
-// Declare the renamed pico-tft init function
 extern void picotft_init(void);
 
 // ============================================================================
-// Internal State
+// Layout (128x160 display, 8x16 font)
 // ============================================================================
+
+#define UPDATE_INTERVAL_MS  100
+#define FONT_W              8
+#define FONT_H              16
+#define LINE_H              14      // Tight but no overlap
+#define MARGIN              2
+#define SEP_GAP             2
+
+// RGB332 palette colors
+#define COL_BG              0x00
+#define COL_WHITE           0xFF
+#define COL_GREEN           0x1C
+#define COL_YELLOW          0xFC
+#define COL_RED             0xE0
+#define COL_CYAN            0x1F
+#define COL_GRAY            0x92
+#define COL_DARK            0x49
+
+// ============================================================================
+// State
+// ============================================================================
+
 static bool initialized = false;
-static tft_stats_t last_stats = {0};
-static uint32_t last_update_time = 0;
-#define UPDATE_INTERVAL_MS 100  // 10 FPS
-
-// Color definitions mapped to 8-bit palette indices
-// We'll use the default palette and map our colors
-#define COLOR_BG        0x00  // Black background
-#define COLOR_TEXT      0xFF  // White text
-#define COLOR_OK        0x1C  // Green
-#define COLOR_WARN      0xE0  // Yellow  
-#define COLOR_ERROR     0xE0  // Red
-#define COLOR_INACTIVE  0x92  // Gray
-
-// Layout constants for 128x160 display
-#define LINE_HEIGHT     16
-#define MARGIN_X        2
-#define MARGIN_Y        2
-
-// Simple 5x7 font bitmap (we'll use the one from pico-tft's font.c)
-extern uint8_t tft_font[256 * 16];
+static uint32_t last_update_ms = 0;
+static uint32_t last_tx_bytes = 0;
+static uint32_t last_rx_bytes = 0;
 
 // ============================================================================
-// Helper Functions
+// Drawing Helpers
 // ============================================================================
 
-static void draw_status_bar(const tft_stats_t *stats) {
-    int y = MARGIN_Y;
-    
-    // Title
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, "KMBox Bridge");
-    y += LINE_HEIGHT;
-    
-    // Connection status
-    char line[32];
-    uint8_t conn_color = (stats->kmbox_connected && stats->cdc_connected) ? 
-                         COLOR_OK : COLOR_ERROR;
-    snprintf(line, sizeof(line), "CDC:%c KM:%c", 
-             stats->cdc_connected ? 'Y' : 'N',
-             stats->kmbox_connected ? 'Y' : 'N');
-    tft_draw_string(MARGIN_X, y, conn_color, line);
-    y += LINE_HEIGHT;
-    
-    // API mode
-    const char *mode_str;
-    switch(stats->api_mode) {
-        case 0: mode_str = "KMBox"; break;
-        case 1: mode_str = "Makcu"; break;
-        case 2: mode_str = "Ferrum"; break;
-        default: mode_str = "???"; break;
+static void hline(int y, uint8_t color) {
+    if (y >= 0 && y < TFT_HEIGHT) {
+        memset(&tft_input[y * TFT_WIDTH + MARGIN], color, TFT_WIDTH - MARGIN * 2);
     }
-    snprintf(line, sizeof(line), "Mode: %s", mode_str);
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
-    y += LINE_HEIGHT;
+}
+
+static void box(int x, int y, int w, int h, uint8_t color) {
+    for (int row = y; row < y + h && row < TFT_HEIGHT; row++) {
+        if (row < 0) continue;
+        int x0 = (x < 0) ? 0 : x;
+        int x1 = (x + w > TFT_WIDTH) ? TFT_WIDTH : x + w;
+        if (x1 > x0) memset(&tft_input[row * TFT_WIDTH + x0], color, x1 - x0);
+    }
+}
+
+static uint8_t temp_color(float t) {
+    if (t > 70.0f) return COL_RED;
+    if (t > 55.0f) return COL_YELLOW;
+    if (t < 10.0f) return COL_CYAN;
+    return COL_WHITE;
+}
+
+static uint8_t hmode_color(uint8_t m) {
+    switch (m) {
+        case 0: return COL_DARK;
+        case 1: return COL_YELLOW;
+        case 2: return COL_GREEN;
+        case 3: return COL_CYAN;
+        default: return COL_RED;
+    }
+}
+
+#define TEMP_VALID(t) ((t) > -50.0f && (t) < 150.0f)
+
+// ============================================================================
+// Screen Layout
+// ============================================================================
+
+static void draw_stats(const tft_stats_t *stats) {
+    char buf[24];
+    int y = MARGIN;
     
-    // UART baud rate
-    snprintf(line, sizeof(line), "UART: %luK", stats->uart_baud / 1000);
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
-    y += LINE_HEIGHT;
+    // === HEADER ===
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "KMBox Bridge");
+    y += LINE_H + SEP_GAP;
+    hline(y, COL_DARK);
+    y += SEP_GAP + 2;
     
-    // Data rates
-    snprintf(line, sizeof(line), "TX: %lu B/s", stats->tx_rate_bps);
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
-    y += LINE_HEIGHT;
+    // === ROW 1: CDC / KM / Humanization ===
+    uint8_t cdc_col = stats->cdc_connected ? COL_GREEN : COL_RED;
+    uint8_t km_col = stats->kmbox_connected ? COL_GREEN : COL_RED;
     
-    snprintf(line, sizeof(line), "RX: %lu B/s", stats->rx_rate_bps);
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
-    y += LINE_HEIGHT;
+    tft_draw_string(MARGIN, y, COL_GRAY, "CDC:");
+    tft_draw_string(MARGIN + 32, y, cdc_col, stats->cdc_connected ? "Y" : "N");
+    tft_draw_string(MARGIN + 48, y, COL_GRAY, "KM:");
+    tft_draw_string(MARGIN + 72, y, km_col, stats->kmbox_connected ? "Y" : "N");
     
-    // Mouse activity
-    snprintf(line, sizeof(line), "Mouse: %lu", stats->mouse_moves);
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
-    y += LINE_HEIGHT;
+    if (stats->humanization_valid) {
+        snprintf(buf, sizeof(buf), "H%d", stats->humanization_mode);
+        tft_draw_string(TFT_WIDTH - MARGIN - 16, y, hmode_color(stats->humanization_mode), buf);
+    }
+    y += LINE_H;
     
-    // Device info (if available)
+    // === ROW 2: Baud + Uptime ===
+    snprintf(buf, sizeof(buf), "%luK", stats->uart_baud / 1000);
+    tft_draw_string(MARGIN, y, COL_DARK, buf);
+    
+    uint32_t mins = stats->uptime_sec / 60;
+    uint32_t secs = stats->uptime_sec % 60;
+    snprintf(buf, sizeof(buf), "%lum%02lus", mins, secs);
+    tft_draw_string(TFT_WIDTH - MARGIN - strlen(buf) * FONT_W, y, COL_DARK, buf);
+    y += LINE_H;
+    
+    // === ROW 3: TX ===
+    bool tx_active = (stats->tx_bytes != last_tx_bytes);
+    tft_draw_string(MARGIN, y, COL_GRAY, "TX");
+    snprintf(buf, sizeof(buf), "%lu", stats->tx_rate_bps);
+    tft_draw_string(MARGIN + 24, y, tx_active ? COL_CYAN : COL_WHITE, buf);
+    if (tx_active) tft_draw_string(TFT_WIDTH - MARGIN - 8, y, COL_GREEN, "^");
+    y += LINE_H;
+    
+    // === ROW 4: RX ===
+    bool rx_active = (stats->rx_bytes != last_rx_bytes);
+    tft_draw_string(MARGIN, y, COL_GRAY, "RX");
+    snprintf(buf, sizeof(buf), "%lu", stats->rx_rate_bps);
+    tft_draw_string(MARGIN + 24, y, rx_active ? COL_CYAN : COL_WHITE, buf);
+    if (stats->rx_buffer_level > 0) {
+        snprintf(buf, sizeof(buf), "[%lu]", stats->rx_buffer_level);
+        tft_draw_string(TFT_WIDTH - MARGIN - strlen(buf) * FONT_W, y, COL_YELLOW, buf);
+    } else if (rx_active) {
+        tft_draw_string(TFT_WIDTH - MARGIN - 8, y, COL_GREEN, "v");
+    }
+    y += LINE_H;
+    
+    // === ROW 5: Mouse ===
+    tft_draw_string(MARGIN, y, COL_GRAY, "Mv");
+    snprintf(buf, sizeof(buf), "%lu", stats->mouse_moves);
+    tft_draw_string(MARGIN + 24, y, COL_WHITE, buf);
+    y += LINE_H + SEP_GAP;
+    
+    // === DEVICE INFO ===
     if (stats->device_vid != 0) {
-        snprintf(line, sizeof(line), "Dev: %04X:%04X", 
-                 stats->device_vid, stats->device_pid);
-        tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
-        y += LINE_HEIGHT;
+        hline(y, COL_DARK);
+        y += SEP_GAP + 2;
+        
+        snprintf(buf, sizeof(buf), "%04X:%04X", stats->device_vid, stats->device_pid);
+        tft_draw_string(MARGIN, y, COL_CYAN, buf);
+        y += LINE_H;
         
         if (stats->device_product[0]) {
-            // Truncate if too long
-            char prod[17];
-            strncpy(prod, stats->device_product, 16);
-            prod[16] = '\0';
-            tft_draw_string(MARGIN_X, y, COLOR_TEXT, prod);
-            y += LINE_HEIGHT;
+            char prod[16];
+            strncpy(prod, stats->device_product, 15);
+            prod[15] = '\0';
+            tft_draw_string(MARGIN, y, COL_GRAY, prod);
+            y += LINE_H;
         }
     }
     
-    // Uptime
-    uint32_t uptime_min = stats->uptime_sec / 60;
-    uint32_t uptime_sec = stats->uptime_sec % 60;
-    snprintf(line, sizeof(line), "Up: %lum%lus", uptime_min, uptime_sec);
-    tft_draw_string(MARGIN_X, y, COLOR_TEXT, line);
+    // === TEMPERATURES (single row) ===
+    bool has_br = TEMP_VALID(stats->bridge_temperature_c);
+    bool has_km = stats->kmbox_connected && TEMP_VALID(stats->kmbox_temperature_c);
+    
+    if (has_br || has_km) {
+        y += SEP_GAP;
+        hline(y, COL_DARK);
+        y += SEP_GAP + 2;
+        
+        int x = MARGIN;
+        if (has_br) {
+            snprintf(buf, sizeof(buf), "BR%.0f", stats->bridge_temperature_c);
+            tft_draw_string(x, y, temp_color(stats->bridge_temperature_c), buf);
+            x += 40;
+        }
+        if (has_km) {
+            snprintf(buf, sizeof(buf), "KM%.0f", stats->kmbox_temperature_c);
+            tft_draw_string(x, y, temp_color(stats->kmbox_temperature_c), buf);
+        }
+    }
 }
 
 // ============================================================================
-// Public API Implementation
+// Public API
 // ============================================================================
 
-bool tft_init(void) {
-    if (initialized) {
-        return true;
-    }
+bool tft_display_init(void) {
+    if (initialized) return true;
     
-    printf("[TFT] Initializing pico-tft library...\n");
-    
-    // Initialize the pico-tft library
     picotft_init();
-    
-    printf("[TFT] pico-tft init complete, clearing display...\n");
-    
-    // Clear the display
-    tft_fill(COLOR_BG);
-    
-    printf("[TFT] Display cleared, swapping buffers...\n");
-    
+    tft_fill(COL_BG);
     tft_swap_sync();
     
-    printf("[TFT] Buffer swap complete, setting up backlight...\n");
-    
-    // Set backlight to full brightness via PWM
     gpio_set_function(TFT_BL_PIN, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(TFT_BL_PIN);
     pwm_set_wrap(slice, 255);
@@ -149,108 +207,70 @@ bool tft_init(void) {
     pwm_set_enabled(slice, true);
     
     initialized = true;
-    printf("[TFT] Initialization complete\n");
     return true;
 }
 
-void tft_update(const tft_stats_t *stats) {
-    if (!initialized) {
-        return;
-    }
+void tft_display_update(const tft_stats_t *stats) {
+    if (!initialized) return;
     
-    // Rate limiting
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_update_time < UPDATE_INTERVAL_MS) {
-        return;
-    }
-    last_update_time = now;
+    if (now - last_update_ms < UPDATE_INTERVAL_MS) return;
+    last_update_ms = now;
     
-    // Check if we need to redraw (stats changed)
-    if (memcmp(&last_stats, stats, sizeof(tft_stats_t)) == 0) {
-        return;
-    }
-    
-    // Clear screen
-    tft_fill(COLOR_BG);
-    
-    // Draw all stats
-    draw_status_bar(stats);
-    
-    // Swap and sync (blocking)
+    tft_fill(COL_BG);
+    draw_stats(stats);
     tft_swap_sync();
     
-    // Remember stats
-    memcpy(&last_stats, stats, sizeof(tft_stats_t));
+    last_tx_bytes = stats->tx_bytes;
+    last_rx_bytes = stats->rx_bytes;
 }
 
-void tft_refresh_now(const tft_stats_t *stats) {
-    if (!initialized) {
-        return;
-    }
+void tft_display_refresh(const tft_stats_t *stats) {
+    if (!initialized) return;
     
-    // Clear screen
-    tft_fill(COLOR_BG);
-    
-    // Draw all stats
-    draw_status_bar(stats);
-    
-    // Swap and sync (blocking)
+    tft_fill(COL_BG);
+    draw_stats(stats);
     tft_swap_sync();
     
-    // Remember stats
-    memcpy(&last_stats, stats, sizeof(tft_stats_t));
-    last_update_time = to_ms_since_boot(get_absolute_time());
+    last_update_ms = to_ms_since_boot(get_absolute_time());
+    last_tx_bytes = stats->tx_bytes;
+    last_rx_bytes = stats->rx_bytes;
 }
 
-void tft_show_splash(void) {
-    if (!initialized) {
-        return;
-    }
+void tft_display_splash(void) {
+    if (!initialized) return;
     
-    tft_fill(COLOR_BG);
+    tft_fill(COL_BG);
     
-    int y = TFT_HEIGHT / 2 - LINE_HEIGHT * 2;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COLOR_TEXT, "KMBox Bridge");
-    y += LINE_HEIGHT;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COLOR_TEXT, "Autopilot");
-    y += LINE_HEIGHT * 2;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COLOR_OK, "Initializing...");
+    int y = TFT_HEIGHT / 2 - LINE_H * 2;
+    box(10, y - 4, TFT_WIDTH - 20, LINE_H * 3 + 8, COL_DARK);
     
-    tft_swap_sync();
-    
-    printf("[TFT] Splash screen displayed\n");
-}
-
-void tft_show_error(const char *msg) {
-    if (!initialized) {
-        return;
-    }
-    
-    tft_fill(COLOR_BG);
-    
-    int y = TFT_HEIGHT / 2 - LINE_HEIGHT;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COLOR_ERROR, "ERROR");
-    y += LINE_HEIGHT;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COLOR_TEXT, msg);
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "KMBox Bridge");
+    y += LINE_H;
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_WHITE, "Autopilot");
+    y += LINE_H * 2;
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_GREEN, "Starting...");
     
     tft_swap_sync();
 }
 
-void tft_set_backlight(uint8_t brightness) {
-    if (!initialized) {
-        return;
-    }
+void tft_display_error(const char *msg) {
+    if (!initialized) return;
     
+    tft_fill(COL_BG);
+    
+    int y = TFT_HEIGHT / 2 - LINE_H;
+    box(5, y - 4, TFT_WIDTH - 10, LINE_H * 2 + 8, COL_RED);
+    
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_WHITE, "ERROR");
+    y += LINE_H;
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_WHITE, msg);
+    
+    tft_swap_sync();
+}
+
+void tft_display_backlight(uint8_t brightness) {
+    if (!initialized) return;
     uint slice = pwm_gpio_to_slice_num(TFT_BL_PIN);
     pwm_set_chan_level(slice, pwm_gpio_to_channel(TFT_BL_PIN), brightness);
-}
-
-bool tft_is_busy(void) {
-    // pico-tft uses blocking sync, so we're never busy
-    return false;
-}
-
-void tft_task(void) {
-    // pico-tft doesn't need background tasks
-    // All updates are synchronous
 }
