@@ -11,4 +11,3 @@ lib/pio_usb
 .vscode/*
 tools/__pycache__/generate_lut.cpython-313.pyc
 HUMANIZATION.md
-tools/mouse_counteract
