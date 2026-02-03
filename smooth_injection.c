@@ -30,12 +30,30 @@ static volatile bool g_save_pending = false;
 static volatile uint32_t g_save_request_time = 0;
 #define SAVE_DEFER_MS 2000  // Wait 2 seconds after last mode change before saving
 
+// Safety tracking for failed flash operations
+static uint8_t g_flash_save_failures = 0;
+#define MAX_FLASH_FAILURES 3  // Disable flash saves after this many failures
+
 // Forward declaration for internal use
 static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool auto_save);
 
 
 // Global state
 static smooth_injection_state_t g_smooth = {0};
+
+// Track last injection mode for stats
+static inject_mode_t g_last_inject_mode = INJECT_MODE_SMOOTH;
+
+// Active queue linked list for O(1) iteration
+// Instead of scanning all SMOOTH_QUEUE_SIZE slots, maintain a list of active entries
+typedef struct active_queue_node {
+    uint8_t index;  // Index into g_smooth.queue[]
+    struct active_queue_node *next;
+} active_queue_node_t;
+
+static active_queue_node_t g_active_nodes[SMOOTH_QUEUE_SIZE];
+static active_queue_node_t *g_active_head = NULL;
+static uint8_t g_active_node_free_bitmap[(SMOOTH_QUEUE_SIZE + 7) / 8];
 
 //--------------------------------------------------------------------+
 // Fast PRNG for Humanization (xorshift32)
@@ -75,9 +93,26 @@ static inline int32_t rng_range_fp(int32_t min_fp, int32_t max_fp) {
 // Fixed-Point Math Helpers
 //--------------------------------------------------------------------+
 
+#if ENABLE_DSP_FIXED_POINT
+// RP2350 DSP-optimized fixed-point multiply using SMMULR
+// Single-cycle signed multiply with rounding
+static inline int32_t fp_mul(int32_t a, int32_t b) {
+    int32_t result;
+    // SMMULR: Signed Most Significant Word Multiply with Round
+    // Returns high 32 bits of (a * b) with rounding
+    __asm__ volatile (
+        "smmulr %0, %1, %2"
+        : "=r" (result)
+        : "r" (a), "r" (b)
+    );
+    return result;
+}
+#else
+// Standard fixed-point multiply for RP2040
 static inline int32_t fp_mul(int32_t a, int32_t b) {
     return (int32_t)(((int64_t)a * b) >> SMOOTH_FP_SHIFT);
 }
+#endif
 
 static inline int32_t fp_div(int32_t a, int32_t b) {
     if (b == 0) return 0;
@@ -115,6 +150,10 @@ static inline int8_t clamp_i8(int32_t val) {
 // Velocity Tracking
 //--------------------------------------------------------------------+
 
+// Persistent fixed-point accumulators to avoid precision loss during conversion
+static int32_t g_velocity_sum_x_fp = 0;
+static int32_t g_velocity_sum_y_fp = 0;
+
 static void velocity_update(int8_t x, int8_t y) {
     velocity_tracker_t *v = &g_smooth.velocity;
     
@@ -127,15 +166,14 @@ static void velocity_update(int8_t x, int8_t y) {
     v->y_history[v->history_index] = y;
     v->history_index = (v->history_index + 1) % SMOOTH_VELOCITY_WINDOW;
     
-    // Update running sum (remove old, add new) - O(1) instead of O(n)
-    int32_t sum_x = (v->avg_velocity_x_fp * SMOOTH_VELOCITY_WINDOW) >> SMOOTH_FP_SHIFT;
-    int32_t sum_y = (v->avg_velocity_y_fp * SMOOTH_VELOCITY_WINDOW) >> SMOOTH_FP_SHIFT;
-    sum_x = sum_x - old_x + x;
-    sum_y = sum_y - old_y + y;
+    // Update running sum in fixed-point (remove old, add new) - O(1)
+    // Keep accumulators in fixed-point to preserve precision across cycles
+    g_velocity_sum_x_fp = g_velocity_sum_x_fp - int_to_fp(old_x) + int_to_fp(x);
+    g_velocity_sum_y_fp = g_velocity_sum_y_fp - int_to_fp(old_y) + int_to_fp(y);
     
-    // Store as fixed-point average
-    v->avg_velocity_x_fp = int_to_fp(sum_x) / SMOOTH_VELOCITY_WINDOW;
-    v->avg_velocity_y_fp = int_to_fp(sum_y) / SMOOTH_VELOCITY_WINDOW;
+    // Store as fixed-point average (no precision loss)
+    v->avg_velocity_x_fp = g_velocity_sum_x_fp / SMOOTH_VELOCITY_WINDOW;
+    v->avg_velocity_y_fp = g_velocity_sum_y_fp / SMOOTH_VELOCITY_WINDOW;
 }
 
 // smooth state accessor for external use
@@ -175,6 +213,22 @@ static smooth_queue_entry_t* queue_alloc(void) {
     g_free_bitmap &= ~(1u << idx);
     
     g_smooth.queue_count++;
+    
+    // Add to active linked list for fast iteration
+    // Find free node
+    for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
+        uint8_t byte_idx = i / 8;
+        uint8_t bit_idx = i % 8;
+        if (!(g_active_node_free_bitmap[byte_idx] & (1 << bit_idx))) {
+            // Found free node
+            g_active_node_free_bitmap[byte_idx] |= (1 << bit_idx);
+            g_active_nodes[i].index = idx;
+            g_active_nodes[i].next = g_active_head;
+            g_active_head = &g_active_nodes[i];
+            break;
+        }
+    }
+    
     return &g_smooth.queue[idx];
 }
 
@@ -188,6 +242,20 @@ static void queue_free(smooth_queue_entry_t *entry) {
         int idx = entry - g_smooth.queue;
         if (idx >= 0 && idx < SMOOTH_QUEUE_SIZE) {
             g_free_bitmap |= (1u << idx);
+            
+            // Remove from active linked list
+            active_queue_node_t **current = &g_active_head;
+            while (*current) {
+                if ((*current)->index == idx) {
+                    active_queue_node_t *to_free = *current;
+                    *current = (*current)->next;
+                    // Mark node as free
+                    int node_idx = to_free - g_active_nodes;
+                    g_active_node_free_bitmap[node_idx / 8] &= ~(1 << (node_idx % 8));
+                    break;
+                }
+                current = &(*current)->next;
+            }
         }
     }
 }
@@ -198,6 +266,15 @@ static void queue_free(smooth_queue_entry_t *entry) {
 
 void smooth_injection_init(void) {
     memset(&g_smooth, 0, sizeof(g_smooth));
+    
+    // Reset global state that's outside g_smooth structure
+    g_free_bitmap = 0xFFFFFFFF;  // All slots free
+    g_velocity_sum_x_fp = 0;     // Reset velocity accumulators
+    g_velocity_sum_y_fp = 0;
+    
+    // Initialize active linked list
+    g_active_head = NULL;
+    memset(g_active_node_free_bitmap, 0, sizeof(g_active_node_free_bitmap));
     
     // Seed RNG with hardware time for per-session variation
     uint64_t time_us = time_us_64();
@@ -212,6 +289,9 @@ bool smooth_inject_movement(int16_t x, int16_t y, inject_mode_t mode) {
 }
 
 bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
+    // Track injection mode for stats
+    g_last_inject_mode = mode;
+    
     // For immediate mode, just add to accumulator
     if (mode == INJECT_MODE_IMMEDIATE) {
         g_smooth.x_accumulator_fp += x_fp;
@@ -250,12 +330,20 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     if (max_component > max_per_frame_fp) {
         // Calculate frames needed (round up) with slight randomization
         frames = (uint8_t)((max_component + max_per_frame_fp - 1) / max_per_frame_fp);
-        // Add ±1 frame variation for movements > 3 frames
-        if (frames > 3 && rng_next() % 3 == 0) {
-            frames += (rng_next() % 2) ? 1 : -1;
-        }
-        if (frames > 255) frames = 255;
+        
+        // Apply movement-aware frame spread from LUT
+        // Small movements get more frames (careful), large movements get fewer (fast)
+        int32_t movement_px = fp_to_int(max_component);
+        int32_t frame_multiplier = lut_get_frame_spread_for_movement(movement_px);
+        frames = (uint8_t)((frames * frame_multiplier) >> SMOOTH_FP_SHIFT);
+        
         if (frames < 1) frames = 1;
+    }
+    
+    // Add 1-2ms delay to simulate natural mouse latency (125Hz-1000Hz polling)
+    // This makes synthetic movement timing match physical mouse behavior
+    if (mode != INJECT_MODE_IMMEDIATE) {
+        frames = frames + (uint8_t)rng_range(0, 1); // Add 0-1 frame (~1-2ms at 1000Hz)
     }
     
     // Choose easing curve based on movement size and mode
@@ -289,8 +377,8 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
         if (vel_mag < slow_thresh) {
             // Mouse nearly stationary - be extra smooth
             // Random multiplier: 1.5x to 2.5x
-            frames = (frames * (uint8_t)rng_range(3, 5)) / 2;
-            if (frames > 255) frames = 255;
+            uint16_t temp = (frames * (uint8_t)rng_range(3, 5)) / 2;
+            frames = (temp > 255) ? 255 : (uint8_t)temp;
         } else if (vel_mag > fast_thresh) {
             // Mouse moving fast - can inject faster
             frames = (frames + (uint8_t)rng_range(1, 2)) / 2;
@@ -299,16 +387,17 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     }
     
     // Overshoot simulation for realism (occasional overshoot then correction)
-    // Now using LUT for faster overshoot magnitude lookup
+    // Only apply to medium movements where hand control naturally overshoots
+    // Not on small (too precise) or very large (ballistic, no overshoot)
     bool will_overshoot = false;
     int32_t overshoot_x_fp = 0, overshoot_y_fp = 0;
+    int32_t movement_px = fp_to_int(max_component);
     if (g_smooth.humanization.jitter_enabled && 
-        max_component > int_to_fp(30) && 
+        movement_px >= 30 && movement_px <= 120 && 
         (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
         will_overshoot = true;
         // Get overshoot magnitude from LUT based on movement size (faster than rng_range)
-        int32_t movement_pixels = fp_to_int(max_component);
-        int32_t overshoot_base = lut_get_overshoot(movement_pixels);
+        int32_t overshoot_base = lut_get_overshoot(movement_px);
         // Scale by humanization setting (overshoot_max_fp acts as multiplier)
         int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
         // Clamp to max
@@ -356,10 +445,11 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
         goto apply_accumulator;
     }
     
-    // Process active entries (typically only 1-3 active at a time)
-    for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
-        smooth_queue_entry_t *entry = &g_smooth.queue[i];
-        if (!entry->active) continue;
+    // Process active entries using linked list (O(n) where n = active count, not queue size)
+    active_queue_node_t *node = g_active_head;
+    while (node) {
+        smooth_queue_entry_t *entry = &g_smooth.queue[node->index];
+        active_queue_node_t *next_node = node->next;  // Save next before potential free
         
         if (entry->frames_left > 0) {
             // Calculate progress using LUT (eliminates division in hot path)
@@ -377,17 +467,41 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
             int32_t dy_fp = fp_mul(entry->y_fp, progress_delta);
             
             // Add micro-jitter for human tremor simulation (except for MICRO mode)
+            // Use movement-aware jitter scaling from LUT:
+            // - Small movements (0-20px): More jitter (stationary hand, precise)
+            // - Medium movements (20-100px): Moderate jitter
+            // - Large movements (100+px): Less jitter (intentional, tremor suppressed)
             if (g_smooth.humanization.jitter_enabled && entry->mode != INJECT_MODE_MICRO) {
-                // Use LUT-based jitter for consistency and speed
-                int32_t jitter_x, jitter_y;
-                int32_t jitter_scale = g_smooth.humanization.jitter_amount_fp;
+                // Calculate movement magnitude once
+                int32_t move_mag = (entry->x_fp < 0 ? -entry->x_fp : entry->x_fp);
+                int32_t y_mag = (entry->y_fp < 0 ? -entry->y_fp : entry->y_fp);
+                if (y_mag > move_mag) move_mag = y_mag;
+                int32_t move_px = fp_to_int(move_mag);
                 
-                // More jitter during mid-movement (when hand is actually moving)
-                if (progress > (SMOOTH_FP_ONE >> 2) && progress < ((SMOOTH_FP_ONE * 3) >> 2)) {
-                    jitter_scale = (jitter_scale * 3) >> 1; // 1.5x jitter during active movement
+                // Get current velocity magnitude for suppression
+                int32_t vel_mag = g_smooth.velocity.avg_velocity_x_fp;
+                if (vel_mag < 0) vel_mag = -vel_mag;
+                int32_t vel_y_abs = g_smooth.velocity.avg_velocity_y_fp;
+                if (vel_y_abs < 0) vel_y_abs = -vel_y_abs;
+                if (vel_y_abs > vel_mag) vel_mag = vel_y_abs;
+                
+                // Suppress jitter when velocity is very low (movement has ended)
+                // Rapid decay: if velocity < 1px/frame, reduce jitter dramatically
+                int32_t velocity_scale = SMOOTH_FP_ONE;
+                if (vel_mag < int_to_fp(1)) {
+                    // Scale from 1.0x down to 0.1x as velocity approaches 0
+                    velocity_scale = (vel_mag * 9) / int_to_fp(1) + (SMOOTH_FP_ONE / 10);
                 }
                 
-                // Get jitter from precomputed LUT (includes application probability)
+                // Get movement-aware jitter scale from LUT
+                int32_t movement_jitter_scale = lut_get_jitter_scale_for_movement(move_px);
+                int32_t jitter_scale = fp_mul(g_smooth.humanization.jitter_amount_fp, movement_jitter_scale);
+                
+                // Apply velocity-based suppression (stops jitter when movement ends)
+                jitter_scale = fp_mul(jitter_scale, velocity_scale);
+                
+                // Get jitter from precomputed LUT
+                int32_t jitter_x, jitter_y;
                 lut_get_jitter(g_smooth.frames_processed, jitter_scale, &jitter_x, &jitter_y);
                 dx_fp += jitter_x;
                 dy_fp += jitter_y;
@@ -434,6 +548,8 @@ void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
         } else {
             queue_free(entry);
         }
+        
+        node = next_node;  // Move to next active entry
     }
     
 apply_accumulator:
@@ -490,6 +606,9 @@ void smooth_clear_queue(void) {
     g_smooth.x_accumulator_fp = 0;
     g_smooth.y_accumulator_fp = 0;
     g_free_bitmap = 0xFFFFFFFF;
+    // Also reset velocity tracking accumulators for consistency
+    g_velocity_sum_x_fp = 0;
+    g_velocity_sum_y_fp = 0;
 }
 
 void smooth_get_stats(uint32_t *total_injected, uint32_t *frames_processed, 
@@ -527,37 +646,37 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             break;
             
         case HUMANIZATION_LOW:
-            // Minimal humanization
-            g_smooth.max_per_frame = (int16_t)rng_range(15, 17); // ±1
+            // Minimal humanization - very light, only on synthetic movement
+            g_smooth.max_per_frame = 16; // Fixed
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 2; // ±0.5px
-            g_smooth.humanization.overshoot_chance = 5; // 5% chance
-            g_smooth.humanization.overshoot_max_fp = int_to_fp(1); // Max 1px
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 32; // ±0.03px (tiny)
+            g_smooth.humanization.overshoot_chance = 0;
+            g_smooth.humanization.overshoot_max_fp = 0;
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(2, 3));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(9, 11));
             break;
             
         case HUMANIZATION_MEDIUM:
-            // Balanced humanization (default)
-            g_smooth.max_per_frame = (int16_t)rng_range(14, 18); // ±2
+            // Balanced - light humanization on synthetic movements
+            g_smooth.max_per_frame = 16; // Fixed
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1); // ±1px
-            g_smooth.humanization.overshoot_chance = 15; // 15% chance
-            g_smooth.humanization.overshoot_max_fp = int_to_fp(2); // Max 2px
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 16; // ±0.06px (light)
+            g_smooth.humanization.overshoot_chance = 0;
+            g_smooth.humanization.overshoot_max_fp = 0;
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(2, 3));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(9, 12));
             break;
             
         case HUMANIZATION_HIGH:
-            // Maximum variation
-            g_smooth.max_per_frame = (int16_t)rng_range(12, 20); // ±4
+            // Maximum - moderate humanization on synthetic movements
+            g_smooth.max_per_frame = 16; // Fixed
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(2); // ±2px
-            g_smooth.humanization.overshoot_chance = 25; // 25% chance
-            g_smooth.humanization.overshoot_max_fp = int_to_fp(3); // Max 3px
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 10; // ±0.1px (moderate)
+            g_smooth.humanization.overshoot_chance = 0;
+            g_smooth.humanization.overshoot_max_fp = 0;
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(8, 15));
             break;
@@ -623,29 +742,79 @@ void smooth_save_humanization_mode(void) {
     g_save_request_time = to_ms_since_boot(get_absolute_time());
 }
 
+// Core1 acknowledgment flag for safe flash operations
+extern volatile bool g_core1_flash_acknowledged;
+
 // Call this periodically from main loop when Core1 is in a safe state
 void smooth_process_deferred_save(void) {
     if (!g_save_pending) return;
+    
+    // Safety check - disable flash saves if we've had too many failures
+    if (g_flash_save_failures >= MAX_FLASH_FAILURES) {
+        printf("Flash saves disabled after %d failures - mode changes are temporary\n", g_flash_save_failures);
+        g_save_pending = false;
+        return;
+    }
     
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
     // Wait for the defer period to allow rapid button presses
     if ((current_time - g_save_request_time) < SAVE_DEFER_MS) return;
     
+    // CRITICAL: Ensure Core1 acknowledgment flag is cleared before we start
+    g_core1_flash_acknowledged = false;
+    
     // Signal Core1 to pause - it checks this flag in its tight loop
     g_flash_operation_in_progress = true;
     
-    // Small delay to let Core1 notice and pause
-    sleep_ms(5);
+    // Send multiple events to ensure Core1 wakes up if in WFI
+    for (int i = 0; i < 5; i++) {
+        __sev();
+        tight_loop_contents();
+    }
     
-    // Now perform the flash write
+    // Wait for Core1 to acknowledge with generous timeout
+    // Core1 might be busy with USB enumeration or HID processing
+    uint32_t timeout = time_us_32() + 100000;  // 100ms timeout (10x longer)
+    bool acknowledged = false;
+    
+    while (time_us_32() < timeout) {
+        if (g_core1_flash_acknowledged) {
+            acknowledged = true;
+            break;
+        }
+        tight_loop_contents();
+    }
+    
+    if (!acknowledged) {
+        // ABORT - Core1 didn't acknowledge, DO NOT write to flash!
+        printf("ERROR: Core1 flash sync timeout - ABORTING save (failure %d/%d)\n", 
+               g_flash_save_failures + 1, MAX_FLASH_FAILURES);
+        
+        // Release flag and count failure
+        g_flash_operation_in_progress = false;
+        g_core1_flash_acknowledged = false;
+        g_flash_save_failures++;
+        
+        // Retry later if not at max failures
+        if (g_flash_save_failures < MAX_FLASH_FAILURES) {
+            g_save_request_time = current_time;  // Reset timer to retry in 2s
+        } else {
+            g_save_pending = false;  // Give up
+        }
+        return;
+    }
+    
+    // Core1 acknowledged - safe to write flash
     smooth_save_humanization_mode_internal();
     
     // Allow Core1 to resume
     g_flash_operation_in_progress = false;
+    g_core1_flash_acknowledged = false;  // Reset for next time
     
     g_save_pending = false;
-    printf("Humanization mode saved to flash\n");
+    g_flash_save_failures = 0;  // Reset failure counter on success
+    printf("Humanization mode saved to flash successfully\n");
 }
 
 void smooth_load_humanization_mode(void) {
@@ -662,4 +831,20 @@ void smooth_load_humanization_mode(void) {
         // No valid data found, use default (without auto-save during init)
         smooth_set_humanization_mode_internal(HUMANIZATION_MEDIUM, false);
     }
+}
+
+//--------------------------------------------------------------------+
+// Getter Functions for Settings Query
+//--------------------------------------------------------------------+
+
+int16_t smooth_get_max_per_frame(void) {
+    return g_smooth.max_per_frame;
+}
+
+bool smooth_get_velocity_matching(void) {
+    return g_smooth.velocity_matching_enabled;
+}
+
+inject_mode_t smooth_get_inject_mode(void) {
+    return g_last_inject_mode;
 }

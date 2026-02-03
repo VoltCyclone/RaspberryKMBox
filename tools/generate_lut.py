@@ -29,6 +29,8 @@ MAX_PRECOMPUTED_FRAMES = 32
 OVERSHOOT_LUT_SIZE = 16
 ACCEL_LUT_SIZE = 32
 SUBPIXEL_DITHER_SIZE = 16
+JITTER_SCALE_LUT_SIZE = 32
+FRAME_SPREAD_LUT_SIZE = 32
 
 
 def ease_in_out_cubic(t):
@@ -89,19 +91,20 @@ def generate_jitter_table():
     """Generate pseudo-random jitter patterns that sum to ~0."""
     random.seed(42)  # Reproducible
     
-    # Generate X jitter - values in range [-0.5, 0.5] in FP
+    # Generate X jitter - DRASTICALLY REDUCED to ±0.05 pixels (was ±0.5)
+    # This gets scaled by humanization settings and movement LUT, so needs to be tiny
     jitter_x = []
     for i in range(JITTER_LUT_SIZE):
         # Use deterministic pattern based on index
         angle = (i * 7 + 3) * 2 * math.pi / JITTER_LUT_SIZE
-        value = math.sin(angle) * 0.5  # Range [-0.5, 0.5]
+        value = math.sin(angle) * 0.05  # Range [-0.05, 0.05] pixels
         jitter_x.append(int(round(value * FP_ONE)))
     
-    # Generate Y jitter - phase shifted
+    # Generate Y jitter - phase shifted, also ±0.05 pixels
     jitter_y = []
     for i in range(JITTER_LUT_SIZE):
         angle = (i * 11 + 7) * 2 * math.pi / JITTER_LUT_SIZE
-        value = math.sin(angle) * 0.5
+        value = math.sin(angle) * 0.05  # Range [-0.05, 0.05] pixels
         jitter_y.append(int(round(value * FP_ONE)))
     
     return jitter_x, jitter_y
@@ -187,6 +190,77 @@ def generate_subpixel_dither():
     return [int(round(v * FP_ONE)) for v in values]
 
 
+def generate_jitter_scale_by_movement():
+    """Generate jitter scale LUT based on movement magnitude.
+    
+    Small movements (0-20px): Higher jitter (0.8x-0.7x)
+    Medium movements (20-100px): Moderate jitter (0.6x-0.2x)
+    Large movements (100+px): Minimal jitter (0.1x-0.05x)
+    """
+    values = []
+    
+    for i in range(JITTER_SCALE_LUT_SIZE):
+        # Each index represents 10px of movement (0-10px, 10-20px, etc.)
+        movement_px = i * 10
+        
+        if movement_px < 20:
+            # 0-20px: 0.8x to 0.7x
+            scale = 0.8 - (movement_px / 20) * 0.1
+        elif movement_px < 40:
+            # 20-40px: 0.7x to 0.5x
+            scale = 0.7 - ((movement_px - 20) / 20) * 0.2
+        elif movement_px < 60:
+            # 40-60px: 0.5x to 0.3x
+            scale = 0.5 - ((movement_px - 40) / 20) * 0.2
+        elif movement_px < 100:
+            # 60-100px: 0.3x to 0.1x
+            scale = 0.3 - ((movement_px - 60) / 40) * 0.2
+        elif movement_px < 140:
+            # 100-140px: 0.1x to 0.05x
+            scale = 0.1 - ((movement_px - 100) / 40) * 0.05
+        else:
+            # 140+px: 0.05x (minimal)
+            scale = 0.05
+        
+        values.append(int(round(scale * FP_ONE)))
+    
+    return values
+
+
+def generate_frame_spread_by_movement():
+    """Generate frame spread multiplier LUT based on movement magnitude.
+    
+    Small movements (0-20px): Slower, more frames (1.3x-1.2x)
+    Medium movements (20-100px): Balanced (1.2x-0.8x)
+    Large movements (100+px): Faster, fewer frames (0.7x)
+    """
+    values = []
+    
+    for i in range(FRAME_SPREAD_LUT_SIZE):
+        # Each index represents 10px of movement
+        movement_px = i * 10
+        
+        if movement_px < 20:
+            # 0-20px: 1.3x to 1.2x (slow, careful)
+            multiplier = 1.3 - (movement_px / 20) * 0.1
+        elif movement_px < 60:
+            # 20-60px: 1.2x to 1.0x
+            multiplier = 1.2 - ((movement_px - 20) / 40) * 0.2
+        elif movement_px < 100:
+            # 60-100px: 1.0x to 0.8x
+            multiplier = 1.0 - ((movement_px - 60) / 40) * 0.2
+        elif movement_px < 140:
+            # 100-140px: 0.8x to 0.7x (fast, ballistic)
+            multiplier = 0.8 - ((movement_px - 100) / 40) * 0.1
+        else:
+            # 140+px: 0.7x (maintain fast)
+            multiplier = 0.7
+        
+        values.append(int(round(multiplier * FP_ONE)))
+    
+    return values
+
+
 def format_array(values, per_line=8, indent="    "):
     """Format array values for C code."""
     lines = []
@@ -226,6 +300,8 @@ def generate_c_file():
     overshoot = generate_overshoot_table()
     accel = generate_accel_curve()
     dither = generate_subpixel_dither()
+    jitter_scale = generate_jitter_scale_by_movement()
+    frame_spread = generate_frame_spread_by_movement()
     
     # Build C file content
     c_code = '''/*
@@ -363,7 +439,33 @@ const int32_t g_accel_curve_lut[ACCEL_LUT_SIZE] = {
 
 const int32_t g_subpixel_dither_lut[SUBPIXEL_DITHER_SIZE] = {
 '''
-    c_code += format_array(dither) + "\n};\n"
+    c_code += format_array(dither) + "\n};\n\n"
+
+    c_code += '''//--------------------------------------------------------------------+
+// Movement-Type Jitter Scale LUT
+//
+// Tremor characteristics by movement type:
+// Index 0-1 (0-20px): 0.8x-0.7x jitter (small, precise adjustments)
+// Index 2-5 (20-60px): 0.7x-0.3x jitter (medium, controlled)
+// Index 6-10 (60-110px): 0.3x-0.1x jitter (large, intentional)
+// Index 11+ (110+px): 0.1x-0.05x jitter (fast flicks, tremor suppressed)
+//--------------------------------------------------------------------+
+
+const int32_t g_jitter_scale_by_movement_lut[JITTER_SCALE_LUT_SIZE] = {
+'''
+    c_code += format_array(jitter_scale) + "\n};\n\n"
+
+    c_code += '''//--------------------------------------------------------------------+
+// Movement-Type Frame Spread LUT
+//
+// Frame timing by movement type:
+// Small movements: Spread over MORE frames (careful, precise)
+// Large movements: Spread over FEWER frames (fast, ballistic)
+//--------------------------------------------------------------------+
+
+const int32_t g_frame_spread_by_movement_lut[FRAME_SPREAD_LUT_SIZE] = {
+'''
+    c_code += format_array(frame_spread) + "\n};\n"
 
     return c_code
 
@@ -383,6 +485,8 @@ def main():
     print(f"  - Overshoot table: {OVERSHOOT_LUT_SIZE} entries")
     print(f"  - Accel curve: {ACCEL_LUT_SIZE} entries")
     print(f"  - Dither pattern: {SUBPIXEL_DITHER_SIZE} entries")
+    print(f"  - Jitter scale LUT: {JITTER_SCALE_LUT_SIZE} entries")
+    print(f"  - Frame spread LUT: {FRAME_SPREAD_LUT_SIZE} entries")
 
 
 if __name__ == "__main__":

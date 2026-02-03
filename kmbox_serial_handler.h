@@ -74,4 +74,10 @@ void kmbox_send_status(const char* message);
 // Send ping to bridge (for bidirectional testing)
 void kmbox_send_ping_to_bridge(void);
 
+// Send info packet to bridge (humanization settings, temperature, etc.)
+void kmbox_send_info_to_bridge(void);
+
+// Get TX buffer stats (for debugging/monitoring)
+uint32_t kmbox_get_tx_dropped_bytes(void);
+
 #endif // KMBOX_SERIAL_HANDLER_H

@@ -22,29 +22,47 @@ A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates
 
 ## Hardware Requirements
 
-### Supported Boards
-- **Recommended**: Adafruit Feather RP2040 USB Host (has built-in USB-A port)
-- **Alternative**: Any RP2040/RP2350 board with USB host wiring
+### Target Hardware
 
-### Minimal Wiring (2 wires)
+**Primary Target**: Adafruit Feather RP2040 USB Host
+- Built-in USB-A host port eliminates external wiring
+- USB-C device port for PC connection
+- Onboard LED and WS2812 NeoPixel support
+- Standard Feather pinout for expansion
 
-For **Adafruit Feather RP2040 USB Host** - **no external wiring needed**:
-- USB-A port: Connect your mouse/keyboard  
-- USB-C port: Connect to your PC
+**Alternative Boards**:
+- Any RP2040 or RP2350 board with external USB host wiring
+- Minimum 264KB RAM required for dual USB stacks
 
-For **other RP2040 boards** - **2 wire USB host setup**:
-- GPIO 16 → USB D+ (green wire on most USB cables)
-- GPIO 17 → USB D- (white wire on most USB cables)  
-- +5V and GND → USB power and ground
+### Basic Wiring
 
-### Optional Components
-- **WS2812 NeoPixel** (GPIO 21): Visual status indicator
-- **Button** (GPIO 7): Mode switching and USB reset
-- **External UART**: Alternative to USB serial (GPIO 5/6 @ 115200)
+**Adafruit Feather RP2040 USB Host** (zero external wiring):
+- USB-A port → Mouse/keyboard
+- USB-C port → PC
+
+**Standard RP2040/RP2350 Boards** (USB host connection):
+- GPIO 16 → USB D+ (typically green wire)
+- GPIO 17 → USB D- (typically white wire)
+- 5V → VBUS (red wire)
+- GND → Ground (black wire)
+
+### Optional Peripherals
+
+| Component | Pin | Purpose |
+|-----------|-----|---------|
+| WS2812 LED | GPIO 21 | RGB status indicator |
+| Button | GPIO 7 (pull-up) | Mode switching, USB reset |
+| Debug UART TX | GPIO 0 | Serial debug output |
+| Debug UART RX | GPIO 1 | Serial debug input |
+| External UART TX | GPIO 5 | KMBox command alternative |
+| External UART RX | GPIO 6 | KMBox command alternative |
+
+Note: Debug UART and external UART both operate at 115200 baud.
 
 ### Power Requirements
-- Standard USB power (5V, ~100-200mA typical)
-- No external power supply needed
+- USB bus powered (5V)
+- Typical consumption: 100-200mA
+- No external power supply required
 
 ## Quick Start
 
@@ -205,7 +223,6 @@ Fallbacks: If no device is attached or descriptors aren’t available, defaults 
 
 ## Using KMBox serial
 
-- Port: UART1 (GPIO 5/6), 115200 8N1 (or UART0 via RP2350 USB bridge @ 115200)
 - Capabilities: movement injection, button press/release, timed clicks, wheel, axis locks, monitor mode
 
 ### Basic Commands

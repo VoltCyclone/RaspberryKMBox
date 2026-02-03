@@ -1,11 +1,7 @@
 # KMBox Bridge - Advanced Autopilot Firmware
 # RP2350 bridge with color tracking and Hardware UART communication
 # 
-# Architecture change: TX/RX wires are now crossed at hardware level,
-# allowing direct hardware UART usage instead of PIO-based pin swapping.
-# This frees up PIO state machines for timing/latency tracking.
-#
-# Optional: 1.8" ST7735 TFT display support via SPI1
+# Includes 1.8" ST7735 TFT display support via hardware SPI
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -28,18 +24,24 @@ add_executable(kmbox_bridge
     tracker.c
     hw_uart.c
     latency_tracker.c
-    tft_display.c
     core1_translator.c
     makcu_translator.c
     ferrum_translator.c
+    tft_display.c
+    tft.c
+    st7735.c
+    ili9341.c
+    font.c
 )
+
+# Generate PIO header for WS2812 NeoPixel from SDK
+pico_generate_pio_header(kmbox_bridge ${PICO_SDK_PATH}/src/rp2_common/pico_status_led/ws2812.pio)
+
+# Generate PIO header for TFT LUT (if hardware acceleration is enabled)
+pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/lut.pio)
 
 # Add kmbox-commands library for shared utilities
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/kmbox-commands kmbox-commands)
-
-# Note: PIO programs removed for UART (now using hardware UART)
-# timestamp.pio is available but not currently generated
-# pico_generate_pio_header(kmbox_bridge ${CMAKE_CURRENT_LIST_DIR}/timestamp.pio)
 
 target_link_libraries(kmbox_bridge
     pico_stdlib
@@ -49,6 +51,7 @@ target_link_libraries(kmbox_bridge
     hardware_uart
     hardware_spi
     hardware_pwm
+    hardware_adc
     pico_multicore
     kmbox_commands
 )

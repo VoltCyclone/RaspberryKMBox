@@ -1,0 +1,71 @@
+.program pio_lut
+
+.wrap_target
+public start:
+	pull block	; get next 8b color sample
+	in x, 23	; copy prefix from X into ISR
+	in osr, 8	; shift 8b color into ISR
+	in null, 1	; pad with 1 more bit (for 16b colors)
+
+	mov y, isr	; duplicate ISR
+	push block	; output ISR the 1st time
+
+	mov isr, y	; restore ISR
+	push block	; output ISR the 2nd time
+
+	mov isr, y	; restore ISR
+	push block	; output ISR the 3rd time
+
+	mov isr, y	; restore ISR
+	push block	; output ISR the 4th time
+.wrap
+
+% c-sdk {
+struct pio_lut_config {
+	PIO pio;
+	int sm;
+	int origin;
+	uint32_t base_addr;
+	int scale;
+};
+
+inline static void pio_set_x(PIO pio, int sm, uint32_t x)
+{
+	for (int i = 7; i >= 0; i--) {
+		const uint32_t nibble = (x >> (i * 4)) & 0xf;
+
+		pio_sm_exec(pio, sm, pio_encode_set(pio_x, nibble));
+		pio_sm_exec(pio, sm, pio_encode_in(pio_x, 4));
+	}
+
+	pio_sm_exec(pio, sm, pio_encode_mov(pio_x, pio_isr));
+	pio_sm_exec(pio, sm, pio_encode_mov(pio_isr, pio_null));
+}
+
+inline static int __unused pio_lut_init(struct pio_lut_config *cfg) {
+	pio_sm_set_enabled(cfg->pio, cfg->sm, false);
+	pio_sm_restart(cfg->pio, cfg->sm);
+	pio_sm_clear_fifos(cfg->pio, cfg->sm);
+
+	int origin = cfg->origin;
+	static struct pio_program program = pio_lut_program;
+	program.origin = origin;
+
+	if (!pio_can_add_program(cfg->pio, &program))
+		return -1;
+
+	origin = pio_add_program(cfg->pio, &program);
+
+	pio_sm_config sm_config = pio_lut_program_get_default_config(origin);
+	sm_config_set_wrap(&sm_config, origin + pio_lut_wrap_target,
+	                   origin + pio_lut_wrap + 2 * cfg->scale - 8);
+	sm_config_set_out_shift(&sm_config, false, false, 32);
+	sm_config_set_in_shift(&sm_config, false, false, 32);
+	pio_sm_init(cfg->pio, cfg->sm, origin + pio_lut_offset_start, &sm_config);
+
+	pio_set_x(cfg->pio, cfg->sm, cfg->base_addr >> 9);
+
+	return origin;
+}
+
+%}

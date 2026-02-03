@@ -151,18 +151,10 @@ static inline size_t bridge_build_reset(uint8_t* buf) {
 // Performance Comparison
 // ============================================================================
 //
-// OLD KMBox Protocol (8 bytes per command):
-// - Move: [0x04, x_lo, x_hi, y_lo, y_hi, 0, 0, 0] = 8 bytes
-// - Button: [0x0B, mask, state, 0, 0, 0, 0, 0] = 8 bytes
-// - Wheel: [0x04, 0, 0, 0, 0, wheel, 0, 0] = 8 bytes
-//
-// NEW Bridge Protocol:
+// Bridge Protocol:
 // - Move: [0xBD, 0x01, x_lo, x_hi, y_lo, y_hi] = 6 bytes (25% smaller)
 // - Button: [0xBD, 0x03, mask, state] = 4 bytes (50% smaller)
 // - Wheel: [0xBD, 0x02, wheel] = 3 bytes (62.5% smaller)
 // - Move+Wheel: [0xBD, 0x04, x_lo, x_hi, y_lo, y_hi, wheel] = 7 bytes (vs 16 bytes = 56% smaller)
-//
-// Average space savings: ~40-50% depending on command mix
-// At 2 Mbaud: ~330 KB/s throughput (vs 200 KB/s with old protocol)
 
 #endif // BRIDGE_PROTOCOL_H
