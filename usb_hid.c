@@ -444,7 +444,15 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
         return false;
     }
 
-    // Fast path: skip ready check for maximum performance
+    // CRITICAL FIX: Check readiness before attempting to send
+    // If endpoint is busy, return true anyway to avoid blocking the HID report pipeline
+    // The keyboard state will be sent with the next available opportunity
+    if (!tud_hid_ready())
+    {
+        return true;  // Endpoint busy, continue processing without blocking
+    }
+
+    // Fast path: send report immediately if endpoint is ready
     bool success = tud_hid_report(REPORT_ID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
     if (success)
     {
@@ -460,12 +468,6 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
 static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_report_t *report)
 {
     if (report == NULL)
-    {
-        return false;
-    }
-
-    // Check if USB device is ready to send reports
-    if (!tud_mounted() || !tud_ready())
     {
         return false;
     }
@@ -518,13 +520,19 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
     int8_t final_y = y;
     int8_t final_wheel = wheel;
 
-    // Check if HID interface is ready
+    // CRITICAL FIX: Always try to send reports even if endpoint wasn't ready last check
+    // Check readiness right before send to minimize latency
+    // If not ready, return true anyway to avoid blocking the HID report pipeline
+    // The movement/button state is already accumulated in kmbox buffers and will be
+    // sent with the next report when endpoint becomes ready
     if (!tud_hid_ready())
     {
-        return false;
+        // Endpoint busy - movement is already queued in kmbox accumulators
+        // Return true to continue processing incoming reports without blocking
+        return true;
     }
 
-    // Fast path: skip ready check for maximum performance
+    // Send the report
     bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons_to_send, final_x, final_y, final_wheel, pan);
     return success;
 }

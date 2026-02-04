@@ -308,14 +308,8 @@ int hw_uart_getc(void) {
     rx_read_pos = (rx_read_pos + 1) & (HW_UART_RX_BUFFER_SIZE - 1);
     total_rx_bytes++;
     
-    // Flash neopixel red on RX for debug (brief flash)
-    extern void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b);
-    static uint32_t rx_flash_count = 0;
-    if ((rx_flash_count++ & 0x1F) == 0) {  // Flash every 32 bytes to avoid overwhelming
-        ws2812_put_rgb(255, 0, 0);  // Red flash for RX
-    } else if ((rx_flash_count & 0x1F) == 1) {
-        ws2812_put_rgb(0, 0, 0);  // Turn off after flash
-    }
+    // REMOVED: WS2812 debug flashing - was causing 1-2µs jitter in hot path
+    // Status LED updates handled by main loop neopixel task
     
     return c;
 }

@@ -53,7 +53,7 @@ typedef struct active_queue_node {
 
 static active_queue_node_t g_active_nodes[SMOOTH_QUEUE_SIZE];
 static active_queue_node_t *g_active_head = NULL;
-static uint8_t g_active_node_free_bitmap[(SMOOTH_QUEUE_SIZE + 7) / 8];
+static uint32_t g_active_node_bitmap = 0;  // Single uint32_t instead of byte array
 
 //--------------------------------------------------------------------+
 // Fast PRNG for Humanization (xorshift32)
@@ -214,20 +214,20 @@ static smooth_queue_entry_t* queue_alloc(void) {
     
     g_smooth.queue_count++;
     
-    // Add to active linked list for fast iteration
-    // Find free node
-    for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
-        uint8_t byte_idx = i / 8;
-        uint8_t bit_idx = i % 8;
-        if (!(g_active_node_free_bitmap[byte_idx] & (1 << bit_idx))) {
-            // Found free node
-            g_active_node_free_bitmap[byte_idx] |= (1 << bit_idx);
-            g_active_nodes[i].index = idx;
-            g_active_nodes[i].next = g_active_head;
-            g_active_head = &g_active_nodes[i];
-            break;
-        }
+    // Add to active linked list for fast iteration - O(1) using CTZ
+    if (g_active_node_bitmap == 0xFFFFFFFF) {
+        // Shouldn't happen since we check queue_count, but handle gracefully
+        return &g_smooth.queue[idx];
     }
+    
+    // O(1) node allocation using count trailing zeros
+    int node_idx = __builtin_ctz(~g_active_node_bitmap);
+    g_active_node_bitmap |= (1u << node_idx);
+    
+    // Link node
+    g_active_nodes[node_idx].index = idx;
+    g_active_nodes[node_idx].next = g_active_head;
+    g_active_head = &g_active_nodes[node_idx];
     
     return &g_smooth.queue[idx];
 }
@@ -249,9 +249,9 @@ static void queue_free(smooth_queue_entry_t *entry) {
                 if ((*current)->index == idx) {
                     active_queue_node_t *to_free = *current;
                     *current = (*current)->next;
-                    // Mark node as free
+                    // Mark node as free in bitmap - O(1)
                     int node_idx = to_free - g_active_nodes;
-                    g_active_node_free_bitmap[node_idx / 8] &= ~(1 << (node_idx % 8));
+                    g_active_node_bitmap &= ~(1u << node_idx);
                     break;
                 }
                 current = &(*current)->next;
@@ -274,7 +274,7 @@ void smooth_injection_init(void) {
     
     // Initialize active linked list
     g_active_head = NULL;
-    memset(g_active_node_free_bitmap, 0, sizeof(g_active_node_free_bitmap));
+    g_active_node_bitmap = 0;  // All nodes free
     
     // Seed RNG with hardware time for per-session variation
     uint64_t time_us = time_us_64();
@@ -431,7 +431,17 @@ void smooth_record_physical_movement(int8_t x, int8_t y) {
     velocity_update(x, y);
 }
 
-void smooth_process_frame(int8_t *out_x, int8_t *out_y) {
+void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
+    // Super-fast path for empty queue with no accumulator
+    if (g_smooth.queue_count == 0 && 
+        g_smooth.x_accumulator_fp == 0 && 
+        g_smooth.y_accumulator_fp == 0) {
+        *out_x = 0;
+        *out_y = 0;
+        g_smooth.frames_processed++;
+        return;
+    }
+    
     // Reset per-frame budget
     g_smooth.frame_x_used = 0;
     g_smooth.frame_y_used = 0;

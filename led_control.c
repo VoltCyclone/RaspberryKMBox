@@ -607,15 +607,13 @@ void neopixel_status_task(void)
     last_update_time = get_current_time_ms();
 
     // Use override status if active, otherwise update normally
-    // TEMPORARILY DISABLED: Status colors for debugging UART
-    // Only show activity flashes (blue=mouse, green=TX, red=RX)
-    // if (g_led_controller.status_override_active) {
-    //     if (g_led_controller.current_status != g_led_controller.status_override) {
-    //         apply_status_change(g_led_controller.status_override);
-    //     }
-    // } else {
-    //     neopixel_update_status();
-    // }
+    if (g_led_controller.status_override_active) {
+        if (g_led_controller.current_status != g_led_controller.status_override) {
+            apply_status_change(g_led_controller.status_override);
+        }
+    } else {
+        neopixel_update_status();
+    }
 
     // Handle special effects (order matters for priority)
     handle_activity_flash();

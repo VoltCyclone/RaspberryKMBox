@@ -252,14 +252,18 @@ static inline void lut_get_jitter(uint32_t frame_counter, int32_t jitter_scale,
     
     uint32_t lut_idx = frame_counter & (JITTER_LUT_SIZE - 1);
     
-    // Scale and return jitter
-    // jitter_scale is already in 16.16, LUT values are in 16.16
-    // Result needs to be in 16.16, so multiply then shift
-    int64_t jx = (int64_t)g_jitter_x_lut[lut_idx] * jitter_scale;
-    int64_t jy = (int64_t)g_jitter_y_lut[lut_idx] * jitter_scale;
+    // Scale and return jitter using 32-bit math
+    // Jitter LUT values are in range ±3277 (fits in 16 bits signed)
+    // jitter_scale is typically < 65536
+    // Scale down jitter_scale to 8.8 fixed point for 32-bit safe multiply
+    int32_t jx_raw = g_jitter_x_lut[lut_idx];  // ±3277 max
+    int32_t jy_raw = g_jitter_y_lut[lut_idx];
     
-    *out_x = (int32_t)(jx >> SMOOTH_FP_SHIFT);
-    *out_y = (int32_t)(jy >> SMOOTH_FP_SHIFT);
+    int32_t scale_8_8 = jitter_scale >> 8;  // Convert to 8.8 fixed point
+    
+    // 16-bit * 16-bit = 32-bit, safe on all platforms
+    *out_x = (jx_raw * scale_8_8) >> 8;  // Result back to 16.16
+    *out_y = (jy_raw * scale_8_8) >> 8;
 }
 
 /**
