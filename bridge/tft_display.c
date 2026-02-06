@@ -20,15 +20,28 @@
 extern void picotft_init(void);
 
 // ============================================================================
-// Layout (128x160 display, 8x16 font)
+// Layout — adaptive to display size
+//   ST7735:  128x160, 8x16 font, tight layout
+//   ILI9341: 240x320, 8x16 font, spacious layout with larger sections
 // ============================================================================
 
 #define UPDATE_INTERVAL_MS  100  // 10 FPS - single rate limit
 #define FONT_W              8
 #define FONT_H              16
-#define LINE_H              14      // Tight but no overlap
+
+#if (TFT_RAW_WIDTH >= 240)
+// ILI9341 240x320 — spacious layout
+#define LINE_H              18
+#define MARGIN              4
+#define SEP_GAP             4
+#define SECTION_GAP         6
+#else
+// ST7735 128x160 — tight layout
+#define LINE_H              14
 #define MARGIN              2
 #define SEP_GAP             2
+#define SECTION_GAP         2
+#endif
 
 // RGB332 palette colors
 #define COL_BG              0x00
@@ -184,6 +197,17 @@ static void draw_stats(const tft_stats_t *stats) {
     }
     y += LINE_H;
     
+#if (TFT_RAW_WIDTH >= 240)
+    // === ROW 1b: API Mode (extra space on ILI9341) ===
+    {
+        const char *mode_names[] = { "KMBox", "Makcu", "Ferrum" };
+        const char *mode_str = (stats->api_mode < 3) ? mode_names[stats->api_mode] : "???";
+        tft_draw_string(MARGIN, y, COL_GRAY, "API:");
+        tft_draw_string(MARGIN + 40, y, COL_CYAN, mode_str);
+    }
+    y += LINE_H;
+#endif
+    
     // === ROW 2: Baud + Uptime ===
     tft_draw_string(MARGIN, y, COL_DARK, fmt_baud);
     int uptime_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_uptime) * FONT_W;
@@ -212,7 +236,7 @@ static void draw_stats(const tft_stats_t *stats) {
     // === ROW 5: Mouse ===
     tft_draw_string(MARGIN, y, COL_GRAY, "Mv");
     tft_draw_string(MARGIN + 24, y, COL_WHITE, fmt_moves);
-    y += LINE_H + SEP_GAP;
+    y += LINE_H + SECTION_GAP;
     
     // === DEVICE INFO ===
     if (fmt_vid_pid[0]) {
@@ -223,11 +247,20 @@ static void draw_stats(const tft_stats_t *stats) {
         y += LINE_H;
         
         if (stats->device_product[0]) {
+#if (TFT_RAW_WIDTH >= 240)
+            // ILI9341: can show full product name (up to 29 chars)
+            char prod[30];
+            int i;
+            for (i = 0; i < 29 && stats->device_product[i]; i++) {
+                prod[i] = stats->device_product[i];
+            }
+#else
             char prod[16];
             int i;
             for (i = 0; i < 15 && stats->device_product[i]; i++) {
                 prod[i] = stats->device_product[i];
             }
+#endif
             prod[i] = '\0';
             tft_draw_string(MARGIN, y, COL_GRAY, prod);
             y += LINE_H;
@@ -236,7 +269,7 @@ static void draw_stats(const tft_stats_t *stats) {
     
     // === TEMPERATURES ===
     if (fmt_br_temp[0] || fmt_km_temp[0]) {
-        y += SEP_GAP;
+        y += SECTION_GAP;
         hline(y, COL_DARK);
         y += SEP_GAP + 2;
         

@@ -63,7 +63,7 @@ static bool button_init_done = false;
 static char ferrum_line[256];
 static uint8_t ferrum_idx = 0;
 
-#define MODE_BUTTON_PIN 7
+// Button config already in config.h (MODE_BUTTON_PIN)
 #define BUTTON_DEBOUNCE_MS 50
 #define BUTTON_LONG_PRESS_MS 2000
 

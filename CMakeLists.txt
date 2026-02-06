@@ -24,7 +24,39 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
+# Board selection: metro (Adafruit Metro RP2350), feather (Adafruit Feather), pico, pico2
 set(PICO_BOARD adafruit_feather_rp2040_usb_host CACHE STRING "Board type")
+
+# Tell the SDK where to find custom board headers (e.g. adafruit_metro_rp2350.h)
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
+
+# Detect board type and set appropriate pin configurations
+if(PICO_BOARD STREQUAL "adafruit_metro_rp2350")
+    set(USB_HOST_DP_PIN 32 CACHE STRING "USB Host D+ pin")
+    set(USB_HOST_DM_PIN 33 CACHE STRING "USB Host D- pin")
+    set(USB_HOST_5V_PIN 29 CACHE STRING "USB Host 5V power pin")
+    set(LED_PIN 23 CACHE STRING "Status LED pin")
+    set(NEOPIXEL_PIN 25 CACHE STRING "NeoPixel data pin")
+    set(NEOPIXEL_POWER_PIN 255 CACHE STRING "NeoPixel power pin (255=not used)")
+    message(STATUS "Configuring for Adafruit Metro RP2350 - USB Host on GPIO32/33")
+elseif(PICO_BOARD STREQUAL "adafruit_feather_rp2040_usb_host")
+    set(USB_HOST_DP_PIN 16 CACHE STRING "USB Host D+ pin")
+    set(USB_HOST_DM_PIN 17 CACHE STRING "USB Host D- pin")
+    set(USB_HOST_5V_PIN 18 CACHE STRING "USB Host 5V power pin")
+    set(LED_PIN 13 CACHE STRING "Status LED pin")
+    set(NEOPIXEL_PIN 21 CACHE STRING "NeoPixel data pin")
+    set(NEOPIXEL_POWER_PIN 20 CACHE STRING "NeoPixel power pin")
+    message(STATUS "Configuring for Adafruit Feather RP2040 USB Host - USB Host on GPIO16/17")
+else()
+    # Default: Pico/Pico2 with common GPIO16/17 for PIO USB
+    set(USB_HOST_DP_PIN 16 CACHE STRING "USB Host D+ pin")
+    set(USB_HOST_DM_PIN 17 CACHE STRING "USB Host D- pin")
+    set(USB_HOST_5V_PIN 18 CACHE STRING "USB Host 5V power pin")
+    set(LED_PIN 25 CACHE STRING "Status LED pin")
+    set(NEOPIXEL_PIN 21 CACHE STRING "NeoPixel data pin")
+    set(NEOPIXEL_POWER_PIN 20 CACHE STRING "NeoPixel power pin")
+    message(STATUS "Configuring for ${PICO_BOARD} - USB Host on GPIO16/17")
+endif()
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -95,8 +127,12 @@ target_compile_definitions(PIOKMbox PRIVATE
         PIO_USB_AVAILABLE=1
         CFG_TUH_RPI_PIO_USB=1
         CPU_FREQ=240000
-        PIN_USB_HOST_DP=16
-        PIN_USB_HOST_DM=17
+        PIN_USB_HOST_DP=${USB_HOST_DP_PIN}
+        PIN_USB_HOST_DM=${USB_HOST_DM_PIN}
+        PIN_USB_5V=${USB_HOST_5V_PIN}
+        PIN_LED=${LED_PIN}
+        PIN_NEOPIXEL=${NEOPIXEL_PIN}
+        NEOPIXEL_POWER=${NEOPIXEL_POWER_PIN}
 )
 
 # Link PIO USB library

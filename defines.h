@@ -46,18 +46,32 @@
 #define CPU_FREQ DEFAULT_CPU_FREQ
 #endif
 
-// Pin definitions
+// Pin definitions - set via CMake compile definitions based on board type
+// Override these via CMakeLists.txt for different boards:
+//   - Adafruit Metro RP2350:   D+=32, D-=33, 5V=29, LED=23, NeoPixel=25
+//   - Adafruit Feather RP2040: D+=16, D-=17, 5V=18, LED=13, NeoPixel=21
+//   - Pico/Pico2 default:      D+=16, D-=17, 5V=18, LED=25, NeoPixel=21
+
 #ifndef PIN_USB_HOST_DP
-#define PIN_USB_HOST_DP         (16u)   // PIO USB Host D+ pin
+#define PIN_USB_HOST_DP         (16u)   // PIO USB Host D+ pin (default)
 #endif
 #ifndef PIN_USB_HOST_DM
-#define PIN_USB_HOST_DM         (17u)   // PIO USB Host D- pin
+#define PIN_USB_HOST_DM         (17u)   // PIO USB Host D- pin (default, must be D+ + 1)
 #endif
-#define PIN_BUTTON              (7u)    // Reset button pin
+#ifndef PIN_USB_5V
 #define PIN_USB_5V              (18u)   // Power pin for USB host
+#endif
+#ifndef PIN_LED
 #define PIN_LED                 (13u)   // Status LED pin
+#endif
+#ifndef PIN_NEOPIXEL
 #define PIN_NEOPIXEL            (21u)   // Neopixel data pin
-#define NEOPIXEL_POWER          (20u)   // Neopixel power pin
+#endif
+#ifndef NEOPIXEL_POWER
+#define NEOPIXEL_POWER          (20u)   // Neopixel power pin (255 = not used/always on)
+#endif
+
+#define PIN_BUTTON              (7u)    // Reset button pin
 
 // UART configuration for KMBox serial communication with RP2350 Bridge
 // Physical connection (crossed wiring):

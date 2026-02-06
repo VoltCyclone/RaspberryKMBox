@@ -267,9 +267,12 @@ void neopixel_init(void)
     gpio_put(PIN_LED, 0);
 
     // Initialize neopixel power pin but keep it OFF during early boot
+    // NEOPIXEL_POWER = 255 means no separate power pin (always powered)
+    #if NEOPIXEL_POWER != 255
     gpio_init(NEOPIXEL_POWER);
     gpio_set_dir(NEOPIXEL_POWER, GPIO_OUT);
     gpio_put(NEOPIXEL_POWER, 0);  // Keep power OFF initially
+    #endif
 
     (void)0; // suppressed init log to avoid blocking hot paths
 }
@@ -280,8 +283,10 @@ void neopixel_enable_power(void)
         return;
     }
     
-    // Enable neopixel power
+    // Enable neopixel power (if separate power pin exists)
+    #if NEOPIXEL_POWER != 255
     gpio_put(NEOPIXEL_POWER, 1);
+    #endif
 
     // Allow power to stabilize
     sleep_ms(POWER_STABILIZATION_DELAY_MS);

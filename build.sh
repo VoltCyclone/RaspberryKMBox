@@ -24,9 +24,11 @@ usage() {
     echo "Targets:"
     echo "  pico      Build main KMBox for RP2040 (Pico)"
     echo "  pico2     Build main KMBox for RP2350 (Pico 2)"
+    echo "  metro     Build main KMBox for Adafruit Metro RP2350"
     echo "  bridge    Build UART bridge for adafruit RP2350"
     echo "  both      Build main KMBox for both RP2040 and RP2350"
-    echo "  all       Build and flash KMBox + Bridge (interactive)"
+    echo "  all       Build and flash KMBox + Bridge (Feather, interactive)"
+    echo "  flash-metros  Build and flash both Metros (KMBox + Bridge)"
     echo ""
     echo "Options:"
     echo "  clean     Clean build directories before building"
@@ -34,9 +36,11 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $0 pico              # Build for RP2040"
-    echo "  $0 pico2 flash       # Build and flash for RP2350"
+    echo "  $0 pico2 flash       # Build and flash for RP2350 (Pico 2)"
+    echo "  $0 metro flash       # Build and flash for Metro RP2350"
     echo "  $0 bridge            # Build UART bridge"
-    echo "  $0 all               # Build & flash KMBox + Bridge (guided)"
+    echo "  $0 all               # Build & flash KMBox + Bridge (Feather, guided)"
+    echo "  $0 flash-metros      # Build & flash both Metro RP2350s"
     echo "  $0 both clean        # Clean build both KMBox variants"
 }
 
@@ -48,11 +52,15 @@ build_kmbox() {
     
     case $target in
         pico)
-            board="pico"
+            board="adafruit_feather_rp2040_usb_host"
             platform="rp2040"
             ;;
         pico2)
             board="pico2"
+            platform="rp2350-arm-s"
+            ;;
+        metro)
+            board="adafruit_metro_rp2350"
             platform="rp2350-arm-s"
             ;;
         *)
@@ -62,7 +70,7 @@ build_kmbox() {
     esac
     
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}Building KMBox for $target ($platform)${NC}"
+    echo -e "${BLUE}Building KMBox for $target ($board / $platform)${NC}"
     echo -e "${BLUE}========================================${NC}"
     
     if [ "$CLEAN" = "1" ]; then
@@ -93,10 +101,27 @@ build_kmbox() {
 }
 
 build_bridge() {
-    local build_dir="$SCRIPT_DIR/bridge/build"
+    local target=${1:-feather}
+    local build_dir=""
+    local board=""
+    
+    case $target in
+        feather)
+            build_dir="$SCRIPT_DIR/bridge/build"
+            board="adafruit_feather_rp2350"
+            ;;
+        metro)
+            build_dir="$SCRIPT_DIR/bridge/build-metro"
+            board="adafruit_metro_rp2350"
+            ;;
+        *)
+            echo -e "${RED}Unknown bridge target: $target${NC}"
+            return 1
+            ;;
+    esac
     
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}Building UART Bridge for adafruit RP2350${NC}"
+    echo -e "${BLUE}Building UART Bridge for $board${NC}"
     echo -e "${BLUE}========================================${NC}"
     
     if [ "$CLEAN" = "1" ]; then
@@ -109,6 +134,7 @@ build_bridge() {
     
     echo "Configuring..."
     PICO_SDK_PATH="$PICO_SDK_PATH" cmake "$SCRIPT_DIR/bridge" \
+        -DPICO_BOARD="$board" \
         -DCMAKE_BUILD_TYPE=Release
     
     echo "Building..."
@@ -190,7 +216,7 @@ FLASH=0
 
 for arg in "$@"; do
     case $arg in
-        pico|pico2|bridge|both|all)
+        pico|pico2|metro|bridge|bridge-metro|both|all|dual-metro|flash-metros)
             TARGET="$arg"
             ;;
         clean)
@@ -230,16 +256,110 @@ case $TARGET in
     pico2)
         build_kmbox pico2
         if [ "$FLASH" = "1" ]; then
-            wait_for_device "KMBox (RP2350)"
-            flash_firmware "$SCRIPT_DIR/build-pico2/PIOKMbox.uf2" "KMBox (RP2350)"
+            wait_for_device "KMBox (RP2350 Pico 2)"
+            flash_firmware "$SCRIPT_DIR/build-pico2/PIOKMbox.uf2" "KMBox (RP2350 Pico 2)"
+        fi
+        ;;
+    metro)
+        build_kmbox metro
+        if [ "$FLASH" = "1" ]; then
+            wait_for_device "KMBox (Metro RP2350)"
+            flash_firmware "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" "KMBox (Metro RP2350)"
         fi
         ;;
     bridge)
-        build_bridge
+        build_bridge feather
         if [ "$FLASH" = "1" ]; then
-            wait_for_device "UART Bridge (adafruit RP2350)"
+            wait_for_device "UART Bridge (Feather RP2350)"
             flash_firmware "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" "UART Bridge"
         fi
+        ;;
+    bridge-metro)
+        build_bridge metro
+        if [ "$FLASH" = "1" ]; then
+            wait_for_device "UART Bridge (Metro RP2350)"
+            flash_firmware "$SCRIPT_DIR/bridge/build-metro/kmbox_bridge.uf2" "UART Bridge (Metro)"
+        fi
+        ;;
+    dual-metro)
+        # Build both Metro RP2350 firmwares: KMBox + Bridge
+        build_kmbox metro
+        build_bridge metro
+        if [ "$FLASH" = "1" ]; then
+            echo ""
+            echo -e "${YELLOW}Dual-Metro flash sequence:${NC}"
+            echo "  1) KMBox Metro (USB Host device)"
+            echo "  2) Bridge Metro (USB CDC + ILI9341 TFT)"
+            echo ""
+            
+            wait_for_device "KMBox (Metro RP2350)"
+            flash_firmware "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" "KMBox (Metro RP2350)"
+            
+            echo ""
+            echo -e "${GREEN}KMBox flashed! Now flashing bridge...${NC}"
+            echo ""
+            
+            wait_for_device "Bridge (Metro RP2350)"
+            flash_firmware "$SCRIPT_DIR/bridge/build-metro/kmbox_bridge.uf2" "Bridge (Metro RP2350)"
+            
+            echo ""
+            echo -e "${GREEN}========================================${NC}"
+            echo -e "${GREEN}Dual-Metro setup flashed successfully!${NC}"
+            echo -e "${GREEN}========================================${NC}"
+            echo ""
+            echo "Wiring (Metro KMBox <-> Metro Bridge):"
+            echo "  KMBox TX/GPIO0  ────► Bridge RX/GPIO1"
+            echo "  KMBox RX/GPIO1  ◄──── Bridge TX/GPIO0"
+            echo "  KMBox GND       ────  Bridge GND"
+            echo ""
+            echo "Note: Set the RX/TX switches on both Metros"
+            echo "      so that TX=GPIO0 and RX=GPIO1."
+            echo ""
+            echo "Test with: python bridge/bridge_client.py --test"
+            exit 0
+        fi
+        ;;
+    flash-metros)
+        # Build + flash both Metro RP2350s in guided sequence
+        echo -e "${CYAN}========================================${NC}"
+        echo -e "${CYAN}  Dual-Metro Build & Flash${NC}"
+        echo -e "${CYAN}========================================${NC}"
+        echo ""
+
+        build_kmbox metro
+        build_bridge metro
+
+        echo ""
+        echo -e "${YELLOW}Flash sequence:${NC}"
+        echo "  1) KMBox Metro  (USB Host device)"
+        echo "  2) Bridge Metro (USB CDC + ILI9341 TFT)"
+        echo ""
+
+        wait_for_device "KMBox (Metro RP2350)"
+        flash_firmware "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" "KMBox (Metro RP2350)"
+
+        echo ""
+        echo -e "${GREEN}✓ KMBox Metro flashed! Now flash the Bridge Metro...${NC}"
+        echo ""
+
+        wait_for_device "Bridge (Metro RP2350)"
+        flash_firmware "$SCRIPT_DIR/bridge/build-metro/kmbox_bridge.uf2" "Bridge (Metro RP2350)"
+
+        echo ""
+        echo -e "${GREEN}========================================${NC}"
+        echo -e "${GREEN}  Dual-Metro setup complete!${NC}"
+        echo -e "${GREEN}========================================${NC}"
+        echo ""
+        echo "Wiring (Metro KMBox <-> Metro Bridge):"
+        echo "  KMBox TX/GPIO0  ────► Bridge RX/GPIO1"
+        echo "  KMBox RX/GPIO1  ◄──── Bridge TX/GPIO0"
+        echo "  KMBox GND       ────  Bridge GND"
+        echo ""
+        echo "Note: Set the RX/TX switches on both Metros"
+        echo "      so that TX=GPIO0 and RX=GPIO1."
+        echo ""
+        echo "Test with: python bridge/bridge_client.py --test"
+        exit 0
         ;;
     both)
         build_kmbox pico
@@ -282,11 +402,11 @@ case $TARGET in
         echo -e "${GREEN}KMBox flashed! Now building bridge...${NC}"
         echo ""
         
-        # Build bridge
-        build_bridge
+        # Build bridge (Feather)
+        build_bridge feather
         
         # Wait and flash bridge
-        wait_for_device "UART Bridge (adafruit RP2350)"
+        wait_for_device "UART Bridge (Feather RP2350)"
         flash_firmware "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" "UART Bridge"
         
         echo ""
@@ -310,6 +430,8 @@ echo -e "${GREEN}Done!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo "Firmware locations:"
-[ -f "$SCRIPT_DIR/build-pico/PIOKMbox.uf2" ] && echo "  KMBox (RP2040):  build-pico/PIOKMbox.uf2"
-[ -f "$SCRIPT_DIR/build-pico2/PIOKMbox.uf2" ] && echo "  KMBox (RP2350):  build-pico2/PIOKMbox.uf2"
-[ -f "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" ] && echo "  UART Bridge:     bridge/build/kmbox_bridge.uf2"
+[ -f "$SCRIPT_DIR/build-pico/PIOKMbox.uf2" ] && echo "  KMBox (RP2040):            build-pico/PIOKMbox.uf2"
+[ -f "$SCRIPT_DIR/build-pico2/PIOKMbox.uf2" ] && echo "  KMBox (Pico 2):            build-pico2/PIOKMbox.uf2"
+[ -f "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" ] && echo "  KMBox (Metro RP2350):      build-metro/PIOKMbox.uf2"
+[ -f "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" ] && echo "  Bridge (Feather):          bridge/build/kmbox_bridge.uf2"
+[ -f "$SCRIPT_DIR/bridge/build-metro/kmbox_bridge.uf2" ] && echo "  Bridge (Metro RP2350):     bridge/build-metro/kmbox_bridge.uf2"

@@ -26,6 +26,18 @@
             "problemMatcher": "$gcc"
         },
         {
+            "label": "Build Metro RP2350",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["metro"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
             "label": "Build Both Targets",
             "type": "shell",
             "command": "./build.sh",
@@ -121,6 +133,24 @@
             }
         },
         {
+            "label": "Run Project (Metro RP2350)",
+            "type": "process",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
+            "args": [
+                "load",
+                "${workspaceFolder}/build-metro/PIOKMbox.uf2",
+                "-fx"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
+            }
+        },
+        {
             "label": "Flash (RP2040)",
             "type": "process",
             "command": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
@@ -171,6 +201,42 @@
             "problemMatcher": "$gcc"
         },
         {
+            "label": "Build Bridge (Metro RP2350)",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["bridge-metro"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Build Dual-Metro (KMBox + Bridge)",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["dual-metro"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Clean Build Dual-Metro",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["dual-metro", "clean"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
             "label": "Build All (KMBox + Bridge)",
             "type": "shell",
             "command": "./build.sh",
@@ -201,6 +267,24 @@
             "args": [
                 "load",
                 "${workspaceFolder}/bridge/build/kmbox_bridge.uf2",
+                "-fx"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
+            }
+        },
+        {
+            "label": "Run Bridge (Metro RP2350)",
+            "type": "process",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
+            "args": [
+                "load",
+                "${workspaceFolder}/bridge/build-metro/kmbox_bridge.uf2",
                 "-fx"
             ],
             "presentation": {
