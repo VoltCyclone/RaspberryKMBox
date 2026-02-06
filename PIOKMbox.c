@@ -11,6 +11,8 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
+#include "hardware/vreg.h"
+#include "hardware/adc.h"
 #include "pico/unique_id.h"
 
 #include "tusb.h"
@@ -27,6 +29,7 @@
 #if PIO_USB_AVAILABLE
 #include "pio_usb.h"
 #include "hardware/clocks.h"
+#include "hardware/pll.h"
 #include "pico/multicore.h"
 #include "tusb.h"
 #endif
@@ -140,14 +143,21 @@ static void core1_task_loop(void) {
     const uint32_t heartbeat_check_threshold = CORE1_HEARTBEAT_CHECK_LOOPS * 4; // 4x less frequent
     
     while (true) {
-        // CRITICAL: Pause during flash operations to prevent crash
+        // CRITICAL: Check flash flag FIRST before any other operations
         // This runs from RAM so it's safe even while flash is being written
-        while (g_flash_operation_in_progress) {
-            // Acknowledge that we've paused - Core0 waits for this before flash write
+        if (g_flash_operation_in_progress) {
+            // Acknowledge IMMEDIATELY that we've paused - Core0 waits for this
             g_core1_flash_acknowledged = true;
-            // Just spin - flash write is very fast (~5ms)
+            
+            // Spin until flash operation completes (~5-10ms)
             // DO NOT call any functions here that might be in flash
-            tight_loop_contents();
+            while (g_flash_operation_in_progress) {
+                tight_loop_contents();
+            }
+            
+            // Clear acknowledge flag after operation (helps Core0 detect completion)
+            // Note: Core0 also clears this, but belt-and-suspenders approach
+            g_core1_flash_acknowledged = false;
         }
         
         tuh_task();
@@ -169,6 +179,34 @@ static void core1_task_loop(void) {
 // System Initialization Functions
 //--------------------------------------------------------------------+
 
+/**
+ * Configure peripheral clock for stable UART operation at overclock speeds
+ * 
+ * MUST be called BEFORE uart_init() when running at 240MHz!
+ * Switches clk_peri from clk_sys (240MHz) to USB PLL (48MHz) for stability.
+ * 
+ * CRITICAL: Must be called AFTER set_sys_clock_khz() and BEFORE uart_init()!
+ */
+static void configure_stable_peri_clock(void) {
+    uint32_t sys_freq = clock_get_hz(clk_sys);
+    
+    printf("[UART] clk_sys = %lu Hz\n", sys_freq);
+    
+    // If overclocked (>133MHz), switch clk_peri to 48MHz USB PLL
+    if (sys_freq > 133000000) {
+        printf("[UART] Overclock detected! Switching clk_peri to 48MHz USB PLL\n");
+        
+        clock_configure(clk_peri,
+                        0,  // No glitchless mux for clk_peri
+                        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                        48000000,
+                        48000000);
+        
+        uint32_t peri_freq = clock_get_hz(clk_peri);
+        printf("[UART] clk_peri now = %lu Hz\n", peri_freq);
+    }
+}
+
 static bool initialize_system(void) {
     // Initialize stdio first for early debug output
     stdio_init_all();
@@ -176,9 +214,17 @@ static bool initialize_system(void) {
     // Add startup delay for cold boot stability
     sleep_ms(200);
     
+    // Overclock RP2040 to 240MHz, increase VREG voltage to 1.25V (max for RP2040)
+    vreg_set_voltage(VREG_VOLTAGE_1_25);
+    sleep_ms(10);  // Let voltage stabilize
+    
     if (!set_sys_clock_khz(CPU_FREQ, true)) {
         return false;
     }
+    
+    // CRITICAL: Configure stable peripheral clock BEFORE UART init
+    // This must happen before kmbox_serial_init() so uart_init() calculates correct divisor
+    configure_stable_peri_clock();
     
     // Re-initialize stdio after clock change with proper delay
     sleep_ms(100);  // Allow clock to stabilize
@@ -186,7 +232,12 @@ static bool initialize_system(void) {
     sleep_ms(100);  // Allow system to stabilize
     
     // Initialize KMBox serial handler on UART0 (via RP2350 USB Bridge)
+    // UART will now use the stable 48MHz peri clock for accurate 2 Mbaud
     kmbox_serial_init();
+    
+    // Initialize ADC for temperature sensor
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
     
     // Initialize smooth injection system for seamless mouse movement blending
     smooth_injection_init();
@@ -253,6 +304,9 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
         if (hold_duration < BUTTON_HOLD_TRIGGER_MS) {
             // Short press - cycle humanization mode
             humanization_mode_t new_mode = smooth_cycle_humanization_mode();
+            
+            // Send immediate notification to bridge
+            kmbox_send_info_to_bridge();
             
             // Show mode with LED flash
             uint32_t mode_color;
@@ -359,7 +413,7 @@ static void main_application_loop(void) {
         hid_device_task();
         
         // Sample time less frequently to reduce overhead
-        if (++loop_counter >= 32) {  // Sample every 32 loops
+        if (++loop_counter >= MAIN_LOOP_TIME_SAMPLE_INTERVAL) {
             current_time = to_ms_since_boot(get_absolute_time());
             loop_counter = 0;
             

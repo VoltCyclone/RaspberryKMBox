@@ -9,6 +9,28 @@
 #define DEFINES_H
 
 //--------------------------------------------------------------------+
+// Performance Tuning Options
+//--------------------------------------------------------------------+
+
+// Main loop time sampling frequency
+// Lower = more frequent time checks (more overhead, better responsiveness)
+// Higher = less frequent time checks (less overhead, slightly delayed task execution)
+// Valid values: 16, 32, 64, 128
+#ifndef MAIN_LOOP_TIME_SAMPLE_INTERVAL
+#define MAIN_LOOP_TIME_SAMPLE_INTERVAL  32
+#endif
+
+// Enable RP2350 DSP instructions for fixed-point math (RP2350/Cortex-M33 only)
+// Provides ~2x speedup for multiply-accumulate operations
+#ifndef ENABLE_DSP_FIXED_POINT
+#if defined(PICO_RP2350) && PICO_RP2350
+#define ENABLE_DSP_FIXED_POINT  1
+#else
+#define ENABLE_DSP_FIXED_POINT  0
+#endif
+#endif
+
+//--------------------------------------------------------------------+
 // HARDWARE CONFIGURATION
 //--------------------------------------------------------------------+
 #if PICO_PLATFORM == rp2040
@@ -37,14 +59,15 @@
 #define PIN_NEOPIXEL            (21u)   // Neopixel data pin
 #define NEOPIXEL_POWER          (20u)   // Neopixel power pin
 
-// UART configuration for KMBox serial input via RP2350 USB Bridge
-// Connected through Feather Click Shield mikroBUS socket 1 or direct UART
-// RP2350 provides USB CDC-to-UART bridge - external PC connects via USB to RP2350,
-// which converts to UART and connects to these pins on the Feather
-#define KMBOX_UART              uart0    // Use UART0 for KMBox (via Click Shield RX/TX pins)
-#define KMBOX_UART_TX_PIN       (0u)     // GPIO0 - Feather TX pin (to RP2350 bridge RX)
-#define KMBOX_UART_RX_PIN       (1u)     // GPIO1 - Feather RX pin (from RP2350 bridge TX)
-#define KMBOX_UART_BAUDRATE     2000000  // Baud rate (2 Mbps for ultra-fast injection)
+// UART configuration for KMBox serial communication with RP2350 Bridge
+// Physical connection (crossed wiring):
+// The RP2350 bridge provides USB CDC interface to PC and translates to/from KMBox
+#define BRIDGE_UART_TX_PIN      PICO_DEFAULT_UART_TX_PIN   
+#define BRIDGE_UART_RX_PIN      PICO_DEFAULT_UART_RX_PIN  
+#define KMBOX_UART              uart0    // UART0 instance
+#define KMBOX_UART_TX_PIN       PICO_DEFAULT_UART_TX_PIN    // UART0 TX (to Bridge RX)
+#define KMBOX_UART_RX_PIN       PICO_DEFAULT_UART_RX_PIN    // UART0 RX (from Bridge TX)
+#define KMBOX_UART_BAUDRATE     2000000  // Baud rate (must match bridge) - 2 Mbaud for max throughput
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
 //--------------------------------------------------------------------+
@@ -82,6 +105,7 @@
 #define FAST_CMD_SMOOTH_CLEAR   0x09    // Clear smooth injection queue
 #define FAST_CMD_TIMED_MOVE     0x0A    // Movement with timestamp for sync
 #define FAST_CMD_SYNC           0x0B    // Clock synchronization packet
+#define FAST_CMD_INFO           0x0C    // Request info (humanization, inject mode, etc)
 #define FAST_CMD_PING           0xFE    // Fast ping (response: 0xFF)
 #define FAST_CMD_RESPONSE       0xFF    // Response/ACK
 

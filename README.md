@@ -1,12 +1,16 @@
 # PIOKMbox — USB HID Passthrough & KMBox Serial Interface
 
-A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates a **transparent USB passthrough device** while providing **KMBox-compatible serial control** for mouse and keyboard automation.
+A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates a **transparent USB passthrough device** while providing **KMBox-compatible serial control** for mouse and keyboard automation. A TFT status display is supported as well.
+
+## Warning
+
+This build runs the bridge and usb proxy at *high* clock speeds. Keep an eye on the tft temperature gauges during use.
 
 ## What It Does
 
 **USB Passthrough**: Connects between your mouse/keyboard and PC, transparently forwarding all input while mirroring the connected device's identity (VID/PID, manufacturer, product name).
 
-**Serial Control**: Accepts KMBox-compatible commands over UART/USB to inject precise mouse movements, clicks, and keyboard input alongside your physical devices.
+**Serial Control**: Accepts KMBox, Macku binary, and ferrum-compatible commands over USB CDC to inject precise mouse movements, clicks, and keyboard input alongside your physical devices.
 
 **Advanced Features**: Humanized movement injection with anti-detection capabilities, smooth velocity matching, and optional RP2350 bridge support for computer vision applications.
 
@@ -18,33 +22,37 @@ A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates
 - **Movement Humanization**: Anti-detection algorithms with configurable modes
 - **Hardware Watchdog**: Automatic recovery from USB stack failures
 - **Visual Status**: RGB LED feedback for all operational states
-- **Minimal Wiring**: Just 2 wires for basic operation
 
 ## Hardware Requirements
 
-### Supported Boards
-- **Recommended**: Adafruit Feather RP2040 USB Host (has built-in USB-A port)
-- **Alternative**: Any RP2040/RP2350 board with USB host wiring
+### Target Hardware
 
-### Minimal Wiring (2 wires)
+**Primary Target**: Adafruit Feather RP2040 USB Host
+- Built-in USB-A host port eliminates external wiring
+- USB-C device port for PC connection
+- Onboard LED and WS2812 NeoPixel support
+- Standard Feather pinout for expansion
 
-For **Adafruit Feather RP2040 USB Host** - **no external wiring needed**:
-- USB-A port: Connect your mouse/keyboard  
-- USB-C port: Connect to your PC
+**Alternative Boards**:
+- Any RP2040 or RP2350 board with external USB host wiring
+- Minimum 264KB RAM required for dual USB stacks
 
-For **other RP2040 boards** - **2 wire USB host setup**:
-- GPIO 16 → USB D+ (green wire on most USB cables)
-- GPIO 17 → USB D- (white wire on most USB cables)  
-- +5V and GND → USB power and ground
+### Basic Wiring
 
-### Optional Components
-- **WS2812 NeoPixel** (GPIO 21): Visual status indicator
-- **Button** (GPIO 7): Mode switching and USB reset
-- **External UART**: Alternative to USB serial (GPIO 5/6 @ 115200)
+**Adafruit Feather RP2040 USB Host** (zero external wiring):
+- USB-A port → Mouse/keyboard
+- USB-C port → PC
+
+**Standard RP2040/RP2350 Boards** (USB host connection):
+- GPIO 16 → USB D+ 
+- GPIO 17 → USB D-
+- 5V → VBUS (red wire)
+- GND → Ground (black wire)
 
 ### Power Requirements
-- Standard USB power (5V, ~100-200mA typical)
-- No external power supply needed
+- USB bus powered (5V)
+- Typical consumption: 100-200mA
+- No external power supply required
 
 ## Quick Start
 
@@ -74,8 +82,7 @@ cd RaspberryKMBox
 ## Using KMBox Commands
 
 ### Serial Connection
-- **Baud Rate**: 115200, 8N1
-- **Interface**: USB CDC (appears as COM port) or external UART
+- **Interface**: USB CDC (appears as COM port, uart speeds are uncapped)
 - **Protocol**: KMBox-compatible text and binary commands
 
 ### Basic Commands
@@ -88,16 +95,9 @@ km.wheel(5)           # Scroll up
 km.lock_mx(1)         # Lock X axis
 ```
 
-### Fast Binary Protocol (Ultra-Low Latency)
-```python
-# 8-byte binary packet for <50µs latency
-packet = bytes([0x01, x_lo, x_hi, y_lo, y_hi, buttons, wheel, 0x00])
-serial.write(packet)
-```
-
 ## KMBox Compatibility
 
-**Fully Compatible** with KMBox B+, Net, Ferrum, and Macku devices:
+**Fully Compatible** with KMBox B+, Ferrum and Macku protocols
 
 ✅ **Mouse Control**: Movement, all buttons, scroll wheel  
 ✅ **Axis Locking**: X/Y movement and button masking  
@@ -106,20 +106,16 @@ serial.write(packet)
 ✅ **Smooth Injection**: Velocity matching and timing control  
 ✅ **Movement Humanization**: Anti-detection with Bezier easing
 
-**Compatible Devices**: Works with 95%+ of existing KMBox scripts and tools.
-
-**Performance**: 
-- Text commands: ~1-2ms latency, 100 cmd/s  
-- Binary protocol: <50µs latency, 2000 cmd/s
-
 ## Status Indicators
 
 ### LED Feedback  
+
 - **Fast blink**: Device connected/active
 - **Slow blink**: Device suspended or error
 - **Solid**: Normal operation
 
 ### NeoPixel Colors (if connected)
+
 - **Blue**: Starting up
 - **Green**: USB device only  
 - **Orange**: USB host only
@@ -131,6 +127,7 @@ serial.write(packet)
 - **Purple**: Suspended
 
 ### Humanization Mode Colors (button press)
+
 - **Red**: OFF (no humanization)
 - **Yellow**: LOW (minimal)  
 - **Green**: MEDIUM (default)
@@ -139,6 +136,7 @@ serial.write(packet)
 ## Controls
 
 ### Button (GPIO 7)
+
 - **Short press** (< 3 sec): Cycle humanization modes
 - **Long press** (≥ 3 sec): Reset USB stacks
 
@@ -167,25 +165,6 @@ This implementation provides **full KMBox compatibility** for the most commonly 
 ✅ Fast binary protocol for minimal latency  
 ✅ Smooth injection and advanced timing  
 
-Missing features are primarily:
-- Text-based keyboard commands (use binary protocol instead)
-- Advanced movement patterns (recoil, auto-movement)
-- Network-specific commands (not applicable)
-
-**For 95% of KMBox use cases, this is a complete replacement.**
-make -j4   # or: ninja
-```
-
-### Build outputs
-
-**Main KMBox firmware:**
-- `PIOKMbox.uf2` — UF2 firmware for drag-and-drop flashing
-- `PIOKMbox.elf` — ELF for debugging
-- `PIOKMbox.bin`, `PIOKMbox.hex` — alternative images
-
-**Bridge firmware:**
-- `bridge/build/kmbox_bridge.uf2` — RP2350 bridge firmware
-
 ### Flashing
 
 - Automatic (if picotool is installed): run `./build.sh`
@@ -201,11 +180,9 @@ Note: To target a different board, set `PICO_BOARD` via CMake cache or edit `CMa
 4. When VID/PID changes, the device disconnects and re-enumerates to reflect the new identity. String descriptors are mirrored when available.
 5. Physical HID input and KMBox serial commands are combined so scripted actions and real input can coexist (with axis locks and timing).
 
-Fallbacks: If no device is attached or descriptors aren’t available, defaults are used — VID:PID `0x9981:0x4001`, Manufacturer `"Hurricane"`, Product `"PIOKM Box"`, and a serial derived from the Pico’s unique ID.
 
 ## Using KMBox serial
 
-- Port: UART1 (GPIO 5/6), 115200 8N1 (or UART0 via RP2350 USB bridge @ 115200)
 - Capabilities: movement injection, button press/release, timed clicks, wheel, axis locks, monitor mode
 
 ### Basic Commands

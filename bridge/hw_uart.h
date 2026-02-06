@@ -22,7 +22,7 @@
 
 // DMA buffer sizes (must be power of 2 for ring buffer)
 #define HW_UART_TX_BUFFER_SIZE  256
-#define HW_UART_RX_BUFFER_SIZE  512
+#define HW_UART_RX_BUFFER_SIZE  PICO_STDIO_STACK_BUFFER_SIZE
 
 /**
  * Initialize hardware UART with DMA support
@@ -107,5 +107,12 @@ void hw_uart_tx_wait(void);
  * @param rx_overflows Number of RX buffer overflows
  */
 void hw_uart_get_stats(uint32_t *tx_bytes, uint32_t *rx_bytes, uint32_t *rx_overflows);
+
+/**
+ * Get UART RX IRQ count (debug)
+ * 
+ * @return Number of times RX IRQ handler was called
+ */
+
 
 #endif // HW_UART_H

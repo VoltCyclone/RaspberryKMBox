@@ -279,4 +279,25 @@ void smooth_load_humanization_mode(void);
  */
 void smooth_process_deferred_save(void);
 
+/**
+ * Get current maximum movement per frame setting
+ * 
+ * @return Maximum pixels per frame
+ */
+int16_t smooth_get_max_per_frame(void);
+
+/**
+ * Get current velocity matching state
+ * 
+ * @return True if velocity matching is enabled
+ */
+bool smooth_get_velocity_matching(void);
+
+/**
+ * Get current injection mode (for stats/display)
+ * 
+ * @return Last used injection mode
+ */
+inject_mode_t smooth_get_inject_mode(void);
+
 #endif // SMOOTH_INJECTION_H

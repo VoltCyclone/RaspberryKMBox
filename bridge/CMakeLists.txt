@@ -27,6 +27,7 @@ add_executable(kmbox_bridge
     core1_translator.c
     makcu_translator.c
     ferrum_translator.c
+    protocol_luts.c
     tft_display.c
     tft.c
     st7735.c
@@ -51,8 +52,14 @@ target_link_libraries(kmbox_bridge
     hardware_uart
     hardware_spi
     hardware_pwm
+    hardware_adc
     pico_multicore
     kmbox_commands
+)
+
+# Add custom TinyUSB configuration
+target_compile_definitions(kmbox_bridge PRIVATE
+    CFG_TUSB_CONFIG_FILE=\"tusb_config.h\"
 )
 
 # Enable USB CDC output (this is our PC interface)

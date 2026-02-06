@@ -4,15 +4,15 @@
  * This firmware runs on an Adafruit Feather RP2350 and provides:
  * - USB CDC interface for receiving RGB frames from PC
  * - Color-based target tracking with configurable parameters
- * - Hardware UART TX/RX for high-speed communication with RP2040 KMBox
+ * - Hardware UART0 for high-speed communication with RP2040 KMBox UART0
  * - NeoPixel and onboard LED status indicators
  * - High-precision latency tracking using freed PIO resources
  * 
  * Architecture:
- *   PC (capture tool) -> USB CDC -> RP2350 (this) -> HW UART -> RP2040 (KMBox)
+ *   PC (capture tool) -> USB CDC -> RP2350 (this) -> UART0 (crossed) -> RP2040 KMBox UART0
  * 
- * Note: TX/RX wires are crossed at hardware level, allowing direct
- * hardware UART usage instead of PIO-based pin swapping.
+ * Wiring: Bridge UART0 (GPIO27/28) <-> crossed <-> KMBox UART0 (GPIO11/12)
+ * This allows direct hardware UART usage instead of PIO-based pin swapping.
  */
 
 #include <stdio.h>
@@ -24,6 +24,8 @@
 #include "hardware/clocks.h"
 #include "hardware/uart.h"
 #include "hardware/dma.h"
+#include "hardware/vreg.h"
+#include "hardware/adc.h"
 #include "tusb.h"
 #include "ws2812.pio.h"
 
@@ -37,6 +39,7 @@
 #include "makcu_translator.h"
 #include "ferrum_protocol.h"
 #include "ferrum_translator.h"
+#include "protocol_luts.h"
 #include "core1_translator.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
 
@@ -130,6 +133,16 @@ static char attached_product[32] = "";
 static uint32_t last_info_request_ms = 0;
 #define INFO_REQUEST_INTERVAL_MS 5000  // Request device info every 5 seconds
 
+// Humanization settings from KMBox
+static uint8_t kmbox_humanization_mode = 0;
+static uint8_t kmbox_inject_mode = 1;  // Default SMOOTH
+static uint8_t kmbox_max_per_frame = 16;
+static bool kmbox_velocity_matching = true;
+static bool kmbox_humanization_valid = false;
+static uint32_t last_humanization_request_ms = 0;
+#define HUMANIZATION_REQUEST_INTERVAL_MS 2000  // Request humanization info every 2 seconds (was 3s)
+#define HUMANIZATION_INITIAL_DELAY_MS 100      // First request 100ms after connection
+
 // CDC receive state machine
 typedef enum {
     RX_STATE_IDLE,
@@ -172,7 +185,7 @@ static void ws2812_init(void) {
     ws2812_program_init(ws2812_pio, ws2812_sm, ws2812_offset, WS2812_PIN, 800000, false);
 }
 
-static inline void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
+void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
     // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
     uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
     pio_sm_put_blocking(ws2812_pio, ws2812_sm, grb << 8);
@@ -188,9 +201,32 @@ static uint32_t uart_rx_bytes_total = 0;
 static uint32_t uart_tx_bytes_total = 0;
 static uint32_t uart_rx_overflows = 0;
 
+// KMBox temperature (from 0x0C info packet)
+static float kmbox_temperature_c = 0.0f;
+
 // Sync stats from hw_uart module (called periodically)
 static void sync_uart_stats(void) {
     hw_uart_get_stats(&uart_tx_bytes_total, &uart_rx_bytes_total, &uart_rx_overflows);
+}
+
+// Read internal temperature sensor (RP2040/RP2350)
+// Returns temperature in Celsius
+static float read_temperature_c(void) {
+    // Select ADC input 4 (internal temperature sensor)
+    adc_select_input(4);
+    
+    // Read raw ADC value (12-bit)
+    uint16_t raw = adc_read();
+    
+    // Convert to voltage (ADC reference is 3.3V)
+    const float conversion_factor = 3.3f / (1 << 12);
+    float voltage = raw * conversion_factor;
+    
+    // Convert voltage to temperature (formula from RP2040 datasheet)
+    // T = 27 - (ADC_voltage - 0.706) / 0.001721
+    float temperature = 27.0f - (voltage - 0.706f) / 0.001721f;
+    
+    return temperature;
 }
 
 // Wrapper functions for compatibility with existing code
@@ -297,6 +333,37 @@ static void process_status_message(const char* msg, size_t len) {
         return;
     }
     
+    // Parse humanization info from KMBox: "KMBOX_INFO:hmode=2,imode=1,max=16,vel=1"
+    if (len >= 11 && strncmp(msg, "KMBOX_INFO:", 11) == 0) {
+        const char* data = msg + 11;
+        int hmode = -1, imode = -1, max = -1, vel = -1;
+        
+        // Simple key=value parser
+        const char* ptr = data;
+        while (*ptr) {
+            if (strncmp(ptr, "hmode=", 6) == 0) {
+                hmode = atoi(ptr + 6);
+            } else if (strncmp(ptr, "imode=", 6) == 0) {
+                imode = atoi(ptr + 6);
+            } else if (strncmp(ptr, "max=", 4) == 0) {
+                max = atoi(ptr + 4);
+            } else if (strncmp(ptr, "vel=", 4) == 0) {
+                vel = atoi(ptr + 4);
+            }
+            // Move to next comma or end
+            while (*ptr && *ptr != ',') ptr++;
+            if (*ptr == ',') ptr++;
+        }
+        
+        // Update values if valid
+        if (hmode >= 0) kmbox_humanization_mode = (uint8_t)hmode;
+        if (imode >= 0) kmbox_inject_mode = (uint8_t)imode;
+        if (max > 0) kmbox_max_per_frame = (uint8_t)max;
+        if (vel >= 0) kmbox_velocity_matching = (vel != 0);
+        kmbox_humanization_valid = true;
+        return;
+    }
+    
     // Forward ALL other status messages to CDC
     if (tud_cdc_connected()) {
         tud_cdc_write_str("[KMBox] ");
@@ -313,14 +380,16 @@ static void uart_rx_task(void) {
     static uint32_t binary_packet_start_time = 0;
     static uint32_t rx_debug_count = 0;
     
+    // Cache timestamp ONCE at start, not per-byte (saves ~50 cycles per byte)
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    
     // Batch process up to 64 bytes per call to avoid blocking too long
     uint8_t batch_count = 0;
     while (uart_rx_available() && batch_count < 64) {
-        uint32_t now = to_ms_since_boot(get_absolute_time());
         uint8_t c = uart_rx_getc();
         batch_count++;
         
-        // Update last RX time for EVERY byte received
+        // Update last RX time once per batch (moved outside loop)
         kmbox_last_rx_time = now;
         
         // Reset binary packet state if timeout (stuck packet)
@@ -329,12 +398,19 @@ static void uart_rx_task(void) {
             binary_idx = 0;
         }
         
-        // Check for start of binary response packet (0xFF or 0xFE from KMBox)
-        if (!in_binary_packet && (c == 0xFF || c == 0xFE)) {
+        // Check for start of binary response packet (0xFF, 0xFE, or 0x0C from KMBox)
+        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0C)) {
             in_binary_packet = true;
             binary_idx = 0;
             binary_packet[binary_idx++] = c;
             binary_packet_start_time = now;
+            
+            // Debug: log binary packet detection
+            static uint32_t last_binary_debug = 0;
+            if (now - last_binary_debug > 1000) {
+                printf("[Bridge RX] Binary packet start: 0x%02X\r\n", c);
+                last_binary_debug = now;
+            }
             continue;
         }
         
@@ -342,8 +418,9 @@ static void uart_rx_task(void) {
         if (in_binary_packet) {
             binary_packet[binary_idx++] = c;
             if (binary_idx >= 8) {
-                // Complete packet received - forward to PC and process
+                // Complete packet received
                 if (binary_packet[0] == 0xFF) {
+                    // Ping/response packet
                     kmbox_response_count++;
                     
                     // Forward response packet to PC over CDC
@@ -351,6 +428,21 @@ static void uart_rx_task(void) {
                         tud_cdc_write(binary_packet, 8);
                         tud_cdc_write_flush();
                     }
+                    
+                    if (kmbox_state != KMBOX_CONNECTED) {
+                        kmbox_state = KMBOX_CONNECTED;
+                    }
+                } else if (binary_packet[0] == 0x0C) {
+                    // Info response: [0x0C] [hmode] [imode] [max_per_frame] [vel_match] [temp_lo] [temp_hi] ...
+                    kmbox_humanization_mode = binary_packet[1];
+                    kmbox_inject_mode = binary_packet[2];
+                    kmbox_max_per_frame = binary_packet[3];
+                    kmbox_velocity_matching = binary_packet[4];
+                    kmbox_humanization_valid = true;  // Mark as valid when we receive data
+                    
+                    // Parse temperature (int16_t in 0.1°C units)
+                    int16_t temp_decideg = (int16_t)(binary_packet[5] | (binary_packet[6] << 8));
+                    kmbox_temperature_c = temp_decideg / 10.0f;
                     
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
@@ -450,6 +542,13 @@ static void kmbox_connection_task(void) {
         // Transition to connected if not already
         if (kmbox_state != KMBOX_CONNECTED) {
             kmbox_state = KMBOX_CONNECTED;
+            // Request info immediately on first connection (use offset to trigger soon)
+            last_info_request_ms = now - INFO_REQUEST_INTERVAL_MS;
+            last_humanization_request_ms = now - HUMANIZATION_REQUEST_INTERVAL_MS + HUMANIZATION_INITIAL_DELAY_MS;
+            
+            // Send initial info request right away (binary)
+            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(info_req, 8);
         }
     }
     
@@ -466,6 +565,22 @@ static void kmbox_connection_task(void) {
         if (now - last_info_request_ms >= INFO_REQUEST_INTERVAL_MS) {
             last_info_request_ms = now;
             request_kmbox_info();
+        }
+        
+        // Request humanization info periodically (for TFT display) - use binary
+        if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
+            last_humanization_request_ms = now;
+            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            bool sent = send_uart_packet(info_req, 8);
+            
+            // Debug: confirm we're sending the request
+            static uint32_t last_info_debug = 0;
+            if (now - last_info_debug > 5000) {
+                printf("[Bridge TX] Sending 0x0C: %02X %02X %02X %02X %02X %02X %02X %02X (sent=%d)\n",
+                       info_req[0], info_req[1], info_req[2], info_req[3],
+                       info_req[4], info_req[5], info_req[6], info_req[7], sent);
+                last_info_debug = now;
+            }
         }
         
         // Check for ping timeout (no response after sending ping)
@@ -486,6 +601,22 @@ static void kmbox_connection_task(void) {
                 send_kmbox_ping();
             }
         }
+        
+        // TEMP: Send 0x0C request even when disconnected to test UART RX
+        if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
+            last_humanization_request_ms = now;
+            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            bool sent = send_uart_packet(info_req, 8);
+            
+            // Debug: confirm we're sending the request
+            static uint32_t last_info_debug_disc = 0;
+            if (now - last_info_debug_disc > 5000) {
+                printf("[Bridge TX DISC] 0x0C: %02X %02X %02X %02X %02X %02X %02X %02X (sent=%d)\n",
+                       info_req[0], info_req[1], info_req[2], info_req[3],
+                       info_req[4], info_req[5], info_req[6], info_req[7], sent);
+                last_info_debug_disc = now;
+            }
+        }
     }
 }
 
@@ -499,7 +630,7 @@ static void uart_debug_task(void) {
         if (tud_cdc_connected()) {
             const char* state_str = (kmbox_state == KMBOX_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
             
-            char debug_msg[80];
+            char debug_msg[128];
             snprintf(debug_msg, sizeof(debug_msg), 
                      "[Bridge] %s | TX:%lu RX:%lu\r\n", 
                      state_str, uart_tx_bytes_total, uart_rx_bytes_total);
@@ -516,7 +647,8 @@ static void uart_debug_task(void) {
 // Send a simple text command to KMBox: "M<x>,<y>\n"
 static void send_text_mouse_move(int16_t dx, int16_t dy) {
     char cmd[24];
-    int len = snprintf(cmd, sizeof(cmd), "M%d,%d\n", dx, dy);
+    // Use fast LUT-based builder instead of snprintf (~10x faster)
+    size_t len = fast_build_move(cmd, dx, dy);
     
     // Non-blocking LED pulse using timestamp comparison
     static uint32_t led_off_time = 0;
@@ -573,57 +705,41 @@ static inline bool is_fast_cmd_byte(uint8_t b) {
     return (b >= 0x01 && b <= 0x0B && b != 0x0A) || b == 0xFE;
 }
 
-// Partial Makcu frame buffer for incomplete frames (#5)
-static uint8_t makcu_partial_buf[4 + MAKCU_MAX_PAYLOAD];  // Header + max payload
-static uint16_t makcu_partial_len = 0;
-
 // Text command buffer
 static char cmd_buffer[128];
 static uint8_t cmd_buffer_idx = 0;
 
+// Makcu frame reception state
+static uint8_t makcu_frame_buffer[260];  // Header + max payload
+static uint16_t makcu_frame_idx = 0;
+static uint16_t makcu_frame_expected = 0;
+typedef enum {
+    MAKCU_STATE_IDLE,
+    MAKCU_STATE_HEADER,
+    MAKCU_STATE_PAYLOAD
+} makcu_state_t;
+static makcu_state_t makcu_state = MAKCU_STATE_IDLE;
+
+// Ferrum line buffer (moved from file scope for better organization)
+// Note: ferrum_line and ferrum_idx already defined at file scope above
+
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
-    // km.move(x,y) - relative mouse movement  
+    // km.move(x,y) - relative mouse movement (convert to binary for efficiency)
     int x, y;
     if (kmbox_parse_move_command(cmd, &x, &y)) {
-        send_mouse_command(x, y, 0);
-        if (tud_cdc_connected()) {
-            tud_cdc_write_str(">>>\r\n");
-            // No flush - let USB send when ready (non-blocking)
-        }
+        // Send as binary packet for efficiency
+        uint8_t pkt[8] = {0x01, (uint8_t)(x & 0xFF), (uint8_t)((x >> 8) & 0xFF),
+                          (uint8_t)(y & 0xFF), (uint8_t)((y >> 8) & 0xFF), 0, 0, 0};
+        send_uart_packet(pkt, 8);
         return;
     }
     
-    // km.transform(scale_x, scale_y, enabled) - set mouse transform on KMBox
-    // scale: 256=1.0x, 0=block, -256=invert, 128=0.5x
-    int scale_x, scale_y, enabled;
-    if (sscanf(cmd, "km.transform(%d , %d , %d)", &scale_x, &scale_y, &enabled) == 3 ||
-        sscanf(cmd, "km.transform(%d,%d,%d)", &scale_x, &scale_y, &enabled) == 3) {
-        send_transform_command((int16_t)scale_x, (int16_t)scale_y, enabled != 0);
-        if (tud_cdc_connected()) {
-            tud_cdc_write_str(">>>\r\n");
-            tud_cdc_write_flush();
-        }
-        return;
-    }
-    
-    // km.transform() - query current transform (forward to KMBox)
-    if (strncmp(cmd, "km.transform()", 14) == 0) {
-        send_uart_packet((const uint8_t*)"km.transform()\n", 15);
-        // Don't add to uart_tx_bytes_total - hw_uart tracks internally
-        return;
-    }
-    
-    // km.click(btn) - mouse click
+    // km.click(btn) - mouse click (convert to binary)
     int btn;
     if (kmbox_parse_click_command(cmd, &btn)) {
-        // Send click packet to KMBox
-        uint8_t click_pkt[8] = {0x02, (uint8_t)btn, 1, 0, 0, 0, 0, 0};
-        send_uart_packet(click_pkt, 8);
-        if (tud_cdc_connected()) {
-            tud_cdc_write_str("OK\r\n");
-            tud_cdc_write_flush();
-        }
+        uint8_t pkt[8] = {0x02, (uint8_t)btn, 1, 0, 0, 0, 0, 0};
+        send_uart_packet(pkt, 8);
         return;
     }
     
@@ -638,7 +754,6 @@ static void handle_text_command(const char* cmd) {
     
     // ping - connection test
     if (strcmp(cmd, "ping") == 0) {
-        // Send ping to KMBox and respond
         send_kmbox_ping();
         if (tud_cdc_connected()) {
             char resp[64];
@@ -670,7 +785,17 @@ static void handle_text_command(const char* cmd) {
         return;
     }
     
-    // Unknown command
+    // Unknown command - forward km.* commands as text to KMBox
+    if (strncmp(cmd, "km.", 3) == 0) {
+        // Forward unknown km.* commands as text (for km.info() etc)
+        char fwd[256];
+        snprintf(fwd, sizeof(fwd), "%s\r\n", cmd);
+        hw_uart_puts(fwd);
+        // Don't send response - wait for KMBox to respond
+        return;
+    }
+    
+    // Other unknown commands
     if (tud_cdc_connected()) {
         tud_cdc_write_str("ERR: unknown command\r\n");
         tud_cdc_write_flush();
@@ -720,195 +845,172 @@ static void process_cdc_byte(uint8_t b) {
 }
 
 static void cdc_task(void) {
+    static uint8_t response_buffer[256];  // Batch responses
+    static uint16_t response_idx = 0;
+    static uint32_t last_flush_time = 0;
+    
     if (!tud_cdc_connected() || !tud_cdc_available()) {
         return;
     }
 
-    uint8_t buf[512];
+    uint8_t buf[2048];  // Match increased CFG_TUD_CDC_RX_BUFSIZE
     uint32_t count = tud_cdc_read(buf, sizeof(buf));
     
-    uint32_t i = 0;
-    
-    // Fix #5: Handle partial Makcu frames from previous call
-    if (makcu_partial_len > 0 && current_api_mode == API_MODE_MAKCU) {
-        // Continue building the partial frame
-        if (makcu_partial_len >= 4) {
-            // We have the header, need more payload
-            uint16_t payload_len = makcu_partial_buf[2] | (makcu_partial_buf[3] << 8);
-            uint16_t total_needed = 4 + payload_len;
-            uint16_t still_need = total_needed - makcu_partial_len;
-            
-            if (count >= still_need) {
-                // Complete the frame
-                memcpy(&makcu_partial_buf[makcu_partial_len], buf, still_need);
-                core1_queue_makcu_frame(makcu_partial_buf[1], &makcu_partial_buf[4], payload_len);
-                i = still_need;
-                makcu_partial_len = 0;
-            } else {
-                // Still not enough, buffer what we have
-                memcpy(&makcu_partial_buf[makcu_partial_len], buf, count);
-                makcu_partial_len += count;
-                return;  // Need more data
-            }
-        } else {
-            // Need more header bytes
-            uint16_t header_need = 4 - makcu_partial_len;
-            if (count >= header_need) {
-                memcpy(&makcu_partial_buf[makcu_partial_len], buf, header_need);
-                makcu_partial_len = 4;
-                i = header_need;
-                // Now check if we have the full payload too
-                uint16_t payload_len = makcu_partial_buf[2] | (makcu_partial_buf[3] << 8);
-                if (payload_len > MAKCU_MAX_PAYLOAD) {
-                    // Invalid frame, discard
-                    makcu_partial_len = 0;
-                } else if (count - i >= payload_len) {
-                    // Complete frame available
-                    memcpy(&makcu_partial_buf[4], &buf[i], payload_len);
-                    core1_queue_makcu_frame(makcu_partial_buf[1], &makcu_partial_buf[4], payload_len);
-                    i += payload_len;
-                    makcu_partial_len = 0;
-                } else {
-                    // Buffer partial payload
-                    memcpy(&makcu_partial_buf[4], &buf[i], count - i);
-                    makcu_partial_len = 4 + (count - i);
-                    return;  // Need more data
-                }
-            } else {
-                // Buffer partial header
-                memcpy(&makcu_partial_buf[makcu_partial_len], buf, count);
-                makcu_partial_len += count;
-                return;  // Need more data
-            }
-        }
+    // Early exit if no data
+    if (count == 0) {
+        return;
     }
     
-    while (i < count) {
+    // Fast-path: Check first byte for protocol hint (better branch prediction)
+    uint8_t first_byte = buf[0];
+    bool likely_makcu = (first_byte == MAKCU_FRAME_START);  // 0x50
+    bool likely_frame = (first_byte == FRAME_MAGIC_0);      // 'F'
+    
+    for (uint32_t i = 0; i < count; i++) {
         uint8_t b = buf[i];
         
-        // Protocol detection and routing based on API mode
-        if (current_api_mode == API_MODE_MAKCU && b == MAKCU_FRAME_START && rx_state == RX_STATE_IDLE) {
-            // Makcu binary frame - Parse header to get full frame
-            // Header: [0x50] [CMD] [LEN_LO] [LEN_HI] [PAYLOAD...]
-            if (i + 4 <= count) {
-                uint8_t cmd = buf[i + 1];
-                uint16_t payload_len = buf[i + 2] | (buf[i + 3] << 8);
+        // Check for Makcu frame start (0x50)
+        if (makcu_state == MAKCU_STATE_IDLE && b == MAKCU_FRAME_START) {
+            makcu_state = MAKCU_STATE_HEADER;
+            makcu_frame_idx = 0;
+            makcu_frame_buffer[makcu_frame_idx++] = b;
+            continue;
+        }
+        
+        // Handle Makcu frame reception
+        if (makcu_state != MAKCU_STATE_IDLE) {
+            makcu_frame_buffer[makcu_frame_idx++] = b;
+            
+            // Check if we have the complete header (4 bytes)
+            if (makcu_state == MAKCU_STATE_HEADER && makcu_frame_idx >= 4) {
+                makcu_frame_header_t* hdr = (makcu_frame_header_t*)makcu_frame_buffer;
+                makcu_frame_expected = sizeof(makcu_frame_header_t) + hdr->len;
                 
                 // Validate payload length
-                if (payload_len > MAKCU_MAX_PAYLOAD) {
-                    i++;  // Skip invalid start byte
+                if (hdr->len > 256) {
+                    // Invalid frame, reset
+                    makcu_state = MAKCU_STATE_IDLE;
+                    makcu_frame_idx = 0;
                     continue;
                 }
                 
-                // Check if full frame available
-                if (i + 4 + payload_len <= count) {
-                    // Queue complete frame to Core1 (just payload, Core1 knows the format)
-                    core1_queue_makcu_frame(cmd, &buf[i + 4], payload_len);
-                    i += 4 + payload_len;
-                    continue;
+                if (hdr->len > 0) {
+                    makcu_state = MAKCU_STATE_PAYLOAD;
                 } else {
-                    // Fix #5: Buffer incomplete frame instead of dropping remaining bytes
-                    uint16_t remaining = count - i;
-                    memcpy(makcu_partial_buf, &buf[i], remaining);
-                    makcu_partial_len = remaining;
-                    return;  // Process rest on next call
-                }
-            } else {
-                // Incomplete header - buffer it
-                uint16_t remaining = count - i;
-                memcpy(makcu_partial_buf, &buf[i], remaining);
-                makcu_partial_len = remaining;
-                return;  // Process rest on next call
-            }
-        }
-        
-        // Ferrum text protocol - line-based
-        if (current_api_mode == API_MODE_FERRUM) {
-            if (b == '\n' || b == '\r') {
-                if (ferrum_idx > 0) {
-                    ferrum_line[ferrum_idx] = '\0';
+                    // No payload, process immediately
+                    makcu_state = MAKCU_STATE_IDLE;
                     
-                    // Translate Ferrum command to bridge protocol
-                    ferrum_translated_t result;
-                    if (ferrum_translate_line(ferrum_line, ferrum_idx, &result) && result.length > 0) {
-                        // Debug: verify first byte is 0xBD
-                        static uint32_t pkt_count = 0;
-                        pkt_count++;
-                        if (pkt_count <= 5 && tud_cdc_connected()) {
-                            char dbg[64];
-                            snprintf(dbg, sizeof(dbg), "[DBG] PKT#%lu: [%02X %02X %02X %02X %02X %02X] len=%zu\r\n",
-                                     pkt_count, result.buffer[0], result.buffer[1], 
-                                     result.buffer[2], result.buffer[3],
-                                     result.buffer[4], result.buffer[5], result.length);
-                            tud_cdc_write_str(dbg);
-                            tud_cdc_write_flush();
+                    // Translate and forward
+                    translated_cmd_t translated;
+                    if (makcu_translate_command(hdr->cmd, NULL, 0, &translated) == TRANSLATE_OK) {
+                        if (translated.length > 0) {
+                            send_uart_packet(translated.buffer, translated.length);
                         }
-                        
-                        // Send translated bridge protocol packets
-                        send_uart_packet(result.buffer, result.length);
-                        // Don't add to uart_tx_bytes_total - hw_uart tracks internally
-                        
-                        if (result.needs_response && tud_cdc_connected()) {
-                            tud_cdc_write_str(FERRUM_RESPONSE);
-                            tud_cdc_write_flush();
-                            // Force immediate transmission by calling tud_task()
-                            tud_task();
-                            // Blink LED to show response sent
-                            gpio_put(LED_PIN, 1);
-                            sleep_us(100);
-                            gpio_put(LED_PIN, 0);
-                        }
-                    } else if (tud_cdc_connected()) {
-                        tud_cdc_write_str("ERR\r\n");
-                        tud_cdc_write_flush();
-                        tud_task();
                     }
                     
-                    ferrum_idx = 0;
+                    // Send response if needed (buffered)
+                    if (makcu_cmd_needs_response(hdr->cmd)) {
+                        uint8_t response[8];
+                        uint16_t resp_len = makcu_build_response(hdr->cmd, MAKCU_STATUS_OK, NULL, 0, response);
+                        if (tud_cdc_connected() && (response_idx + resp_len < sizeof(response_buffer))) {
+                            memcpy(&response_buffer[response_idx], response, resp_len);
+                            response_idx += resp_len;
+                        }
+                    }
+                    makcu_frame_idx = 0;
                 }
-            } else if (ferrum_idx < sizeof(ferrum_line) - 1) {
-                ferrum_line[ferrum_idx++] = b;
             }
-            i++;
-            continue;
-        }
-        
-        // KMBox native mode - fast binary commands
-        if (current_api_mode == API_MODE_KMBOX && is_fast_cmd_byte(b) && rx_state == RX_STATE_IDLE) {
-            if (i + KMBOX_PACKET_SIZE <= count) {
-                // Convert 8-byte KMBox command to bridge protocol
-                uint8_t bridge_packet[7];
-                size_t bridge_len = 0;
+            
+            // Check if we have the complete frame
+            if (makcu_state == MAKCU_STATE_PAYLOAD && makcu_frame_idx >= makcu_frame_expected) {
+                makcu_frame_header_t* hdr = (makcu_frame_header_t*)makcu_frame_buffer;
+                uint8_t* payload = makcu_frame_buffer + sizeof(makcu_frame_header_t);
                 
-                // Fast path: direct mouse move translation
-                if (b == 0x01) {  // FAST_CMD_MOUSE_MOVE
-                    int16_t x = buf[i+1] | (buf[i+2] << 8);
-                    int16_t y = buf[i+3] | (buf[i+4] << 8);
-                    // Ignore buttons and wheel for text protocol
-                    
-                    // Send simple text command
-                    send_text_mouse_move(x, y);
+                // Translate and forward
+                translated_cmd_t translated;
+                if (makcu_translate_command(hdr->cmd, payload, hdr->len, &translated) == TRANSLATE_OK) {
+                    if (translated.length > 0) {
+                        send_uart_packet(translated.buffer, translated.length);
+                    }
                 }
-                i += KMBOX_PACKET_SIZE;
-                continue;
-            } else {
-                break;  // Incomplete packet
+                
+                // Send response if needed (buffered)
+                if (makcu_cmd_needs_response(hdr->cmd)) {
+                    uint8_t response[8];
+                    uint16_t resp_len = makcu_build_response(hdr->cmd, MAKCU_STATUS_OK, NULL, 0, response);
+                    if (tud_cdc_connected() && (response_idx + resp_len < sizeof(response_buffer))) {
+                        memcpy(&response_buffer[response_idx], response, resp_len);
+                        response_idx += resp_len;
+                    }
+                }
+                
+                makcu_state = MAKCU_STATE_IDLE;
+                makcu_frame_idx = 0;
             }
-        }
-        
-        // Frame data (tracking frames)
-        if (rx_state != RX_STATE_IDLE || b == FRAME_MAGIC_0) {
-            process_cdc_byte(b);
-            i++;
             continue;
         }
         
+        // Handle Ferrum text commands (km.* format)
+        // Check if this is part of a km. command
+        if (ferrum_idx == 0 && b == 'k') {
+            ferrum_line[ferrum_idx++] = b;
+            continue;
+        }
+        if (ferrum_idx == 1 && b == 'm') {
+            ferrum_line[ferrum_idx++] = b;
+            continue;
+        }
+        if (ferrum_idx == 2 && b == '.') {
+            ferrum_line[ferrum_idx++] = b;
+            continue;
+        }
+        
+        // If we've started a km. command, continue collecting
+        if (ferrum_idx > 0) {
+            if (b == '\r' || b == '\n') {
+                // End of Ferrum command
+                ferrum_line[ferrum_idx] = '\0';
+                
+                ferrum_translated_t translated;
+                if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
+                    if (translated.length > 0) {
+                        send_uart_packet(translated.buffer, translated.length);
+                    }
+                    // Send Ferrum response (buffered)
+                    if (translated.needs_response && tud_cdc_connected()) {
+                        const char* resp = FERRUM_RESPONSE;
+                        size_t resp_len = strlen(resp);
+                        if (response_idx + resp_len < sizeof(response_buffer)) {
+                            memcpy(&response_buffer[response_idx], resp, resp_len);
+                            response_idx += resp_len;
+                        }
+                    }
+                } else {
+                    // Invalid Ferrum command, treat as regular text
+                    ferrum_line[ferrum_idx] = '\0';
+                    handle_text_command(ferrum_line);
+                }
+                
+                ferrum_idx = 0;
+                continue;
+            }
+            
+            // Continue collecting Ferrum command
+            if (ferrum_idx < sizeof(ferrum_line) - 1) {
+                ferrum_line[ferrum_idx++] = b;
+            } else {
+                // Buffer overflow, reset
+                ferrum_idx = 0;
+            }
+            continue;
+        }
+        
+        // Regular text command handling (for native KMBox commands)
         // Text commands (printable ASCII)
         if (b >= 0x20 && b <= 0x7E) {
             if (cmd_buffer_idx < sizeof(cmd_buffer) - 1) {
                 cmd_buffer[cmd_buffer_idx++] = b;
             }
-            i++;
             continue;
         }
         
@@ -919,11 +1021,22 @@ static void cdc_task(void) {
                 handle_text_command(cmd_buffer);
                 cmd_buffer_idx = 0;
             }
-            i++;
             continue;
         }
-        
-        i++;
+    }
+    
+    // Flush buffered responses if:
+    // 1. Buffer has data AND (buffer is >75% full OR 5ms has passed since last flush)
+    uint32_t now = time_us_32();
+    bool should_flush = (response_idx > 0) && 
+                       ((response_idx >= sizeof(response_buffer) * 3 / 4) || 
+                        ((now - last_flush_time) >= 5000));
+    
+    if (should_flush && tud_cdc_connected()) {
+        tud_cdc_write(response_buffer, response_idx);
+        tud_cdc_write_flush();
+        response_idx = 0;
+        last_flush_time = now;
     }
 }
 
@@ -1032,22 +1145,22 @@ static void tft_update_task(void) {
     // Sync UART stats from hw_uart module (single source of truth for byte counts)
     sync_uart_stats();
     
-    // Calculate UART rates (once per second)
+    // Move rate calculation to a separate 1Hz timer (removed ms delta calculation)
+    static uint32_t last_rate_calc_ms = 0;
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    uint32_t rate_delta_ms = now_ms - last_rate_calc_time_ms;
-    if (rate_delta_ms >= 1000) {
-        // Calculate bytes per second
+    if (now_ms - last_rate_calc_ms >= 1000) {
+        // Calculate bytes per second over exactly 1s window
         uint32_t tx_delta = uart_tx_bytes_total - last_tx_bytes_for_rate;
         uint32_t rx_delta = uart_rx_bytes_total - last_rx_bytes_for_rate;
-        uart_tx_rate_bps = (tx_delta * 1000) / rate_delta_ms;
-        uart_rx_rate_bps = (rx_delta * 1000) / rate_delta_ms;
+        uart_tx_rate_bps = tx_delta;  // Exactly bytes/sec
+        uart_rx_rate_bps = rx_delta;
         
         last_tx_bytes_for_rate = uart_tx_bytes_total;
         last_rx_bytes_for_rate = uart_rx_bytes_total;
-        last_rate_calc_time_ms = now_ms;
+        last_rate_calc_ms = now_ms;
     }
     
-    // Gather all statistics
+    // Gather all statistics (lightweight - no formatting here)
     tft_stats_t stats = {0};  // Zero-initialize all fields
     
     // Connection status
@@ -1060,6 +1173,7 @@ static void tft_update_task(void) {
     // Data rates
     stats.tx_bytes = uart_tx_bytes_total;
     stats.rx_bytes = uart_rx_bytes_total;
+    stats.rx_buffer_level = hw_uart_rx_count();  // Unread bytes in DMA buffer
     stats.tx_rate_bps = uart_tx_rate_bps;
     stats.rx_rate_bps = uart_rx_rate_bps;
     stats.uart_baud = UART_BAUD;  // From config.h
@@ -1067,21 +1181,30 @@ static void tft_update_task(void) {
     // Attached device info from KMBox
     stats.device_vid = attached_vid;
     stats.device_pid = attached_pid;
-    strncpy(stats.device_manufacturer, attached_manufacturer, sizeof(stats.device_manufacturer) - 1);
     strncpy(stats.device_product, attached_product, sizeof(stats.device_product) - 1);
+    
+    // Humanization settings from KMBox
+    stats.humanization_mode = kmbox_humanization_mode;
+    stats.humanization_valid = kmbox_humanization_valid;
     
     // Mouse activity
     stats.mouse_moves = tft_mouse_activity_count;
-    stats.mouse_clicks = injection_count;  // Repurpose for injection count
     
-    // Uptime (reuse now_ms from rate calculation)
+    // Uptime
     stats.uptime_sec = (now_ms - boot_time_ms) / 1000;
     
-    // CPU frequency
-    stats.cpu_freq_mhz = clock_get_hz(clk_sys) / 1000000;
+    // Temperature: read only every 500ms (ADC is slow), cache result
+    static uint32_t last_temp_read_ms = 0;
+    static float cached_temp = 0.0f;
+    if (now_ms - last_temp_read_ms >= 500) {
+        cached_temp = read_temperature_c();
+        last_temp_read_ms = now_ms;
+    }
+    stats.bridge_temperature_c = cached_temp;
+    stats.kmbox_temperature_c = kmbox_temperature_c;
     
-    // Call TFT update (internally rate-limited)
-    tft_update(&stats);
+    // Call TFT update (internally rate-limited to 100ms)
+    tft_display_update(&stats);
 }
 
 // ============================================================================
@@ -1089,6 +1212,11 @@ static void tft_update_task(void) {
 // ============================================================================
 
 int main(void) {
+    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.20V
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    sleep_ms(10);  // Let voltage stabilize
+    set_sys_clock_khz(240000, true);
+    
     stdio_init_all();
     sleep_ms(100);
     
@@ -1097,11 +1225,16 @@ int main(void) {
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0);
     
+    // Initialize ADC for temperature sensor
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
+    
     // Initialize peripherals (fast init only)
     ws2812_init();
     button_init();
     hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
     latency_tracker_init(); // Initialize latency tracking
+    protocol_luts_init();   // Initialize protocol translation LUTs
     
     // Initialize Core1 translator
     core1_translator_init();
@@ -1117,8 +1250,8 @@ int main(void) {
     tusb_init();
     
     // Now init TFT (has long delays, but USB is already initializing)
-    tft_init();             // Initialize TFT display (SPI1)
-    tft_show_splash();      // Show splash screen
+    tft_display_init();     // Initialize TFT display (SPI1)
+    tft_display_splash();   // Show splash screen
     
     // Initialize connection state
     uint32_t boot_time = to_ms_since_boot(get_absolute_time());
@@ -1168,13 +1301,14 @@ int main(void) {
         // Send startup message once CDC is connected
         if (tud_cdc_connected() && !startup_msg_sent) {
             sleep_ms(100);
-            printf("\n=== KMBox Bridge with Hardware UART ===\n");
+            printf("\n=== KMBox Bridge v2.1 FIFO-FIX ===\n");
             printf("Board: Adafruit Feather RP2350\n");
             printf("System clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
+            printf("Peripheral clock: %lu MHz\n", clock_get_hz(clk_peri) / 1000000);
             printf("Core1: Protocol translator active\n");
-            printf("UART: Hardware UART0 @ %d baud (DMA accelerated)\n", UART_BAUD);
-            printf("  TX: GPIO%d -> crossed wire -> KMBox RX\n", UART_TX_PIN);
-            printf("  RX: GPIO%d <- crossed wire <- KMBox TX\n", UART_RX_PIN);
+            printf("UART: Hardware UART0 @ %d baud (DMA RX+TX)\n", UART_BAUD);
+            printf("  TX: GPIO%d -> crossed wire -> KMBox UART0 RX\n", UART_TX_PIN);
+            printf("  RX: GPIO%d <- crossed wire <- KMBox UART0 TX\n", UART_RX_PIN);
             printf("PIO: Available for timing/WS2812 (freed from UART duty)\n");
             printf("Protocols: KMBox, Makcu, Ferrum (button to toggle)\n");
             printf("Waiting for KMBox connection...\n\n");

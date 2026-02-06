@@ -1,10 +1,11 @@
 /**
- * Makcu to Bridge Protocol Translator Implementation
+ * Makcu to KMBox Protocol Translator Implementation
+ * Translates Makcu binary protocol to KMBox text protocol
  */
 
 #include "makcu_translator.h"
 #include "makcu_protocol.h"
-#include "../lib/bridge-protocol/bridge_protocol.h"
+#include "protocol_luts.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -59,7 +60,7 @@ uint16_t makcu_build_response(
     }
 }
 
-// Helper: Convert Makcu button number to KMBox button mask
+// Helper: Convert Makcu button number to HID button mask
 static uint8_t makcu_button_to_mask(uint8_t button) {
     switch (button) {
         case 1: return 0x01;  // Left
@@ -97,11 +98,11 @@ translate_result_t makcu_translate_command(
             
             makcu_move_t* move = (makcu_move_t*)payload;
             
-            // Translate to bridge protocol MOUSE_MOVE (6 bytes vs 8)
-            out_cmd->length = bridge_build_mouse_move(out_cmd->buffer, move->dx, move->dy);
+            // Translate to KMBox text protocol: "M<x>,<y>\n"
+            out_cmd->length = fast_build_move((char*)out_cmd->buffer, move->dx, move->dy);
             out_cmd->result = TRANSLATE_OK;
             
-            // Note: Bezier segments/control points ignored for now
+            // Note: Bezier segments/control points ignored
             // KMBox does smoothing internally
             return TRANSLATE_OK;
         }
@@ -115,16 +116,19 @@ translate_result_t makcu_translate_command(
             
             makcu_mo_t* mo = (makcu_mo_t*)payload;
             
-            // Translate to bridge protocol MOUSE_MOVE_WHEEL (7 bytes vs 8+8=16)
-            out_cmd->length = bridge_build_mouse_move_wheel(out_cmd->buffer, mo->x, mo->y, mo->wheel);
+            // Translate movement and wheel
+            if (mo->x != 0 || mo->y != 0) {
+                out_cmd->length = fast_build_move((char*)out_cmd->buffer, mo->x, mo->y);
+                if (mo->wheel != 0) {
+                    // Append wheel command
+                    out_cmd->length += fast_build_wheel((char*)out_cmd->buffer + out_cmd->length, mo->wheel);
+                }
+            } else if (mo->wheel != 0) {
+                out_cmd->length = fast_build_wheel((char*)out_cmd->buffer, mo->wheel);
+            }
             
-            // Handle buttons separately if needed (button state changes)
-            // For now, just translate movement + wheel
-            // TODO: Add button state handling if buttons != 0
-            
+            // Note: Button state and pan/tilt not supported in simple text protocol
             out_cmd->result = TRANSLATE_OK;
-            
-            // Note: pan/tilt not supported in KMBox protocol
             return TRANSLATE_OK;
         }
         
@@ -151,12 +155,15 @@ translate_result_t makcu_translate_command(
                 case MAKCU_CMD_SIDE2_BUTTON: button_num = 5; break;
             }
             
-            // Translate to bridge protocol BUTTON_SET (4 bytes vs 8)
-            out_cmd->length = bridge_build_button_set(
-                out_cmd->buffer,
-                makcu_button_to_mask(button_num),
-                (state == 1) ? 1 : 0
-            );
+            uint8_t button_mask = makcu_button_to_mask(button_num);
+            if (!button_mask) {
+                out_cmd->result = TRANSLATE_INVALID;
+                return TRANSLATE_INVALID;
+            }
+            
+            // Translate to KMBox text protocol: "B<mask>\n"
+            // If pressing, set the mask; if releasing, clear it (send 0)
+            out_cmd->length = fast_build_button((char*)out_cmd->buffer, (state == 1) ? button_mask : 0);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -169,17 +176,16 @@ translate_result_t makcu_translate_command(
             }
             
             makcu_click_t* click = (makcu_click_t*)payload;
+            uint8_t button_mask = makcu_button_to_mask(click->button);
+            if (!button_mask) {
+                out_cmd->result = TRANSLATE_INVALID;
+                return TRANSLATE_INVALID;
+            }
             
-            // Translate to KMBox FAST_CMD_MOUSE_CLICK (0x02)
-            out_cmd->buffer[0] = 0x02;  // FAST_CMD_MOUSE_CLICK
-            out_cmd->buffer[1] = makcu_button_to_mask(click->button);
-            out_cmd->buffer[2] = click->count;
-            out_cmd->buffer[3] = click->delay_ms;
-            out_cmd->buffer[4] = 0;
-            out_cmd->buffer[5] = 0;
-            out_cmd->buffer[6] = 0;
-            out_cmd->buffer[7] = 0;
-            out_cmd->length = 8;
+            // Translate to KMBox click command: press then release
+            // Since KMBox doesn't have direct click with count, we'll do a single click
+            out_cmd->length = fast_build_button((char*)out_cmd->buffer, button_mask);
+            out_cmd->length += fast_build_button((char*)out_cmd->buffer + out_cmd->length, 0);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -193,91 +199,21 @@ translate_result_t makcu_translate_command(
             
             int8_t delta = (int8_t)payload[0];
             
-            // Translate to bridge protocol MOUSE_WHEEL (3 bytes vs 8)
-            out_cmd->length = bridge_build_mouse_wheel(out_cmd->buffer, delta);
+            // Translate to KMBox text protocol: "W<delta>\n"
+            out_cmd->length = fast_build_wheel((char*)out_cmd->buffer, delta);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
         
         // ===== KEYBOARD COMMANDS =====
+        // KMBox is mouse-only, keyboard commands not supported
         
-        case MAKCU_CMD_KB_DOWN: {
-            // Key down (0xA2): [key:u8]
-            if (payload_len < 1) {
-                out_cmd->result = TRANSLATE_INVALID;
-                return TRANSLATE_INVALID;
-            }
-            
-            uint8_t key = payload[0];
-            
-            // Translate to KMBox FAST_CMD_KEY_DOWN (0x04)
-            out_cmd->buffer[0] = 0x04;  // FAST_CMD_KEY_DOWN
-            out_cmd->buffer[1] = key;
-            out_cmd->buffer[2] = 0;
-            out_cmd->buffer[3] = 0;
-            out_cmd->buffer[4] = 0;
-            out_cmd->buffer[5] = 0;
-            out_cmd->buffer[6] = 0;
-            out_cmd->buffer[7] = 0;
-            out_cmd->length = 8;
-            out_cmd->result = TRANSLATE_OK;
-            return TRANSLATE_OK;
-        }
-        
-        case MAKCU_CMD_KB_UP: {
-            // Key up (0xAA): [key:u8]
-            if (payload_len < 1) {
-                out_cmd->result = TRANSLATE_INVALID;
-                return TRANSLATE_INVALID;
-            }
-            
-            uint8_t key = payload[0];
-            
-            // Translate to KMBox FAST_CMD_KEY_UP (0x05)
-            out_cmd->buffer[0] = 0x05;  // FAST_CMD_KEY_UP
-            out_cmd->buffer[1] = key;
-            out_cmd->buffer[2] = 0;
-            out_cmd->buffer[3] = 0;
-            out_cmd->buffer[4] = 0;
-            out_cmd->buffer[5] = 0;
-            out_cmd->buffer[6] = 0;
-            out_cmd->buffer[7] = 0;
-            out_cmd->length = 8;
-            out_cmd->result = TRANSLATE_OK;
-            return TRANSLATE_OK;
-        }
-        
-        case MAKCU_CMD_KB_PRESS: {
-            // Key press (0xA7): [key:u8, hold_ms:u8, rand_ms:u8]
-            if (payload_len < 1) {
-                out_cmd->result = TRANSLATE_INVALID;
-                return TRANSLATE_INVALID;
-            }
-            
-            makcu_kb_press_t* press = (makcu_kb_press_t*)payload;
-            
-            // Translate to KMBox FAST_CMD_KEY_PRESS (0x06)
-            out_cmd->buffer[0] = 0x06;  // FAST_CMD_KEY_PRESS
-            out_cmd->buffer[1] = press->key;
-            out_cmd->buffer[2] = (payload_len >= 2) ? press->hold_ms : 50;  // default 50ms
-            out_cmd->buffer[3] = (payload_len >= 3) ? press->rand_ms : 0;
-            out_cmd->buffer[4] = 0;
-            out_cmd->buffer[5] = 0;
-            out_cmd->buffer[6] = 0;
-            out_cmd->buffer[7] = 0;
-            out_cmd->length = 8;
-            out_cmd->result = TRANSLATE_OK;
-            return TRANSLATE_OK;
-        }
-        
-        case MAKCU_CMD_KB_STRING: {
-            // Type string (0xA9): [text:u8×N]
-            // KMBox doesn't have a direct string command, would need to send
-            // individual key presses. For now, mark as unsupported.
-            // Could implement by converting to series of key press commands
+        case MAKCU_CMD_KB_DOWN:
+        case MAKCU_CMD_KB_UP:
+        case MAKCU_CMD_KB_PRESS:
+        case MAKCU_CMD_KB_STRING:
             out_cmd->result = TRANSLATE_UNSUPPORTED;
             return TRANSLATE_UNSUPPORTED;
-        }
         
         // ===== UNSUPPORTED COMMANDS =====
         
@@ -308,11 +244,17 @@ translate_result_t makcu_translate_command(
         
         // ===== MISC COMMANDS =====
         
+        case MAKCU_CMD_VERSION:
+            // Return bridge version
+            out_cmd->length = snprintf((char*)out_cmd->buffer, sizeof(out_cmd->buffer),
+                                      "kmbox_bridge v1.0\n");
+            out_cmd->result = TRANSLATE_OK;
+            return TRANSLATE_OK;
+        
         case MAKCU_CMD_SCREEN:
         case MAKCU_CMD_BAUD:
         case MAKCU_CMD_ECHO:
         case MAKCU_CMD_LED:
-        case MAKCU_CMD_VERSION:
         case MAKCU_CMD_INFO:
         case MAKCU_CMD_REBOOT:
         case MAKCU_CMD_DEVICE:

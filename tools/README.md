@@ -1,9 +1,55 @@
-# Mouse Counteraction Tool
+# KMBox Testing Tools
+
+## Mouse Counteraction Tool
 
 A C application that connects to a KMBox device and sends opposite mouse movements to counteract any detected movement, effectively locking the cursor in place.
 
+## KMBox Stress Test (NEW!)
+
+A Python script that tests humanization and compatibility with real-world KMBox usage patterns. Based on actual implementations from:
+- OceanTw/KMNet.java (rapid movements)
+- uve192/KMBox.NET (interpolated/Bezier)
+- ZCban/kmboxNET (10,000+ iteration tests)
+
+### Quick Start
+
+```bash
+# Run the stress test
+python3 kmbox_stress_test.py /dev/tty.usbmodem2101
+
+# Or make it executable
+chmod +x kmbox_stress_test.py
+./kmbox_stress_test.py /dev/tty.usbmodem2101
+```
+
+### Test Suite
+
+1. **Rapid Small Movements**: 10,000 iterations of ±10px (most common pattern)
+2. **Horizontal Sweep**: Smooth left-right sweeps
+3. **Small Precise Movements**: 1-5px movements (humanization focus)
+4. **Large Fast Flicks**: 100-300px movements (minimal jitter)
+5. **Circular Motion**: Smooth curves
+6. **Mixed Pattern**: Real-world simulation
+7. **Report Rate Verification**: Confirms no double HID reports
+
+### What to Look For
+
+- **Small movements**: Light jitter is GOOD (looks human)
+- **Large movements**: Minimal jitter is GOOD (feels snappy)
+- **Report rate**: Should stay the SAME when synthetic active
+- **No glitches**: Smooth motion, no accumulated drift
+
+See [HUMANIZATION.md](../HUMANIZATION.md) for detailed strategy documentation.
+
+---
+
+## Mouse Counteraction Tool
+
+A C application that connects to a KMBox device and sends opposite mouse movements to counteract any detected movement, effectively locking the cursor in place. **Now includes comprehensive test modes based on real KMBox usage patterns!**
+
 ## Features
 
+- **Built-in test modes**: Stress tests matching real KMBox SDK patterns
 - **Real-time counteraction**: Instantly sends opposite movements to cancel mouse motion
 - **Configurable gain**: Adjust counteraction strength (0.0 - 2.0x)
 - **Deadzone filtering**: Ignore small movements to reduce jitter
@@ -11,25 +57,71 @@ A C application that connects to a KMBox device and sends opposite mouse movemen
 - **Statistics tracking**: Monitor movements detected, countered, and throughput
 - **Verbose logging**: Optional detailed movement logging for debugging
 
+## Test Modes
+
+Run built-in stress tests based on real KMBox patterns:
+
+```bash
+# Quick test - rapid movements (most common pattern)
+./mouse_counteract -t rapid /dev/tty.usbmodem2101
+
+# Run all tests
+./mouse_counteract -t all /dev/tty.usbmodem2101
+
+# Individual tests
+./mouse_counteract -t precise /dev/tty.usbmodem2101  # Small movements
+./mouse_counteract -t flicks /dev/tty.usbmodem2101   # Large flicks
+./mouse_counteract -t sweep /dev/tty.usbmodem2101    # Smooth tracking
+./mouse_counteract -t mixed /dev/tty.usbmodem2101    # Real-world mix
+```
+
+**Available Test Modes:**
+- `rapid` - 10,000 rapid ±10px movements (validates high-speed processing)
+- `precise` - Small 1-5px movements (humanization visibility test)
+- `flicks` - Large 100-300px flicks (minimal jitter test)
+- `sweep` - Smooth horizontal tracking (continuous movement)
+- `mixed` - Real-world combined pattern (aiming simulation)
+- `all` - Run all tests sequentially
+
+**What to Look For:**
+- Small movements: Light jitter is GOOD (looks human)
+- Large movements: Minimal jitter is GOOD (feels snappy)
+- Rapid test: Should achieve >500 commands/sec
+
 ## Building
 
 ### Prerequisites
 
-- GCC or compatible C compiler
-- Make (optional, can compile directly)
+- macOS: Clang with CoreGraphics and ApplicationServices frameworks
+- Linux: GCC with X11 development libraries
+- Windows: MinGW or Visual Studio
 
 ### Compile
 
 ```bash
-# Using Make
+# macOS
 cd tools
-make
+clang -o mouse_counteract mouse_counteract.c \
+      -framework CoreGraphics -framework ApplicationServices
 
-# Or compile directly
-gcc -Wall -O2 -o mouse_counteract mouse_counteract.c
+# Linux
+gcc -Wall -O2 -o mouse_counteract mouse_counteract.c -lX11
+
+# Windows (MinGW)
+gcc -Wall -O2 -o mouse_counteract.exe mouse_counteract.c
 ```
 
 ## Usage
+
+### Test Mode (Recommended for validation)
+
+```bash
+# Run rapid movement test (most common KMBox pattern)
+./mouse_counteract -t rapid /dev/tty.usbmodem2101
+
+# Run all tests
+./mouse_counteract -t all /dev/tty.usbmodem2101
+```
 
 ### Basic Usage
 
@@ -47,10 +139,12 @@ gcc -Wall -O2 -o mouse_counteract mouse_counteract.c
 ### Options
 
 ```
--b, --baud RATE      Serial baud rate (default: 115200)
+-b, --baud RATE      Serial baud rate (default: 921600)
 -g, --gain FLOAT     Counteraction gain 0.0-2.0 (default: 1.0)
 -d, --deadzone PX    Ignore movements below threshold pixels (default: 0)
+-t, --test MODE      Run test mode: rapid, precise, flicks, sweep, mixed, all
 -v, --verbose        Enable verbose logging
+-p, --paused         Start in paused mode
 -h, --help           Show help message
 ```
 

@@ -444,7 +444,15 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
         return false;
     }
 
-    // Fast path: skip ready check for maximum performance
+    // CRITICAL FIX: Check readiness before attempting to send
+    // If endpoint is busy, return true anyway to avoid blocking the HID report pipeline
+    // The keyboard state will be sent with the next available opportunity
+    if (!tud_hid_ready())
+    {
+        return true;  // Endpoint busy, continue processing without blocking
+    }
+
+    // Fast path: send report immediately if endpoint is ready
     bool success = tud_hid_report(REPORT_ID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
     if (success)
     {
@@ -460,12 +468,6 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
 static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_report_t *report)
 {
     if (report == NULL)
-    {
-        return false;
-    }
-
-    // Check if USB device is ready to send reports
-    if (!tud_mounted() || !tud_ready())
     {
         return false;
     }
@@ -518,13 +520,19 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
     int8_t final_y = y;
     int8_t final_wheel = wheel;
 
-    // Check if HID interface is ready
+    // CRITICAL FIX: Always try to send reports even if endpoint wasn't ready last check
+    // Check readiness right before send to minimize latency
+    // If not ready, return true anyway to avoid blocking the HID report pipeline
+    // The movement/button state is already accumulated in kmbox buffers and will be
+    // sent with the next report when endpoint becomes ready
     if (!tud_hid_ready())
     {
-        return false;
+        // Endpoint busy - movement is already queued in kmbox accumulators
+        // Return true to continue processing incoming reports without blocking
+        return true;
     }
 
-    // Fast path: skip ready check for maximum performance
+    // Send the report
     bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons_to_send, final_x, final_y, final_wheel, pan);
     return success;
 }
@@ -559,7 +567,7 @@ void __not_in_flash_func(process_mouse_report)(const hid_mouse_report_t *report)
     static uint32_t activity_counter = 0;
     if (++activity_counter % MOUSE_ACTIVITY_THROTTLE == 0)
     {
-        neopixel_trigger_activity_flash_color(COLOR_MOUSE_ACTIVITY);
+        neopixel_trigger_activity_flash_color(0x000000FF); // Blue for mouse activity
     }
 
     // Fast forward the report
@@ -568,11 +576,12 @@ void __not_in_flash_func(process_mouse_report)(const hid_mouse_report_t *report)
         // Report processed successfully  
     }
 
+    // TEMPORARILY DISABLED: Rainbow effect for debugging UART
     // If the report contains movement, advance the rainbow hue based on movement
-    if (report->x != 0 || report->y != 0)
-    {
-        neopixel_rainbow_on_movement(report->x, report->y);
-    }
+    // if (report->x != 0 || report->y != 0)
+    // {
+    //     neopixel_rainbow_on_movement(report->x, report->y);
+    // }
 }
 
 bool find_key_in_report(const hid_keyboard_report_t *report, uint8_t keycode)
@@ -621,14 +630,34 @@ void hid_device_task(void)
 
     // CRITICAL FIX: Always check for pending bridge movements and flush them
     // This ensures bridge commands work even when physical mouse is connected but idle
+    // BUT: Don't send standalone smooth injection reports when physical mouse is connected
+    // (smooth injections piggyback on physical reports to avoid doubling report count)
     if (kmbox_has_pending_movement() && tud_hid_ready())
     {
-        // Flush any pending bridge movements by sending a mouse report
-        uint8_t buttons;
-        int8_t x, y, wheel, pan;
-        kmbox_get_mouse_report(&buttons, &x, &y, &wheel, &pan);
-        tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
-        return;  // One report per task call to avoid overwhelming USB
+        // Only send standalone reports if no physical mouse is connected
+        // Otherwise, smooth injections will blend with physical mouse reports
+        if (!connection_state.mouse_connected)
+        {
+            // Flush any pending bridge movements by sending a mouse report
+            uint8_t buttons;
+            int8_t x, y, wheel, pan;
+            kmbox_get_mouse_report(&buttons, &x, &y, &wheel, &pan);
+            
+            // Process smooth injection queue for standalone injection
+            int8_t smooth_x = 0, smooth_y = 0;
+            if (smooth_has_pending())
+            {
+                smooth_process_frame(&smooth_x, &smooth_y);
+                // Add smooth injection to the kmbox movement
+                int16_t total_x = (int16_t)x + (int16_t)smooth_x;
+                int16_t total_y = (int16_t)y + (int16_t)smooth_y;
+                x = (total_x > 127) ? 127 : ((total_x < -128) ? -128 : (int8_t)total_x);
+                y = (total_y > 127) ? 127 : ((total_y < -128) ? -128 : (int8_t)total_y);
+            }
+            
+            tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
+            return;  // One report per task call to avoid overwhelming USB
+        }
     }
 
     // Only send reports when devices are not connected
