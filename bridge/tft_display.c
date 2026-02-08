@@ -61,7 +61,8 @@ extern void picotft_init(void);
 #define COL_RED             0xE0
 #define COL_CYAN            0x1F
 #define COL_GRAY            0x92
-#define COL_DARK            0x49
+#define COL_DARK            0x6D
+#define COL_DIM_LINE        0x49
 
 // ============================================================================
 // State
@@ -264,7 +265,7 @@ static void draw_stats(const tft_stats_t *stats) {
     // === HEADER ===
     tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "KMBox Bridge");
     y += LINE_H + SEP_GAP;
-    hline(y, COL_DARK);
+    hline(y, COL_DIM_LINE);
     y += SEP_GAP + 2;
     
     // === ROW 1: CDC / KM / Humanization ===
@@ -293,9 +294,9 @@ static void draw_stats(const tft_stats_t *stats) {
 #endif
     
     // === ROW 2: Baud + Uptime ===
-    tft_draw_string(MARGIN, y, COL_DARK, fmt_baud);
+    tft_draw_string(MARGIN, y, COL_GREEN, fmt_baud);
     int uptime_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_uptime) * FONT_W;
-    tft_draw_string(uptime_x, y, COL_DARK, fmt_uptime);
+    tft_draw_string(uptime_x, y, COL_CYAN, fmt_uptime);
     y += LINE_H;
     
     // === ROW 2b: CPU + Command Rate ===
@@ -309,11 +310,12 @@ static void draw_stats(const tft_stats_t *stats) {
     
     // === ROW 3: TX ===
     bool tx_active = (stats->tx_bytes != last_tx_bytes);
+    uint8_t tx_val_col = tx_active ? COL_GREEN : (stats->tx_rate_bps == 0 ? COL_RED : COL_WHITE);
     tft_draw_string(MARGIN, y, COL_GRAY, "TX");
-    tft_draw_string(MARGIN + 24, y, tx_active ? COL_CYAN : COL_WHITE, fmt_tx_rate);
+    tft_draw_string(MARGIN + 24, y, tx_val_col, fmt_tx_rate);
     if (fmt_tx_peak[0]) {
         int peak_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_tx_peak) * FONT_W;
-        tft_draw_string(peak_x, y, COL_DARK, fmt_tx_peak);
+        tft_draw_string(peak_x, y, COL_GRAY, fmt_tx_peak);
     } else if (tx_active) {
         tft_draw_string(TFT_WIDTH - MARGIN - 8, y, COL_GREEN, "^");
     }
@@ -321,22 +323,24 @@ static void draw_stats(const tft_stats_t *stats) {
     
     // === ROW 4: RX ===
     bool rx_active = (stats->rx_bytes != last_rx_bytes);
+    uint8_t rx_val_col = rx_active ? COL_GREEN : (stats->rx_rate_bps == 0 ? COL_RED : COL_WHITE);
     tft_draw_string(MARGIN, y, COL_GRAY, "RX");
-    tft_draw_string(MARGIN + 24, y, rx_active ? COL_CYAN : COL_WHITE, fmt_rx_rate);
+    tft_draw_string(MARGIN + 24, y, rx_val_col, fmt_rx_rate);
     if (fmt_rx_buf[0]) {
         int buf_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_rx_buf) * FONT_W;
         tft_draw_string(buf_x, y, COL_YELLOW, fmt_rx_buf);
     } else if (fmt_rx_peak[0]) {
         int peak_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_rx_peak) * FONT_W;
-        tft_draw_string(peak_x, y, COL_DARK, fmt_rx_peak);
+        tft_draw_string(peak_x, y, COL_GRAY, fmt_rx_peak);
     } else if (rx_active) {
         tft_draw_string(TFT_WIDTH - MARGIN - 8, y, COL_GREEN, "v");
     }
     y += LINE_H;
     
     // === ROW 5: Mouse + Buttons ===
+    uint8_t mv_col = (stats->mouse_moves > 0) ? COL_WHITE : COL_RED;
     tft_draw_string(MARGIN, y, COL_GRAY, "Mv");
-    tft_draw_string(MARGIN + 24, y, COL_WHITE, fmt_moves);
+    tft_draw_string(MARGIN + 24, y, mv_col, fmt_moves);
     if (fmt_buttons[0]) {
         int btn_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_buttons) * FONT_W;
         tft_draw_string(btn_x, y, COL_YELLOW, fmt_buttons);
@@ -353,7 +357,7 @@ static void draw_stats(const tft_stats_t *stats) {
     
     // === LATENCY STATS ===
     if (fmt_lat_avg[0]) {
-        hline(y, COL_DARK);
+        hline(y, COL_DIM_LINE);
         y += SEP_GAP + 2;
         
         tft_draw_string(MARGIN, y, COL_GRAY, "Lat:");
@@ -364,23 +368,23 @@ static void draw_stats(const tft_stats_t *stats) {
 #if (TFT_RAW_WIDTH >= 240)
         // ILI9341: Show range and jitter on separate lines
         if (fmt_lat_range[0]) {
-            tft_draw_string(MARGIN, y, COL_DARK, "Rng:");
-            tft_draw_string(MARGIN + 32, y, COL_DARK, fmt_lat_range);
-            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_range) * FONT_W, y, COL_DARK, "us");
+            tft_draw_string(MARGIN, y, COL_GRAY, "Rng:");
+            tft_draw_string(MARGIN + 32, y, COL_GRAY, fmt_lat_range);
+            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_range) * FONT_W, y, COL_GRAY, "us");
             y += LINE_H;
         }
         if (fmt_lat_jitter[0]) {
-            tft_draw_string(MARGIN, y, COL_DARK, "Jtr:");
+            tft_draw_string(MARGIN, y, COL_GRAY, "Jtr:");
             tft_draw_string(MARGIN + 32, y, COL_YELLOW, fmt_lat_jitter);
-            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_jitter) * FONT_W, y, COL_DARK, "us");
+            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_jitter) * FONT_W, y, COL_GRAY, "us");
             y += LINE_H;
         }
 #else
         // ST7735: Compact format - just show jitter
         if (fmt_lat_jitter[0]) {
-            tft_draw_string(MARGIN, y, COL_DARK, "Jtr:");
+            tft_draw_string(MARGIN, y, COL_GRAY, "Jtr:");
             tft_draw_string(MARGIN + 32, y, COL_YELLOW, fmt_lat_jitter);
-            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_jitter) * FONT_W, y, COL_DARK, "us");
+            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_jitter) * FONT_W, y, COL_GRAY, "us");
             y += LINE_H;
         }
 #endif
@@ -389,7 +393,7 @@ static void draw_stats(const tft_stats_t *stats) {
     
     // === DEVICE INFO ===
     if (fmt_vid_pid[0]) {
-        hline(y, COL_DARK);
+        hline(y, COL_DIM_LINE);
         y += SEP_GAP + 2;
         
         tft_draw_string(MARGIN, y, COL_CYAN, fmt_vid_pid);
@@ -419,7 +423,7 @@ static void draw_stats(const tft_stats_t *stats) {
     // === TEMPERATURES ===
     if (fmt_br_temp[0] || fmt_km_temp[0]) {
         y += SECTION_GAP;
-        hline(y, COL_DARK);
+        hline(y, COL_DIM_LINE);
         y += SEP_GAP + 2;
         
         int x = MARGIN;
@@ -576,7 +580,7 @@ static void draw_gauge_view(const tft_stats_t *stats) {
     char uptime_str[16];
     snprintf(uptime_str, sizeof(uptime_str), "%lum%02lus", mins, secs);
     int uptime_x = TFT_WIDTH - MARGIN - (int)strlen(uptime_str) * FONT_W;
-    tft_draw_string(uptime_x, y, COL_DARK, uptime_str);
+    tft_draw_string(uptime_x, y, COL_CYAN, uptime_str);
 #else
     // Small display: horizontal bar gauges
     int bar_height = 24;

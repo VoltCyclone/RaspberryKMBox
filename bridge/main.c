@@ -51,14 +51,11 @@
 
 static api_mode_t current_api_mode = API_MODE_KMBOX;
 
-// Button handling - tracking for stats, not for mode switching
+// Button handling - mode toggle on short press
 static uint32_t last_button_check = 0;
 static bool button_state = false;
 static uint32_t button_press_start = 0;
-
-#if 0  // Fix #11: Button feature disabled - wrap in #if 0 instead of silencing warnings
 static bool button_init_done = false;
-#endif
 
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
@@ -272,28 +269,36 @@ static void button_init(void) {
     gpio_init(MODE_BUTTON_PIN);
     gpio_set_dir(MODE_BUTTON_PIN, GPIO_IN);
     gpio_pull_up(MODE_BUTTON_PIN);
-    // Button state tracking disabled - see #if 0 block above
+    button_init_done = true;
 }
 
 static void button_task(void) {
-    // Fix #11: Button feature disabled - API mode fixed to KMBox
-    // TODO: Fix button debouncing before re-enabling (see #if 0 block)
+    if (!button_init_done) return;
     
-    // Track button presses for display stats
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_button_check >= 50) {  // Debounce check every 50ms
-        last_button_check = now;
-        bool pressed = !gpio_get(MODE_BUTTON_PIN);  // Active low
+    if (now - last_button_check < BUTTON_DEBOUNCE_MS) return;
+    last_button_check = now;
+    
+    bool pressed = !gpio_get(MODE_BUTTON_PIN);  // Active low
+    
+    if (pressed && !button_state) {
+        // Button just pressed — record start time
+        button_state = true;
+        button_press_start = now;
+    } else if (!pressed && button_state) {
+        // Button just released
+        button_state = false;
+        uint32_t held_ms = now - button_press_start;
+        button_press_count++;
         
-        if (pressed && !button_state) {
-            // Button just pressed
-            button_state = true;
-            button_press_start = now;
-        } else if (!pressed && button_state) {
-            // Button just released
-            button_state = false;
-            button_press_count++;
+        if (held_ms < BUTTON_LONG_PRESS_MS) {
+            // Short press: cycle API mode (KMBox → Makcu → Ferrum → KMBox)
+            current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
+            // Reset ferrum line buffer on mode change
+            ferrum_idx = 0;
+            ferrum_line[0] = '\0';
         }
+        // Long press reserved for future use
     }
 }
 
