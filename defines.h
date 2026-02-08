@@ -20,44 +20,49 @@
 #define MAIN_LOOP_TIME_SAMPLE_INTERVAL  32
 #endif
 
-// Enable RP2350 DSP instructions for fixed-point math (RP2350/Cortex-M33 only)
-// Provides ~2x speedup for multiply-accumulate operations
-#ifndef ENABLE_DSP_FIXED_POINT
-#if defined(PICO_RP2350) && PICO_RP2350
+// RP2350 DSP instructions for fixed-point math (Cortex-M33 SMULL)
+// Always enabled - RP2040 support has been dropped
+// Note: SDK's pico_float/pico_double already use DCP hardware acceleration
+// automatically on RP2350 (LIB_PICO_DOUBLE_PICO=1, LIB_PICO_FLOAT_PICO_VFP=1)
 #define ENABLE_DSP_FIXED_POINT  1
-#else
-#define ENABLE_DSP_FIXED_POINT  0
-#endif
-#endif
 
 //--------------------------------------------------------------------+
 // HARDWARE CONFIGURATION
 //--------------------------------------------------------------------+
-#if PICO_PLATFORM == rp2040
-#define DEFAULT_CPU_FREQ 240000
-#elif PICO_PLATFORM == rp2350
-// Overclock RP2350 to match RP2040 performance for real-time tracking
+// RP2350 overclocked to 240MHz for real-time tracking
 // NOTE: This increases power draw and may be unstable on some boards.
-// Default increased from 120 MHz -> 240 MHz (kHz units)
 #define DEFAULT_CPU_FREQ 240000
-#endif
 
 #ifndef CPU_FREQ
 #define CPU_FREQ DEFAULT_CPU_FREQ
 #endif
 
-// Pin definitions
+// Pin definitions - set via CMake compile definitions based on board type
+// Override these via CMakeLists.txt for different boards:
+//   - Adafruit Metro RP2350:   D+=32, D-=33, 5V=29, LED=23, NeoPixel=25
+//   - Adafruit Feather RP2040: D+=16, D-=17, 5V=18, LED=13, NeoPixel=21
+//   - Pico/Pico2 default:      D+=16, D-=17, 5V=18, LED=25, NeoPixel=21
+
 #ifndef PIN_USB_HOST_DP
-#define PIN_USB_HOST_DP         (16u)   // PIO USB Host D+ pin
+#define PIN_USB_HOST_DP         (16u)   // PIO USB Host D+ pin (default)
 #endif
 #ifndef PIN_USB_HOST_DM
-#define PIN_USB_HOST_DM         (17u)   // PIO USB Host D- pin
+#define PIN_USB_HOST_DM         (17u)   // PIO USB Host D- pin (default, must be D+ + 1)
 #endif
-#define PIN_BUTTON              (7u)    // Reset button pin
+#ifndef PIN_USB_5V
 #define PIN_USB_5V              (18u)   // Power pin for USB host
+#endif
+#ifndef PIN_LED
 #define PIN_LED                 (13u)   // Status LED pin
+#endif
+#ifndef PIN_NEOPIXEL
 #define PIN_NEOPIXEL            (21u)   // Neopixel data pin
-#define NEOPIXEL_POWER          (20u)   // Neopixel power pin
+#endif
+#ifndef NEOPIXEL_POWER
+#define NEOPIXEL_POWER          (20u)   // Neopixel power pin (255 = not used/always on)
+#endif
+
+#define PIN_BUTTON              (7u)    // Reset button pin
 
 // UART configuration for KMBox serial communication with RP2350 Bridge
 // Physical connection (crossed wiring):
@@ -65,8 +70,8 @@
 #define BRIDGE_UART_TX_PIN      PICO_DEFAULT_UART_TX_PIN   
 #define BRIDGE_UART_RX_PIN      PICO_DEFAULT_UART_RX_PIN  
 #define KMBOX_UART              uart0    // UART0 instance
-#define KMBOX_UART_TX_PIN       PICO_DEFAULT_UART_TX_PIN    // GPIO11 - UART0 TX (to Bridge GPIO28 RX)
-#define KMBOX_UART_RX_PIN       PICO_DEFAULT_UART_RX_PIN    // GPIO12 - UART0 RX (from Bridge GPIO27 TX)
+#define KMBOX_UART_TX_PIN       PICO_DEFAULT_UART_TX_PIN    // UART0 TX (to Bridge RX)
+#define KMBOX_UART_RX_PIN       PICO_DEFAULT_UART_RX_PIN    // UART0 RX (from Bridge TX)
 #define KMBOX_UART_BAUDRATE     2000000  // Baud rate (must match bridge) - 2 Mbaud for max throughput
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 

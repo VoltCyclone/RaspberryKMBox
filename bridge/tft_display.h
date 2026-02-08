@@ -11,6 +11,15 @@
 #include <stdbool.h>
 
 // ============================================================================
+// Display View Modes
+// ============================================================================
+
+typedef enum {
+    TFT_VIEW_DETAILED,   // Full detailed statistics view
+    TFT_VIEW_GAUGES      // Large gauge/visualization view
+} tft_view_mode_t;
+
+// ============================================================================
 // Stats Structure
 // ============================================================================
 
@@ -36,6 +45,8 @@ typedef struct {
     
     // Activity counters
     uint32_t mouse_moves;
+    uint32_t button_presses;
+    uint32_t commands_per_sec;
     
     // Device info (from KMBox)
     uint16_t device_vid;
@@ -44,6 +55,24 @@ typedef struct {
     
     // Uptime (seconds)
     uint32_t uptime_sec;
+    
+    // System info
+    uint32_t cpu_freq_mhz;
+    
+    // Error counters
+    uint32_t uart_errors;
+    uint32_t frame_errors;
+    
+    // Peak rates (for showing max throughput achieved)
+    uint32_t tx_peak_bps;
+    uint32_t rx_peak_bps;
+    
+    // Latency stats (microseconds)
+    uint32_t latency_min_us;
+    uint32_t latency_avg_us;
+    uint32_t latency_max_us;
+    uint32_t latency_jitter_us;
+    uint32_t latency_samples;
     
     // Temperatures (Celsius, use <-50 or >150 to indicate invalid)
     float bridge_temperature_c;
@@ -71,5 +100,17 @@ void tft_display_error(const char *msg);
 
 /** Set backlight brightness (0-255). */
 void tft_display_backlight(uint8_t brightness);
+
+/** Get current view mode. */
+tft_view_mode_t tft_display_get_view(void);
+
+/** Set view mode. */
+void tft_display_set_view(tft_view_mode_t mode);
+
+/** Toggle between view modes. */
+void tft_display_toggle_view(void);
+
+/** Process touch input (call regularly if touch enabled). */
+void tft_display_handle_touch(void);
 
 #endif // TFT_DISPLAY_H

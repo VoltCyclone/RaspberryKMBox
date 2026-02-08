@@ -52,7 +52,7 @@ void tft_preflight(void)
 
 	/* 8.2.6 MADCTL: Memory Access Data Control */
 	uint8_t madctl = (0 << 5) | (TFT_FLIP_X << 6) | (TFT_FLIP_Y << 7) |
-			 (1 << 3) /* BGR swap */ | (TFT_FLIP_Y << 4) | (TFT_FLIP_X << 2);
+			 (1 << 3) /* BGR swap */ | (TFT_FLIP_Y << 4) | (0 << 2);
 	tft_control(0x36, &madctl, sizeof madctl);
 
 	/* 8.2.33 COLMOD: Interface Pixel Format */

@@ -2,10 +2,10 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build RP2040 (Pico)",
+            "label": "Build RP2350 (Pico 2)",
             "type": "shell",
             "command": "./build.sh",
-            "args": ["pico"],
+            "args": ["pico2"],
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -14,10 +14,10 @@
             "problemMatcher": "$gcc"
         },
         {
-            "label": "Build RP2350 (Pico 2)",
+            "label": "Build Metro RP2350",
             "type": "shell",
             "command": "./build.sh",
-            "args": ["pico2"],
+            "args": ["metro"],
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -53,22 +53,6 @@
             "problemMatcher": "$gcc"
         },
         {
-            "label": "Compile Project (RP2040)",
-            "type": "process",
-            "isBuildCommand": true,
-            "command": "${userHome}/.pico-sdk/ninja/v1.12.1/ninja",
-            "args": ["-C", "${workspaceFolder}/build-pico"],
-            "group": "build",
-            "presentation": {
-                "reveal": "always",
-                "panel": "dedicated"
-            },
-            "problemMatcher": "$gcc",
-            "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe"
-            }
-        },
-        {
             "label": "Compile Project (RP2350)",
             "type": "process",
             "isBuildCommand": true,
@@ -82,24 +66,6 @@
             "problemMatcher": "$gcc",
             "windows": {
                 "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe"
-            }
-        },
-        {
-            "label": "Run Project (RP2040)",
-            "type": "process",
-            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
-            "args": [
-                "load",
-                "${workspaceFolder}/build-pico/PIOKMbox.uf2",
-                "-fx"
-            ],
-            "presentation": {
-                "reveal": "always",
-                "panel": "dedicated"
-            },
-            "problemMatcher": [],
-            "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
             }
         },
         {
@@ -121,22 +87,21 @@
             }
         },
         {
-            "label": "Flash (RP2040)",
+            "label": "Run Project (Metro RP2350)",
             "type": "process",
-            "command": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
             "args": [
-                "-s",
-                "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
-                "-f",
-                "interface/cmsis-dap.cfg",
-                "-f",
-                "target/rp2040.cfg",
-                "-c",
-                "adapter speed 5000; program \"${workspaceFolder}/build-pico/PIOKMbox.elf\" verify reset exit"
+                "load",
+                "${workspaceFolder}/build-metro/PIOKMbox.uf2",
+                "-fx"
             ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
             "problemMatcher": [],
             "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/openocd/0.12.0+dev/openocd.exe"
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
             }
         },
         {
@@ -163,6 +128,42 @@
             "type": "shell",
             "command": "./build.sh",
             "args": ["bridge"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Build Bridge (Metro RP2350)",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["bridge-metro"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Build Dual-Metro (KMBox + Bridge)",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["dual-metro"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Clean Build Dual-Metro",
+            "type": "shell",
+            "command": "./build.sh",
+            "args": ["dual-metro", "clean"],
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -201,6 +202,24 @@
             "args": [
                 "load",
                 "${workspaceFolder}/bridge/build/kmbox_bridge.uf2",
+                "-fx"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": [],
+            "windows": {
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
+            }
+        },
+        {
+            "label": "Run Bridge (Metro RP2350)",
+            "type": "process",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
+            "args": [
+                "load",
+                "${workspaceFolder}/bridge/build-metro/kmbox_bridge.uf2",
                 "-fx"
             ],
             "presentation": {

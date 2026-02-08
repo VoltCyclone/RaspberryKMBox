@@ -1,12 +1,16 @@
 # PIOKMbox — USB HID Passthrough & KMBox Serial Interface
 
-A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates a **transparent USB passthrough device** while providing **KMBox-compatible serial control** for mouse and keyboard automation.
+A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates a **transparent USB passthrough device** while providing **KMBox-compatible serial control** for mouse and keyboard automation. A TFT status display is supported as well.
+
+## Warning
+
+This build runs the bridge and usb proxy at *high* clock speeds. Keep an eye on the tft temperature gauges during use.
 
 ## What It Does
 
 **USB Passthrough**: Connects between your mouse/keyboard and PC, transparently forwarding all input while mirroring the connected device's identity (VID/PID, manufacturer, product name).
 
-**Serial Control**: Accepts KMBox-compatible commands over UART/USB to inject precise mouse movements, clicks, and keyboard input alongside your physical devices.
+**Serial Control**: Accepts KMBox, Macku binary, and ferrum-compatible commands over USB CDC to inject precise mouse movements, clicks, and keyboard input alongside your physical devices.
 
 **Advanced Features**: Humanized movement injection with anti-detection capabilities, smooth velocity matching, and optional RP2350 bridge support for computer vision applications.
 
@@ -18,7 +22,6 @@ A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates
 - **Movement Humanization**: Anti-detection algorithms with configurable modes
 - **Hardware Watchdog**: Automatic recovery from USB stack failures
 - **Visual Status**: RGB LED feedback for all operational states
-- **Minimal Wiring**: Just 2 wires for basic operation
 
 ## Hardware Requirements
 
@@ -41,23 +44,10 @@ A high-performance dual-role USB HID firmware for Raspberry Pi Pico that creates
 - USB-C port → PC
 
 **Standard RP2040/RP2350 Boards** (USB host connection):
-- GPIO 16 → USB D+ (typically green wire)
-- GPIO 17 → USB D- (typically white wire)
+- GPIO 16 → USB D+ 
+- GPIO 17 → USB D-
 - 5V → VBUS (red wire)
 - GND → Ground (black wire)
-
-### Optional Peripherals
-
-| Component | Pin | Purpose |
-|-----------|-----|---------|
-| WS2812 LED | GPIO 21 | RGB status indicator |
-| Button | GPIO 7 (pull-up) | Mode switching, USB reset |
-| Debug UART TX | GPIO 0 | Serial debug output |
-| Debug UART RX | GPIO 1 | Serial debug input |
-| External UART TX | GPIO 5 | KMBox command alternative |
-| External UART RX | GPIO 6 | KMBox command alternative |
-
-Note: Debug UART and external UART both operate at 115200 baud.
 
 ### Power Requirements
 - USB bus powered (5V)
@@ -92,8 +82,7 @@ cd RaspberryKMBox
 ## Using KMBox Commands
 
 ### Serial Connection
-- **Baud Rate**: 115200, 8N1
-- **Interface**: USB CDC (appears as COM port) or external UART
+- **Interface**: USB CDC (appears as COM port, uart speeds are uncapped)
 - **Protocol**: KMBox-compatible text and binary commands
 
 ### Basic Commands
@@ -106,16 +95,9 @@ km.wheel(5)           # Scroll up
 km.lock_mx(1)         # Lock X axis
 ```
 
-### Fast Binary Protocol (Ultra-Low Latency)
-```python
-# 8-byte binary packet for <50µs latency
-packet = bytes([0x01, x_lo, x_hi, y_lo, y_hi, buttons, wheel, 0x00])
-serial.write(packet)
-```
-
 ## KMBox Compatibility
 
-**Fully Compatible** with KMBox B+, Net, Ferrum, and Macku devices:
+**Fully Compatible** with KMBox B+, Ferrum and Macku protocols
 
 ✅ **Mouse Control**: Movement, all buttons, scroll wheel  
 ✅ **Axis Locking**: X/Y movement and button masking  
@@ -124,20 +106,16 @@ serial.write(packet)
 ✅ **Smooth Injection**: Velocity matching and timing control  
 ✅ **Movement Humanization**: Anti-detection with Bezier easing
 
-**Compatible Devices**: Works with 95%+ of existing KMBox scripts and tools.
-
-**Performance**: 
-- Text commands: ~1-2ms latency, 100 cmd/s  
-- Binary protocol: <50µs latency, 2000 cmd/s
-
 ## Status Indicators
 
 ### LED Feedback  
+
 - **Fast blink**: Device connected/active
 - **Slow blink**: Device suspended or error
 - **Solid**: Normal operation
 
 ### NeoPixel Colors (if connected)
+
 - **Blue**: Starting up
 - **Green**: USB device only  
 - **Orange**: USB host only
@@ -149,6 +127,7 @@ serial.write(packet)
 - **Purple**: Suspended
 
 ### Humanization Mode Colors (button press)
+
 - **Red**: OFF (no humanization)
 - **Yellow**: LOW (minimal)  
 - **Green**: MEDIUM (default)
@@ -157,6 +136,7 @@ serial.write(packet)
 ## Controls
 
 ### Button (GPIO 7)
+
 - **Short press** (< 3 sec): Cycle humanization modes
 - **Long press** (≥ 3 sec): Reset USB stacks
 
@@ -185,25 +165,6 @@ This implementation provides **full KMBox compatibility** for the most commonly 
 ✅ Fast binary protocol for minimal latency  
 ✅ Smooth injection and advanced timing  
 
-Missing features are primarily:
-- Text-based keyboard commands (use binary protocol instead)
-- Advanced movement patterns (recoil, auto-movement)
-- Network-specific commands (not applicable)
-
-**For 95% of KMBox use cases, this is a complete replacement.**
-make -j4   # or: ninja
-```
-
-### Build outputs
-
-**Main KMBox firmware:**
-- `PIOKMbox.uf2` — UF2 firmware for drag-and-drop flashing
-- `PIOKMbox.elf` — ELF for debugging
-- `PIOKMbox.bin`, `PIOKMbox.hex` — alternative images
-
-**Bridge firmware:**
-- `bridge/build/kmbox_bridge.uf2` — RP2350 bridge firmware
-
 ### Flashing
 
 - Automatic (if picotool is installed): run `./build.sh`
@@ -219,7 +180,6 @@ Note: To target a different board, set `PICO_BOARD` via CMake cache or edit `CMa
 4. When VID/PID changes, the device disconnects and re-enumerates to reflect the new identity. String descriptors are mirrored when available.
 5. Physical HID input and KMBox serial commands are combined so scripted actions and real input can coexist (with axis locks and timing).
 
-Fallbacks: If no device is attached or descriptors aren’t available, defaults are used — VID:PID `0x9981:0x4001`, Manufacturer `"Hurricane"`, Product `"PIOKM Box"`, and a serial derived from the Pico’s unique ID.
 
 ## Using KMBox serial
 

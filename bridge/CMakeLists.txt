@@ -1,13 +1,18 @@
 # KMBox Bridge - Advanced Autopilot Firmware
 # RP2350 bridge with color tracking and Hardware UART communication
 # 
-# Includes 1.8" ST7735 TFT display support via hardware SPI
+# Supports:
+#   - Adafruit Feather RP2350 + ST7735 1.8" TFT (128x160)
+#   - Adafruit Metro RP2350 + ILI9341 Arduino TFT shield (240x320)
 
 cmake_minimum_required(VERSION 3.13)
 
-# Set board type for Adafruit Feather RP2350
-set(PICO_BOARD adafruit_feather_rp2350)
+# Board selection: metro (default, ILI9341 TFT) or feather (ST7735 TFT)
+set(PICO_BOARD adafruit_metro_rp2350 CACHE STRING "Board type")
 set(PICO_PLATFORM rp2350-arm-s)
+
+# Custom board headers (for adafruit_metro_rp2350)
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/../boards)
 
 # Import Pico SDK
 set(PICO_SDK_PATH $ENV{HOME}/.pico-sdk/sdk/2.2.0-fresh)
@@ -19,6 +24,39 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# Detect board and configure TFT driver + pins
+if(PICO_BOARD STREQUAL "adafruit_metro_rp2350")
+    set(TFT_DRIVER_NAME "ILI9341")
+    set(BRIDGE_TFT_DRIVER 3)   # TFT_DRIVER_ILI9341
+    # Metro Arduino header SPI (ICSP) = SPI1: SCK=30, MOSI=31, MISO=28
+    set(BRIDGE_TFT_SPI_DEV "spi1")
+    set(BRIDGE_TFT_SCK  30)
+    set(BRIDGE_TFT_MOSI 31)
+    set(BRIDGE_TFT_MISO 28)
+    set(BRIDGE_TFT_CS   10)    # D10
+    set(BRIDGE_TFT_DC    9)    # D9
+    set(BRIDGE_TFT_RST   8)    # D8
+    set(BRIDGE_TFT_BL    3)    # D3 (D7 is MODE_BUTTON)
+    set(BRIDGE_TOUCH_CS  4)    # D4 (typical for ILI9341 Arduino shields)
+    set(BRIDGE_TOUCH_IRQ 2)    # D2 (IRQ pin for touch interrupt)
+    set(BRIDGE_MODE_BTN  7)    # D7
+    message(STATUS "Bridge: Metro RP2350 + ILI9341 240x320 TFT")
+else()
+    set(TFT_DRIVER_NAME "ST7735")
+    set(BRIDGE_TFT_DRIVER 1)   # TFT_DRIVER_ST7735
+    # Feather SPI0 default pins
+    set(BRIDGE_TFT_SPI_DEV "spi0")
+    set(BRIDGE_TFT_SCK  22)    # PICO_DEFAULT_SPI_SCK_PIN
+    set(BRIDGE_TFT_MOSI 23)    # PICO_DEFAULT_SPI_TX_PIN
+    set(BRIDGE_TFT_MISO -1)    # Not used
+    set(BRIDGE_TFT_CS    9)
+    set(BRIDGE_TFT_DC   10)
+    set(BRIDGE_TFT_RST   6)
+    set(BRIDGE_TFT_BL    7)
+    set(BRIDGE_MODE_BTN  7)    # Shared with BL on Feather
+    message(STATUS "Bridge: Feather RP2350 + ST7735 128x160 TFT")
+endif()
+
 add_executable(kmbox_bridge
     main.c
     tracker.c
@@ -27,11 +65,13 @@ add_executable(kmbox_bridge
     core1_translator.c
     makcu_translator.c
     ferrum_translator.c
+    protocol_luts.c
     tft_display.c
     tft.c
     st7735.c
     ili9341.c
     font.c
+    xpt2046_touch.c
 )
 
 # Generate PIO header for WS2812 NeoPixel from SDK
@@ -55,6 +95,34 @@ target_link_libraries(kmbox_bridge
     pico_multicore
     kmbox_commands
 )
+
+# Add custom TinyUSB configuration and board-specific TFT pin definitions
+target_compile_definitions(kmbox_bridge PRIVATE
+    CFG_TUSB_CONFIG_FILE="tusb_config.h"
+    USBD_MANUFACTURER="Hurricane"
+    USBD_PRODUCT="KMBox\ Bridge\ ${TFT_DRIVER_NAME}"
+    USBD_DESC_STR_MAX=32
+    BRIDGE_TFT_DRIVER=${BRIDGE_TFT_DRIVER}
+    BRIDGE_TFT_SCK_PIN=${BRIDGE_TFT_SCK}
+    BRIDGE_TFT_MOSI_PIN=${BRIDGE_TFT_MOSI}
+    BRIDGE_TFT_CS_PIN=${BRIDGE_TFT_CS}
+    BRIDGE_TFT_DC_PIN=${BRIDGE_TFT_DC}
+    BRIDGE_TFT_RST_PIN=${BRIDGE_TFT_RST}
+    BRIDGE_TFT_BL_PIN=${BRIDGE_TFT_BL}
+    BRIDGE_MODE_BTN_PIN=${BRIDGE_MODE_BTN}
+)
+
+# Add touch CS pin for ILI9341 displays
+if(DEFINED BRIDGE_TOUCH_CS)
+    target_compile_definitions(kmbox_bridge PRIVATE
+        BRIDGE_TOUCH_CS_PIN=${BRIDGE_TOUCH_CS}
+    )
+    if(DEFINED BRIDGE_TOUCH_IRQ)
+        target_compile_definitions(kmbox_bridge PRIVATE
+            BRIDGE_TOUCH_IRQ_PIN=${BRIDGE_TOUCH_IRQ}
+        )
+    endif()
+endif()
 
 # Enable USB CDC output (this is our PC interface)
 pico_enable_stdio_usb(kmbox_bridge 1)

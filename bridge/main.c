@@ -4,12 +4,12 @@
  * This firmware runs on an Adafruit Feather RP2350 and provides:
  * - USB CDC interface for receiving RGB frames from PC
  * - Color-based target tracking with configurable parameters
- * - Hardware UART0 for high-speed communication with RP2040 KMBox UART0
+ * - Hardware UART0 for high-speed communication with RP2350 KMBox UART0
  * - NeoPixel and onboard LED status indicators
  * - High-precision latency tracking using freed PIO resources
  * 
  * Architecture:
- *   PC (capture tool) -> USB CDC -> RP2350 (this) -> UART0 (crossed) -> RP2040 KMBox UART0
+ *   PC (capture tool) -> USB CDC -> RP2350 (this) -> UART0 (crossed) -> RP2350 KMBox UART0
  * 
  * Wiring: Bridge UART0 (GPIO27/28) <-> crossed <-> KMBox UART0 (GPIO11/12)
  * This allows direct hardware UART usage instead of PIO-based pin swapping.
@@ -39,6 +39,7 @@
 #include "makcu_translator.h"
 #include "ferrum_protocol.h"
 #include "ferrum_translator.h"
+#include "protocol_luts.h"
 #include "core1_translator.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
 
@@ -50,19 +51,17 @@
 
 static api_mode_t current_api_mode = API_MODE_KMBOX;
 
-// Button handling - disabled, variables kept for future re-enablement
-#if 0  // Fix #11: Button feature disabled - wrap in #if 0 instead of silencing warnings
+// Button handling - mode toggle on short press
 static uint32_t last_button_check = 0;
 static bool button_state = false;
 static uint32_t button_press_start = 0;
 static bool button_init_done = false;
-#endif
 
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
 static uint8_t ferrum_idx = 0;
 
-#define MODE_BUTTON_PIN 7
+// Button config already in config.h (MODE_BUTTON_PIN)
 #define BUTTON_DEBOUNCE_MS 50
 #define BUTTON_LONG_PRESS_MS 2000
 
@@ -115,6 +114,14 @@ static uint32_t kmbox_connect_attempts = 0;
 // TFT display tracking variables
 static uint32_t boot_time_ms = 0;
 static uint32_t tft_mouse_activity_count = 0;
+static uint32_t button_press_count = 0;
+static uint32_t uart_error_count = 0;
+static uint32_t frame_error_count = 0;
+
+// Command rate tracking
+static uint32_t last_cmd_rate_calc_ms = 0;
+static uint32_t last_cmd_count = 0;
+static uint32_t commands_per_sec = 0;
 
 // UART rate tracking for TFT display
 static uint32_t last_rate_calc_time_ms = 0;
@@ -122,6 +129,8 @@ static uint32_t last_tx_bytes_for_rate = 0;
 static uint32_t last_rx_bytes_for_rate = 0;
 static uint32_t uart_tx_rate_bps = 0;  // Calculated TX rate
 static uint32_t uart_rx_rate_bps = 0;  // Calculated RX rate
+static uint32_t uart_tx_peak_bps = 0;  // Peak TX rate seen
+static uint32_t uart_rx_peak_bps = 0;  // Peak RX rate seen
 static uint32_t injection_count = 0;   // Number of successful km.move injections
 
 // Attached device info from KMBox
@@ -187,7 +196,10 @@ static void ws2812_init(void) {
 void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
     // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
     uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
-    pio_sm_put_blocking(ws2812_pio, ws2812_sm, grb << 8);
+    // Non-blocking: skip update if PIO FIFO is full (LED is cosmetic, not critical)
+    if (!pio_sm_is_tx_fifo_full(ws2812_pio, ws2812_sm)) {
+        pio_sm_put(ws2812_pio, ws2812_sm, grb << 8);
+    }
 }
 
 // ============================================================================
@@ -257,12 +269,37 @@ static void button_init(void) {
     gpio_init(MODE_BUTTON_PIN);
     gpio_set_dir(MODE_BUTTON_PIN, GPIO_IN);
     gpio_pull_up(MODE_BUTTON_PIN);
-    // Button state tracking disabled - see #if 0 block above
+    button_init_done = true;
 }
 
 static void button_task(void) {
-    // Fix #11: Button feature disabled - API mode fixed to KMBox
-    // TODO: Fix button debouncing before re-enabling (see #if 0 block)
+    if (!button_init_done) return;
+    
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_button_check < BUTTON_DEBOUNCE_MS) return;
+    last_button_check = now;
+    
+    bool pressed = !gpio_get(MODE_BUTTON_PIN);  // Active low
+    
+    if (pressed && !button_state) {
+        // Button just pressed — record start time
+        button_state = true;
+        button_press_start = now;
+    } else if (!pressed && button_state) {
+        // Button just released
+        button_state = false;
+        uint32_t held_ms = now - button_press_start;
+        button_press_count++;
+        
+        if (held_ms < BUTTON_LONG_PRESS_MS) {
+            // Short press: cycle API mode (KMBox → Makcu → Ferrum → KMBox)
+            current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
+            // Reset ferrum line buffer on mode change
+            ferrum_idx = 0;
+            ferrum_line[0] = '\0';
+        }
+        // Long press reserved for future use
+    }
 }
 
 // Send packet via Hardware UART (DMA accelerated)
@@ -379,14 +416,18 @@ static void uart_rx_task(void) {
     static uint32_t binary_packet_start_time = 0;
     static uint32_t rx_debug_count = 0;
     
-    // Batch process up to 64 bytes per call to avoid blocking too long
-    uint8_t batch_count = 0;
-    while (uart_rx_available() && batch_count < 64) {
-        uint32_t now = to_ms_since_boot(get_absolute_time());
-        uint8_t c = uart_rx_getc();
-        batch_count++;
+    // Cache timestamp ONCE at start, not per-byte (saves ~50 cycles per byte)
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    
+    // Batch read up to 64 bytes at once from DMA ring buffer (single memcpy)
+    uint8_t rx_batch[64];
+    size_t batch_count = hw_uart_read(rx_batch, sizeof(rx_batch));
+    if (batch_count == 0) return;
+    
+    for (size_t batch_i = 0; batch_i < batch_count; batch_i++) {
+        uint8_t c = rx_batch[batch_i];
         
-        // Update last RX time for EVERY byte received
+        // Update last RX time once per batch (moved outside loop)
         kmbox_last_rx_time = now;
         
         // Reset binary packet state if timeout (stuck packet)
@@ -467,7 +508,7 @@ static void uart_rx_task(void) {
             }
         }
         // Ignore other non-printable bytes
-    }
+    } // end for batch_i
 }
 
 // ============================================================================
@@ -644,7 +685,8 @@ static void uart_debug_task(void) {
 // Send a simple text command to KMBox: "M<x>,<y>\n"
 static void send_text_mouse_move(int16_t dx, int16_t dy) {
     char cmd[24];
-    int len = snprintf(cmd, sizeof(cmd), "M%d,%d\n", dx, dy);
+    // Use fast LUT-based builder instead of snprintf (~10x faster)
+    size_t len = fast_build_move(cmd, dx, dy);
     
     // Non-blocking LED pulse using timestamp comparison
     static uint32_t led_off_time = 0;
@@ -704,6 +746,20 @@ static inline bool is_fast_cmd_byte(uint8_t b) {
 // Text command buffer
 static char cmd_buffer[128];
 static uint8_t cmd_buffer_idx = 0;
+
+// Makcu frame reception state
+static uint8_t makcu_frame_buffer[260];  // Header + max payload
+static uint16_t makcu_frame_idx = 0;
+static uint16_t makcu_frame_expected = 0;
+typedef enum {
+    MAKCU_STATE_IDLE,
+    MAKCU_STATE_HEADER,
+    MAKCU_STATE_PAYLOAD
+} makcu_state_t;
+static makcu_state_t makcu_state = MAKCU_STATE_IDLE;
+
+// Ferrum line buffer (moved from file scope for better organization)
+// Note: ferrum_line and ferrum_idx already defined at file scope above
 
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
@@ -827,25 +883,172 @@ static void process_cdc_byte(uint8_t b) {
 }
 
 static void cdc_task(void) {
+    static uint8_t response_buffer[256];  // Batch responses
+    static uint16_t response_idx = 0;
+    static uint32_t last_flush_time = 0;
+    
     if (!tud_cdc_connected() || !tud_cdc_available()) {
         return;
     }
 
-    uint8_t buf[512];
+    uint8_t buf[2048];  // Match increased CFG_TUD_CDC_RX_BUFSIZE
     uint32_t count = tud_cdc_read(buf, sizeof(buf));
     
-    uint32_t i = 0;
+    // Early exit if no data
+    if (count == 0) {
+        return;
+    }
     
-    // Simplified text-only protocol
-    while (i < count) {
+    // Fast-path: Check first byte for protocol hint (better branch prediction)
+    uint8_t first_byte = buf[0];
+    bool likely_makcu = (first_byte == MAKCU_FRAME_START);  // 0x50
+    bool likely_frame = (first_byte == FRAME_MAGIC_0);      // 'F'
+    
+    for (uint32_t i = 0; i < count; i++) {
         uint8_t b = buf[i];
         
+        // Check for Makcu frame start (0x50)
+        if (makcu_state == MAKCU_STATE_IDLE && b == MAKCU_FRAME_START) {
+            makcu_state = MAKCU_STATE_HEADER;
+            makcu_frame_idx = 0;
+            makcu_frame_buffer[makcu_frame_idx++] = b;
+            continue;
+        }
+        
+        // Handle Makcu frame reception
+        if (makcu_state != MAKCU_STATE_IDLE) {
+            makcu_frame_buffer[makcu_frame_idx++] = b;
+            
+            // Check if we have the complete header (4 bytes)
+            if (makcu_state == MAKCU_STATE_HEADER && makcu_frame_idx >= 4) {
+                makcu_frame_header_t* hdr = (makcu_frame_header_t*)makcu_frame_buffer;
+                makcu_frame_expected = sizeof(makcu_frame_header_t) + hdr->len;
+                
+                // Validate payload length
+                if (hdr->len > 256) {
+                    // Invalid frame, reset
+                    makcu_state = MAKCU_STATE_IDLE;
+                    makcu_frame_idx = 0;
+                    continue;
+                }
+                
+                if (hdr->len > 0) {
+                    makcu_state = MAKCU_STATE_PAYLOAD;
+                } else {
+                    // No payload, process immediately
+                    makcu_state = MAKCU_STATE_IDLE;
+                    
+                    // Translate and forward
+                    translated_cmd_t translated;
+                    if (makcu_translate_command(hdr->cmd, NULL, 0, &translated) == TRANSLATE_OK) {
+                        if (translated.length > 0) {
+                            send_uart_packet(translated.buffer, translated.length);
+                        }
+                    }
+                    
+                    // Send response if needed (buffered)
+                    if (makcu_cmd_needs_response(hdr->cmd)) {
+                        uint8_t response[8];
+                        uint16_t resp_len = makcu_build_response(hdr->cmd, MAKCU_STATUS_OK, NULL, 0, response);
+                        if (tud_cdc_connected() && (response_idx + resp_len < sizeof(response_buffer))) {
+                            memcpy(&response_buffer[response_idx], response, resp_len);
+                            response_idx += resp_len;
+                        }
+                    }
+                    makcu_frame_idx = 0;
+                }
+            }
+            
+            // Check if we have the complete frame
+            if (makcu_state == MAKCU_STATE_PAYLOAD && makcu_frame_idx >= makcu_frame_expected) {
+                makcu_frame_header_t* hdr = (makcu_frame_header_t*)makcu_frame_buffer;
+                uint8_t* payload = makcu_frame_buffer + sizeof(makcu_frame_header_t);
+                
+                // Translate and forward
+                translated_cmd_t translated;
+                if (makcu_translate_command(hdr->cmd, payload, hdr->len, &translated) == TRANSLATE_OK) {
+                    if (translated.length > 0) {
+                        send_uart_packet(translated.buffer, translated.length);
+                    }
+                }
+                
+                // Send response if needed (buffered)
+                if (makcu_cmd_needs_response(hdr->cmd)) {
+                    uint8_t response[8];
+                    uint16_t resp_len = makcu_build_response(hdr->cmd, MAKCU_STATUS_OK, NULL, 0, response);
+                    if (tud_cdc_connected() && (response_idx + resp_len < sizeof(response_buffer))) {
+                        memcpy(&response_buffer[response_idx], response, resp_len);
+                        response_idx += resp_len;
+                    }
+                }
+                
+                makcu_state = MAKCU_STATE_IDLE;
+                makcu_frame_idx = 0;
+            }
+            continue;
+        }
+        
+        // Handle Ferrum text commands (km.* format)
+        // Check if this is part of a km. command
+        if (ferrum_idx == 0 && b == 'k') {
+            ferrum_line[ferrum_idx++] = b;
+            continue;
+        }
+        if (ferrum_idx == 1 && b == 'm') {
+            ferrum_line[ferrum_idx++] = b;
+            continue;
+        }
+        if (ferrum_idx == 2 && b == '.') {
+            ferrum_line[ferrum_idx++] = b;
+            continue;
+        }
+        
+        // If we've started a km. command, continue collecting
+        if (ferrum_idx > 0) {
+            if (b == '\r' || b == '\n') {
+                // End of Ferrum command
+                ferrum_line[ferrum_idx] = '\0';
+                
+                ferrum_translated_t translated;
+                if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
+                    if (translated.length > 0) {
+                        send_uart_packet(translated.buffer, translated.length);
+                    }
+                    // Send Ferrum response (buffered)
+                    if (translated.needs_response && tud_cdc_connected()) {
+                        const char* resp = FERRUM_RESPONSE;
+                        size_t resp_len = strlen(resp);
+                        if (response_idx + resp_len < sizeof(response_buffer)) {
+                            memcpy(&response_buffer[response_idx], resp, resp_len);
+                            response_idx += resp_len;
+                        }
+                    }
+                } else {
+                    // Invalid Ferrum command, treat as regular text
+                    ferrum_line[ferrum_idx] = '\0';
+                    handle_text_command(ferrum_line);
+                }
+                
+                ferrum_idx = 0;
+                continue;
+            }
+            
+            // Continue collecting Ferrum command
+            if (ferrum_idx < sizeof(ferrum_line) - 1) {
+                ferrum_line[ferrum_idx++] = b;
+            } else {
+                // Buffer overflow, reset
+                ferrum_idx = 0;
+            }
+            continue;
+        }
+        
+        // Regular text command handling (for native KMBox commands)
         // Text commands (printable ASCII)
         if (b >= 0x20 && b <= 0x7E) {
             if (cmd_buffer_idx < sizeof(cmd_buffer) - 1) {
                 cmd_buffer[cmd_buffer_idx++] = b;
             }
-            i++;
             continue;
         }
         
@@ -856,11 +1059,22 @@ static void cdc_task(void) {
                 handle_text_command(cmd_buffer);
                 cmd_buffer_idx = 0;
             }
-            i++;
             continue;
         }
-        
-        i++;
+    }
+    
+    // Flush buffered responses if:
+    // 1. Buffer has data AND (buffer is >75% full OR 5ms has passed since last flush)
+    uint32_t now = time_us_32();
+    bool should_flush = (response_idx > 0) && 
+                       ((response_idx >= sizeof(response_buffer) * 3 / 4) || 
+                        ((now - last_flush_time) >= 5000));
+    
+    if (should_flush && tud_cdc_connected()) {
+        tud_cdc_write(response_buffer, response_idx);
+        tud_cdc_write_flush();
+        response_idx = 0;
+        last_flush_time = now;
     }
 }
 
@@ -969,22 +1183,35 @@ static void tft_update_task(void) {
     // Sync UART stats from hw_uart module (single source of truth for byte counts)
     sync_uart_stats();
     
-    // Calculate UART rates (once per second)
+    // Move rate calculation to a separate 1Hz timer (removed ms delta calculation)
+    static uint32_t last_rate_calc_ms = 0;
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    uint32_t rate_delta_ms = now_ms - last_rate_calc_time_ms;
-    if (rate_delta_ms >= 1000) {
-        // Calculate bytes per second
+    if (now_ms - last_rate_calc_ms >= 1000) {
+        // Calculate bytes per second over exactly 1s window
         uint32_t tx_delta = uart_tx_bytes_total - last_tx_bytes_for_rate;
         uint32_t rx_delta = uart_rx_bytes_total - last_rx_bytes_for_rate;
-        uart_tx_rate_bps = (tx_delta * 1000) / rate_delta_ms;
-        uart_rx_rate_bps = (rx_delta * 1000) / rate_delta_ms;
+        uart_tx_rate_bps = tx_delta;  // Exactly bytes/sec
+        uart_rx_rate_bps = rx_delta;
+        
+        // Track peak rates
+        if (uart_tx_rate_bps > uart_tx_peak_bps) {
+            uart_tx_peak_bps = uart_tx_rate_bps;
+        }
+        if (uart_rx_rate_bps > uart_rx_peak_bps) {
+            uart_rx_peak_bps = uart_rx_rate_bps;
+        }
+        
+        // Calculate command rate (mouse moves per second)
+        uint32_t cmd_delta = tft_mouse_activity_count - last_cmd_count;
+        commands_per_sec = cmd_delta;
+        last_cmd_count = tft_mouse_activity_count;
         
         last_tx_bytes_for_rate = uart_tx_bytes_total;
         last_rx_bytes_for_rate = uart_rx_bytes_total;
-        last_rate_calc_time_ms = now_ms;
+        last_rate_calc_ms = now_ms;
     }
     
-    // Gather all statistics
+    // Gather all statistics (lightweight - no formatting here)
     tft_stats_t stats = {0};  // Zero-initialize all fields
     
     // Connection status
@@ -1002,6 +1229,10 @@ static void tft_update_task(void) {
     stats.rx_rate_bps = uart_rx_rate_bps;
     stats.uart_baud = UART_BAUD;  // From config.h
     
+    // Peak rates
+    stats.tx_peak_bps = uart_tx_peak_bps;
+    stats.rx_peak_bps = uart_rx_peak_bps;
+    
     // Attached device info from KMBox
     stats.device_vid = attached_vid;
     stats.device_pid = attached_pid;
@@ -1011,17 +1242,41 @@ static void tft_update_task(void) {
     stats.humanization_mode = kmbox_humanization_mode;
     stats.humanization_valid = kmbox_humanization_valid;
     
-    // Mouse activity
+    // Mouse activity and other counters
     stats.mouse_moves = tft_mouse_activity_count;
+    stats.button_presses = button_press_count;
+    stats.commands_per_sec = commands_per_sec;
     
-    // Uptime (reuse now_ms from rate calculation)
+    // Error counters
+    stats.uart_errors = uart_error_count;
+    stats.frame_errors = frame_error_count;
+    
+    // System info
+    stats.cpu_freq_mhz = clock_get_hz(clk_sys) / 1000000;
+    
+    // Uptime
     stats.uptime_sec = (now_ms - boot_time_ms) / 1000;
     
-    // Device temperatures
-    stats.bridge_temperature_c = read_temperature_c();
+    // Latency statistics
+    latency_stats_t lat_stats;
+    latency_get_stats(&lat_stats);
+    stats.latency_min_us = lat_stats.min_us;
+    stats.latency_avg_us = lat_stats.avg_us;
+    stats.latency_max_us = lat_stats.max_us;
+    stats.latency_jitter_us = lat_stats.jitter_us;
+    stats.latency_samples = lat_stats.sample_count;
+    
+    // Temperature: read only every 500ms (ADC is slow), cache result
+    static uint32_t last_temp_read_ms = 0;
+    static float cached_temp = 0.0f;
+    if (now_ms - last_temp_read_ms >= 500) {
+        cached_temp = read_temperature_c();
+        last_temp_read_ms = now_ms;
+    }
+    stats.bridge_temperature_c = cached_temp;
     stats.kmbox_temperature_c = kmbox_temperature_c;
     
-    // Call TFT update (internally rate-limited)
+    // Call TFT update (internally rate-limited to 100ms)
     tft_display_update(&stats);
 }
 
@@ -1052,6 +1307,7 @@ int main(void) {
     button_init();
     hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
     latency_tracker_init(); // Initialize latency tracking
+    protocol_luts_init();   // Initialize protocol translation LUTs
     
     // Initialize Core1 translator
     core1_translator_init();
@@ -1091,6 +1347,7 @@ int main(void) {
         
         kmbox_connection_task();
         button_task();
+        tft_display_handle_touch();  // Handle touch screen input (view switching)
         
         // Periodic UART echo test (every 2 seconds while not connected)
         static uint32_t last_echo_test = 0;

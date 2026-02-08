@@ -20,7 +20,13 @@
 #define UART_BAUD            2000000  // Baud rate for RP2350<->RP2040 communication (2 Mbaud)
 #define LED_PIN              PICO_DEFAULT_LED_PIN
 #define WS2812_PIN           PICO_DEFAULT_WS2812_PIN
+
+// Mode button pin (from CMake or default)
+#ifdef BRIDGE_MODE_BTN_PIN
+#define MODE_BUTTON_PIN      BRIDGE_MODE_BTN_PIN
+#else
 #define MODE_BUTTON_PIN      7        // API mode toggle button (same as KMBox reset button)
+#endif
 
 // ROI (Region of Interest) Configuration
 #define ROI_DEFAULT_SIZE     48       // Default ROI size (48x48 pixels)

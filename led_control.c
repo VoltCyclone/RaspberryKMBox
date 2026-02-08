@@ -6,6 +6,7 @@
 #include "led_control.h"
 #include "usb_hid.h"
 #include "defines.h"
+#include "dcp_helpers.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
@@ -267,9 +268,12 @@ void neopixel_init(void)
     gpio_put(PIN_LED, 0);
 
     // Initialize neopixel power pin but keep it OFF during early boot
+    // NEOPIXEL_POWER = 255 means no separate power pin (always powered)
+    #if NEOPIXEL_POWER != 255
     gpio_init(NEOPIXEL_POWER);
     gpio_set_dir(NEOPIXEL_POWER, GPIO_OUT);
     gpio_put(NEOPIXEL_POWER, 0);  // Keep power OFF initially
+    #endif
 
     (void)0; // suppressed init log to avoid blocking hot paths
 }
@@ -280,8 +284,10 @@ void neopixel_enable_power(void)
         return;
     }
     
-    // Enable neopixel power
+    // Enable neopixel power (if separate power pin exists)
+    #if NEOPIXEL_POWER != 255
     gpio_put(NEOPIXEL_POWER, 1);
+    #endif
 
     // Allow power to stabilize
     sleep_ms(POWER_STABILIZATION_DELAY_MS);
@@ -329,10 +335,8 @@ uint32_t neopixel_apply_brightness(uint32_t color, float brightness)
         return 0;
     }
 
-    const uint8_t r = (uint8_t)((((color >> 16) & 0xFF) * (uint16_t)(brightness * 255.0f)) >> 8);
-    const uint8_t g = (uint8_t)((((color >> 8) & 0xFF)  * (uint16_t)(brightness * 255.0f)) >> 8);
-    const uint8_t b = (uint8_t)(((color & 0xFF)         * (uint16_t)(brightness * 255.0f)) >> 8);
-    return (r << 16) | (g << 8) | b;
+    // Use DCP hardware acceleration for high-precision brightness scaling
+    return dcp_apply_brightness_rgb(color, brightness);
 }
 
 uint32_t neopixel_apply_brightness_u8(uint32_t color, uint8_t brightness)
@@ -348,7 +352,7 @@ uint32_t neopixel_apply_brightness_u8(uint32_t color, uint8_t brightness)
 
 void neopixel_set_color(uint32_t color)
 {
-    neopixel_set_color_with_brightness(color, MAX_BRIGHTNESS);
+    neopixel_set_color_with_brightness_u8(color, 255);
 }
 
 void neopixel_set_color_with_brightness(uint32_t color, float brightness)
@@ -428,8 +432,9 @@ static void update_breathing_brightness(void)
     // progress in [0..2*HALF); up then down
     uint32_t period = BREATHING_CYCLE_MS;
     uint32_t t = cycle_time % period;
-    uint8_t min_b = (uint8_t)(BREATHING_MIN_BRIGHTNESS * 255.0f);
-    uint8_t max_b = (uint8_t)(BREATHING_MAX_BRIGHTNESS * 255.0f);
+    // Pre-computed at compile time: avoid float multiply in hot path
+    static const uint8_t min_b = (uint8_t)(int)(BREATHING_MIN_BRIGHTNESS * 255.0f);
+    static const uint8_t max_b = (uint8_t)(int)(BREATHING_MAX_BRIGHTNESS * 255.0f);
     uint8_t range = (uint8_t)(max_b - min_b);
     uint16_t val;
     if (t < BREATHING_HALF_CYCLE_MS) {
@@ -607,15 +612,13 @@ void neopixel_status_task(void)
     last_update_time = get_current_time_ms();
 
     // Use override status if active, otherwise update normally
-    // TEMPORARILY DISABLED: Status colors for debugging UART
-    // Only show activity flashes (blue=mouse, green=TX, red=RX)
-    // if (g_led_controller.status_override_active) {
-    //     if (g_led_controller.current_status != g_led_controller.status_override) {
-    //         apply_status_change(g_led_controller.status_override);
-    //     }
-    // } else {
-    //     neopixel_update_status();
-    // }
+    if (g_led_controller.status_override_active) {
+        if (g_led_controller.current_status != g_led_controller.status_override) {
+            apply_status_change(g_led_controller.status_override);
+        }
+    } else {
+        neopixel_update_status();
+    }
 
     // Handle special effects (order matters for priority)
     handle_activity_flash();

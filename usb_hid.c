@@ -36,8 +36,6 @@ static void utf16_to_utf8(uint16_t *utf16_buf, size_t utf16_buf_bytes, char *utf
     // String descriptor format: [bLength (1B)][bDescriptorType (1B)][UTF-16LE code units...]
     // Determine actual descriptor length from first byte
     const uint8_t *raw = (const uint8_t *)utf16_buf;
-    if (!raw)
-        return;
 
     // Cap length by provided buffer size to be safe
     uint8_t bLength = raw[0];
@@ -126,6 +124,45 @@ void force_usb_reenumeration() {
     }
 }
 
+//--------------------------------------------------------------------+
+// USB Descriptor Cloning Infrastructure
+//--------------------------------------------------------------------+
+
+// Forward declarations
+static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_t mouse_len);
+static void rebuild_configuration_descriptor(void);
+static void parse_host_config_descriptor(const uint8_t *cfg_desc, uint16_t cfg_len);
+static void reset_device_string_descriptors(void);  // Defined after all global state
+
+// Captured host device descriptor fields for cloning
+static struct {
+    uint16_t bcdUSB;
+    uint8_t  bDeviceClass;
+    uint8_t  bDeviceSubClass;
+    uint8_t  bDeviceProtocol;
+    uint8_t  bMaxPacketSize0;
+    uint16_t bcdDevice;
+    uint8_t  iManufacturer;
+    uint8_t  iProduct;
+    uint8_t  iSerialNumber;
+    bool     valid;
+} host_device_info = { .bcdUSB = 0x0200, .bMaxPacketSize0 = 64, .bcdDevice = 0x0100, .valid = false };
+
+// Captured host config descriptor fields for cloning
+static struct {
+    uint8_t  bmAttributes;     // Self-powered, remote wakeup
+    uint8_t  bMaxPower;        // In 2mA units
+    uint8_t  bInterfaceProtocol; // Boot mouse protocol etc
+    uint8_t  bInterfaceSubClass;
+    uint16_t wMaxPacketSize;   // Endpoint max packet size
+    uint8_t  bInterval;        // Polling interval
+    bool     valid;
+} host_config_info = { .bmAttributes = TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, .bMaxPower = USB_CONFIG_POWER_MA / 2, .bInterfaceProtocol = HID_ITF_PROTOCOL_NONE, .bInterfaceSubClass = 0, .wMaxPacketSize = CFG_TUD_HID_EP_BUFSIZE, .bInterval = HID_POLLING_INTERVAL_MS, .valid = false };
+
+// Runtime configuration descriptor buffer (mutable so we can patch it)
+static uint8_t desc_configuration_runtime[TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN];
+static bool desc_config_runtime_valid = false;
+
 // Function to fetch string descriptors from attached device
 static void fetch_device_string_descriptors(uint8_t dev_addr) {
     // Reset string descriptors
@@ -174,14 +211,8 @@ static void fetch_device_string_descriptors(uint8_t dev_addr) {
     string_descriptors_fetched = true;
 }
 
-// Function to reset string descriptors when device is disconnected
-static void reset_device_string_descriptors(void) {
-    memset(attached_manufacturer, 0, sizeof(attached_manufacturer));
-    memset(attached_product, 0, sizeof(attached_product));
-    memset(attached_serial, 0, sizeof(attached_serial));
-    string_descriptors_fetched = false;
-    attached_has_serial = false;
-}
+// reset_device_string_descriptors() — defined after all global state declarations
+// (see forward declaration above)
 
 // Function to get the VID of the attached device
 uint16_t get_attached_vid(void) {
@@ -255,7 +286,10 @@ static bool process_keyboard_report_internal(const hid_keyboard_report_t *report
 static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 
 // --- Runtime HID descriptor mirroring storage & helpers ---
-#define HID_DESC_BUF_SIZE 256
+// Gaming mice (Razer, Logitech, SteelSeries) can have very large HID
+// report descriptors — 500-1000+ bytes with multiple collections for
+// mouse, keyboard macros, and vendor-specific features.
+#define HID_DESC_BUF_SIZE 1024
 
 static const uint8_t desc_hid_keyboard[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))};
@@ -281,28 +315,493 @@ static size_t host_mouse_desc_len = 0;
 static bool host_mouse_has_report_id = false;
 static uint8_t host_mouse_report_id = 0;
 
+// --- Raw report forwarding for gaming mice ---
+// When we clone the host mouse's HID report descriptor, we must send reports
+// in the exact same binary format.  We parse the host descriptor to discover
+// the byte layout (offsets & widths of buttons, X, Y, wheel) and then forward
+// incoming reports with kmbox/smooth deltas injected in-place.
+//
+// Layout populated by parse_mouse_report_layout() during tuh_hid_mount_cb.
+typedef struct {
+    // Total expected report size (excluding report-ID prefix byte)
+    uint8_t  report_size;
+
+    // Button byte
+    uint8_t  buttons_offset;
+    uint8_t  buttons_bits;     // typically 5 or 8
+
+    // X axis
+    uint8_t  x_offset;         // byte offset from start of report data
+    bool     x_is_16bit;       // true for gaming mice, false for boot mice
+
+    // Y axis
+    uint8_t  y_offset;
+    bool     y_is_16bit;
+
+    // Wheel (vertical scroll)
+    uint8_t  wheel_offset;
+    bool     has_wheel;
+
+    // Horizontal scroll / pan
+    uint8_t  pan_offset;
+    bool     has_pan;
+
+    // Report ID for the mouse collection (0 = no report IDs in descriptor)
+    uint8_t  mouse_report_id;
+    bool     has_report_id;
+
+    bool     valid;            // true once successfully parsed
+} mouse_report_layout_t;
+
+static mouse_report_layout_t host_mouse_layout = { .valid = false };
+
+// Track which dev_addr we've already cloned device/config descriptors for,
+// so we only do it once for multi-interface composite devices (e.g. Razer
+// Basilisk V3 has 4 HID interfaces, each triggers tuh_hid_mount_cb).
+static uint8_t cloned_dev_addr = 0;
+
+// Runtime report IDs — may be remapped to avoid conflicts with host mouse descriptor
+static uint8_t runtime_kbd_report_id = REPORT_ID_KEYBOARD;
+static uint8_t runtime_consumer_report_id = REPORT_ID_CONSUMER_CONTROL;
+
+// Function to reset string descriptors and cloned state when device is disconnected
+static void reset_device_string_descriptors(void) {
+    memset(attached_manufacturer, 0, sizeof(attached_manufacturer));
+    memset(attached_product, 0, sizeof(attached_product));
+    memset(attached_serial, 0, sizeof(attached_serial));
+    string_descriptors_fetched = false;
+    attached_has_serial = false;
+    
+    // Reset cloned descriptor state
+    host_device_info.valid = false;
+    host_config_info.valid = false;
+    host_mouse_layout.valid = false;
+    host_mouse_desc_len = 0;
+    host_mouse_has_report_id = false;
+    host_mouse_report_id = 0;
+    cloned_dev_addr = 0;
+    
+    // Reset runtime report IDs to defaults
+    runtime_kbd_report_id = REPORT_ID_KEYBOARD;
+    runtime_consumer_report_id = REPORT_ID_CONSUMER_CONTROL;
+    
+    // Rebuild config descriptor with defaults
+    build_runtime_hid_report_with_mouse(NULL, 0);
+    rebuild_configuration_descriptor();
+}
+
+// Minimal HID descriptor parser — extracts report field layout for the mouse
+// collection so we know where to inject deltas in raw reports.
+// This is intentionally simple and handles the common gaming mouse patterns:
+//   buttons (1-3 bytes), X (8/12/16 bit), Y (8/12/16 bit), wheel, pan.
+static void parse_mouse_report_layout(const uint8_t *desc, size_t len,
+                                       mouse_report_layout_t *layout)
+{
+    memset(layout, 0, sizeof(*layout));
+    layout->valid = false;
+
+    if (!desc || len < 4) return;
+
+    // HID descriptor state machine — minimal implementation
+    bool in_mouse_collection = false;
+    uint8_t usage_page = 0;
+    uint8_t usage = 0;
+    uint32_t bit_offset = 0;        // current bit position in the report
+    uint32_t mouse_bit_max = 0;     // track highest bit offset within mouse collection
+    uint8_t report_size_bits = 0;   // current REPORT_SIZE
+    uint8_t report_count = 0;       // current REPORT_COUNT
+    int collection_depth = 0;
+    int mouse_collection_depth = -1;
+    uint8_t current_report_id = 0;  // current Report ID context
+    uint8_t mouse_report_id = 0;    // Report ID that contains the mouse collection
+    bool found_mouse_report_id = false;
+
+    // Track what usages we've seen before each INPUT item
+    #define MAX_USAGES 16
+    uint8_t usage_stack[MAX_USAGES];
+    uint8_t usage_stack_count = 0;
+    bool has_usage_range = false;
+
+    size_t i = 0;
+    while (i < len) {
+        uint8_t item = desc[i];
+        uint8_t item_size = item & 0x03;
+        if (item_size == 3) item_size = 4; // size=3 means 4 bytes
+
+        if (i + 1 + item_size > len) break;
+
+        uint32_t value = 0;
+        for (uint8_t b = 0; b < item_size; b++) {
+            value |= (uint32_t)desc[i + 1 + b] << (b * 8);
+        }
+
+        uint8_t item_tag = item & 0xFC; // tag + type
+
+        switch (item_tag) {
+            case 0x04: // Usage Page (Global)
+                usage_page = (uint8_t)value;
+                break;
+            case 0x08: // Usage (Local)
+                if (usage_stack_count < MAX_USAGES) {
+                    usage_stack[usage_stack_count++] = (uint8_t)value;
+                }
+                usage = (uint8_t)value;
+                break;
+            case 0x18: // Usage Minimum (Local)
+                has_usage_range = true;
+                break;
+            case 0x28: // Usage Maximum (Local)
+                break;
+            case 0xA0: // Collection
+                collection_depth++;
+                if (usage_page == HID_USAGE_PAGE_DESKTOP && usage == HID_USAGE_DESKTOP_MOUSE) {
+                    in_mouse_collection = true;
+                    mouse_collection_depth = collection_depth;
+                    // Record which Report ID contains the mouse collection
+                    mouse_report_id = current_report_id;
+                    found_mouse_report_id = (current_report_id != 0);
+                }
+                break;
+            case 0xC0: // End Collection
+                if (in_mouse_collection && collection_depth == mouse_collection_depth) {
+                    // Exiting the mouse collection — record max bit offset for size calc
+                    if (bit_offset > mouse_bit_max) {
+                        mouse_bit_max = bit_offset;
+                    }
+                    in_mouse_collection = false;
+                    mouse_collection_depth = -1;
+                }
+                collection_depth--;
+                break;
+            case 0x74: // Report Size (Global)
+                report_size_bits = (uint8_t)value;
+                break;
+            case 0x94: // Report Count (Global)
+                report_count = (uint8_t)value;
+                break;
+            case 0x80: // Input (Main)
+            {
+                if (in_mouse_collection) {
+                    bool is_constant = (value & 0x01); // bit 0: constant vs data
+                    uint32_t total_bits = (uint32_t)report_size_bits * report_count;
+
+                    if (!is_constant) {
+                        // Determine what this input field is based on usage context
+                        if (usage_page == HID_USAGE_PAGE_BUTTON || has_usage_range) {
+                            // Button field
+                            layout->buttons_offset = bit_offset / 8;
+                            layout->buttons_bits = report_count;
+                        } else if (usage_page == HID_USAGE_PAGE_DESKTOP) {
+                            // Process each usage in the stack
+                            for (uint8_t u = 0; u < usage_stack_count && u < report_count; u++) {
+                                uint8_t cur_usage = usage_stack[u];
+                                uint32_t field_bit_offset = bit_offset + (u * report_size_bits);
+                                uint8_t byte_off = field_bit_offset / 8;
+
+                                if (cur_usage == HID_USAGE_DESKTOP_X) {
+                                    layout->x_offset = byte_off;
+                                    layout->x_is_16bit = (report_size_bits >= 16);
+                                } else if (cur_usage == HID_USAGE_DESKTOP_Y) {
+                                    layout->y_offset = byte_off;
+                                    layout->y_is_16bit = (report_size_bits >= 16);
+                                } else if (cur_usage == HID_USAGE_DESKTOP_WHEEL) {
+                                    layout->wheel_offset = byte_off;
+                                    layout->has_wheel = true;
+                                }
+                            }
+                            // Also handle X,Y packed in a single INPUT with report_count=2
+                            if (usage_stack_count == 0 && usage == HID_USAGE_DESKTOP_X && report_count >= 2) {
+                                layout->x_offset = bit_offset / 8;
+                                layout->x_is_16bit = (report_size_bits >= 16);
+                                layout->y_offset = (bit_offset + report_size_bits) / 8;
+                                layout->y_is_16bit = (report_size_bits >= 16);
+                            }
+                        } else if (usage_page == HID_USAGE_PAGE_CONSUMER) {
+                            // AC Pan (horizontal scroll)
+                            if (usage_stack_count > 0 && usage_stack[0] == 0x38) { // AC Pan = 0x238
+                                layout->pan_offset = bit_offset / 8;
+                                layout->has_pan = true;
+                            }
+                        }
+                    }
+
+                    bit_offset += total_bits;
+                }
+
+                // Clear local state after Main item
+                usage_stack_count = 0;
+                has_usage_range = false;
+                break;
+            }
+            case 0x84: // Report ID (Global)
+                // Record the current Report ID context before processing
+                // If we were in the mouse collection, save its final bit offset
+                if (in_mouse_collection && bit_offset > mouse_bit_max) {
+                    mouse_bit_max = bit_offset;
+                }
+                current_report_id = (uint8_t)value;
+                // Reset bit offset for new report ID section
+                // (report ID byte is NOT counted in the bit offset of field data)
+                bit_offset = 0;
+                break;
+        }
+
+        i += 1 + item_size;
+    }
+
+    // Use mouse-specific bit count for report size, not the final global bit_offset
+    // which may include data from non-mouse report IDs after the mouse collection
+    if (in_mouse_collection && bit_offset > mouse_bit_max) {
+        mouse_bit_max = bit_offset; // Still in mouse collection at end of descriptor
+    }
+    layout->report_size = (mouse_bit_max + 7) / 8;
+    
+    // Store the discovered report ID
+    layout->mouse_report_id = mouse_report_id;
+    layout->has_report_id = found_mouse_report_id;
+    
+    if (layout->report_size < 3) {
+        // Too small to be a valid mouse report
+        return;
+    }
+    layout->valid = true;
+
+    // Debug output
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Layout: sz=%u rid=%u btn@%u x@%u(%s) y@%u(%s) whl@%u pan@%u",
+             layout->report_size,
+             layout->mouse_report_id,
+             layout->buttons_offset,
+             layout->x_offset, layout->x_is_16bit ? "16" : "8",
+             layout->y_offset, layout->y_is_16bit ? "16" : "8",
+             layout->has_wheel ? layout->wheel_offset : 0xFF,
+             layout->has_pan ? layout->pan_offset : 0xFF);
+    kmbox_send_status(msg);
+}
+
+// Per-instance HID usage tracking for non-boot-protocol devices (e.g. Logitech receivers)
+// These devices report HID_ITF_PROTOCOL_NONE but we can detect mouse/keyboard
+// usage from parsing the HID report descriptor.
+#define MAX_HID_INSTANCES 16  // CFG_TUH_HID * CFG_TUH_DEVICE_MAX
+typedef struct {
+    uint8_t dev_addr;
+    uint8_t instance;
+    uint8_t effective_protocol;  // HID_ITF_PROTOCOL_MOUSE/KEYBOARD/NONE
+    bool    has_report_id;
+    uint8_t mouse_report_id;     // Report ID for mouse reports (0 if no report IDs)
+    uint8_t keyboard_report_id;  // Report ID for keyboard reports
+    bool    active;
+} hid_instance_info_t;
+
+static hid_instance_info_t hid_instances[MAX_HID_INSTANCES];
+
+static hid_instance_info_t* find_hid_instance(uint8_t dev_addr, uint8_t instance) {
+    for (int i = 0; i < MAX_HID_INSTANCES; i++) {
+        if (hid_instances[i].active && 
+            hid_instances[i].dev_addr == dev_addr && 
+            hid_instances[i].instance == instance) {
+            return &hid_instances[i];
+        }
+    }
+    return NULL;
+}
+
+static hid_instance_info_t* alloc_hid_instance(uint8_t dev_addr, uint8_t instance) {
+    // First check if already exists
+    hid_instance_info_t* existing = find_hid_instance(dev_addr, instance);
+    if (existing) return existing;
+    
+    // Find empty slot
+    for (int i = 0; i < MAX_HID_INSTANCES; i++) {
+        if (!hid_instances[i].active) {
+            memset(&hid_instances[i], 0, sizeof(hid_instance_info_t));
+            hid_instances[i].dev_addr = dev_addr;
+            hid_instances[i].instance = instance;
+            hid_instances[i].active = true;
+            return &hid_instances[i];
+        }
+    }
+    return NULL;
+}
+
+static void free_hid_instances_for_device(uint8_t dev_addr) {
+    for (int i = 0; i < MAX_HID_INSTANCES; i++) {
+        if (hid_instances[i].active && hid_instances[i].dev_addr == dev_addr) {
+            hid_instances[i].active = false;
+        }
+    }
+}
+
+// Detect mouse/keyboard usage from HID report descriptor
+// Returns effective protocol: HID_ITF_PROTOCOL_MOUSE, HID_ITF_PROTOCOL_KEYBOARD, or HID_ITF_PROTOCOL_NONE
+static uint8_t detect_usage_from_report_descriptor(const uint8_t *desc_report, uint16_t desc_len,
+                                                    hid_instance_info_t *info) {
+    if (!desc_report || desc_len == 0) return HID_ITF_PROTOCOL_NONE;
+    
+    // Use TinyUSB's built-in parser
+    tuh_hid_report_info_t report_info[8];
+    uint8_t report_count = tuh_hid_parse_report_descriptor(report_info, 8, desc_report, desc_len);
+    
+    uint8_t detected_protocol = HID_ITF_PROTOCOL_NONE;
+    
+    for (uint8_t i = 0; i < report_count; i++) {
+        if (report_info[i].usage_page == HID_USAGE_PAGE_DESKTOP) {
+            if (report_info[i].usage == HID_USAGE_DESKTOP_MOUSE) {
+                detected_protocol = HID_ITF_PROTOCOL_MOUSE;
+                if (info) {
+                    info->has_report_id = (report_info[i].report_id != 0);
+                    info->mouse_report_id = report_info[i].report_id;
+                }
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Detected MOUSE usage (report_id=%u)", report_info[i].report_id);
+                kmbox_send_status(msg);
+                break;  // Mouse takes priority
+            } else if (report_info[i].usage == HID_USAGE_DESKTOP_KEYBOARD) {
+                detected_protocol = HID_ITF_PROTOCOL_KEYBOARD;
+                if (info) {
+                    info->has_report_id = (report_info[i].report_id != 0);
+                    info->keyboard_report_id = report_info[i].report_id;
+                }
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Detected KEYBOARD usage (report_id=%u)", report_info[i].report_id);
+                kmbox_send_status(msg);
+                // Don't break - keep looking for mouse
+            }
+        }
+    }
+    
+    return detected_protocol;
+}
+
 static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_t mouse_len)
 {
-    // Concatenate keyboard + mouse_desc (or default) + consumer into runtime buffer
+    // Build the composite HID report descriptor:
+    //   Keyboard (report ID N) + Mouse (report ID M) + Consumer Control (report ID P)
+    //
+    // CRITICAL CONSTRAINT (USB HID §5.6): When ANY top-level collection uses a
+    // Report ID, ALL collections in the descriptor MUST have a Report ID.
+    // Our keyboard and consumer descriptors always have Report IDs, so we MUST
+    // ensure the mouse portion also has one.
+    //
+    // For gaming mice whose descriptors already contain Report IDs, we use the
+    // descriptor as-is and remap keyboard/consumer to avoid conflicts.
+    //
+    // For boot-protocol mice (or mice whose descriptors lack Report IDs), we
+    // inject REPORT_ID_MOUSE (2) into the mouse descriptor so it's valid in the
+    // composite.
+    
+    // --- Scan mouse descriptor for existing Report IDs ---
+    bool used_ids[256];
+    memset(used_ids, 0, sizeof(used_ids));
+    bool mouse_has_report_ids = false;
+    
+    if (mouse_desc != NULL && mouse_len > 0) {
+        for (size_t i = 0; i + 1 < mouse_len; i++) {
+            if (mouse_desc[i] == 0x85) { // Report ID tag (1-byte value)
+                used_ids[mouse_desc[i + 1]] = true;
+                mouse_has_report_ids = true;
+            }
+        }
+    }
+    
+    // --- If mouse has no Report IDs, we'll inject REPORT_ID_MOUSE ---
+    // Build a modified copy with Report ID inserted after the first
+    // Collection(Application) tag [0xA1, 0x01].
+    uint8_t mouse_desc_patched[HID_DESC_BUF_SIZE];
+    size_t mouse_len_patched = 0;
+    const uint8_t *mouse_desc_final = mouse_desc;
+    size_t mouse_len_final = mouse_len;
+    
+    if (mouse_desc != NULL && mouse_len > 0 && !mouse_has_report_ids) {
+        // Inject Report ID after first Collection(Application)
+        bool injected = false;
+        size_t dst = 0;
+        for (size_t src = 0; src < mouse_len && dst < sizeof(mouse_desc_patched) - 2; src++) {
+            mouse_desc_patched[dst++] = mouse_desc[src];
+            
+            // Look for Collection(Application): 0xA1 0x01
+            if (!injected && src + 1 < mouse_len &&
+                mouse_desc[src] == 0xA1 && mouse_desc[src + 1] == 0x01) {
+                // Copy the 0x01 value byte
+                src++;
+                mouse_desc_patched[dst++] = mouse_desc[src];
+                // Inject Report ID(REPORT_ID_MOUSE)
+                mouse_desc_patched[dst++] = 0x85; // Report ID tag
+                mouse_desc_patched[dst++] = REPORT_ID_MOUSE;
+                injected = true;
+            }
+        }
+        
+        if (injected) {
+            mouse_len_patched = dst;
+            mouse_desc_final = mouse_desc_patched;
+            mouse_len_final = mouse_len_patched;
+            used_ids[REPORT_ID_MOUSE] = true;
+            
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Injected Report ID %u into mouse desc (%zu->%zu bytes)",
+                     REPORT_ID_MOUSE, mouse_len, mouse_len_patched);
+            kmbox_send_status(msg);
+        }
+    }
+    
+    // --- Determine safe Report IDs for keyboard and consumer ---
+    uint8_t kbd_report_id = REPORT_ID_KEYBOARD;      // default 1
+    uint8_t consumer_report_id = REPORT_ID_CONSUMER_CONTROL; // default 3
+    
+    // If default keyboard ID conflicts, find an unused one starting from 0x10
+    if (used_ids[kbd_report_id]) {
+        for (uint8_t id = 0x10; id < 0xFE; id++) {
+            if (!used_ids[id]) { kbd_report_id = id; break; }
+        }
+    }
+    used_ids[kbd_report_id] = true; // Mark it used
+    
+    // Same for consumer
+    if (used_ids[consumer_report_id]) {
+        for (uint8_t id = 0x11; id < 0xFE; id++) {
+            if (!used_ids[id]) { consumer_report_id = id; break; }
+        }
+    }
+    
+    // Build remapped keyboard and consumer descriptors
+    uint8_t kbd_desc[sizeof(desc_hid_keyboard)];
+    memcpy(kbd_desc, desc_hid_keyboard, sizeof(desc_hid_keyboard));
+    for (size_t i = 0; i + 1 < sizeof(kbd_desc); i++) {
+        if (kbd_desc[i] == 0x85 && kbd_desc[i+1] == REPORT_ID_KEYBOARD) {
+            kbd_desc[i+1] = kbd_report_id;
+            break;
+        }
+    }
+    
+    uint8_t consumer_desc[sizeof(desc_hid_consumer)];
+    memcpy(consumer_desc, desc_hid_consumer, sizeof(desc_hid_consumer));
+    for (size_t i = 0; i + 1 < sizeof(consumer_desc); i++) {
+        if (consumer_desc[i] == 0x85 && consumer_desc[i+1] == REPORT_ID_CONSUMER_CONTROL) {
+            consumer_desc[i+1] = consumer_report_id;
+            break;
+        }
+    }
+    
     size_t pos = 0;
 
-    // Copy keyboard
-    size_t klen = sizeof(desc_hid_keyboard);
-    if (pos + klen >= HID_DESC_BUF_SIZE)
+    // Copy keyboard descriptor
+    if (pos + sizeof(kbd_desc) >= HID_DESC_BUF_SIZE)
         return;
-    memcpy(&desc_hid_report_runtime[pos], desc_hid_keyboard, klen);
-    pos += klen;
+    memcpy(&desc_hid_report_runtime[pos], kbd_desc, sizeof(kbd_desc));
+    pos += sizeof(kbd_desc);
 
-    // Copy mouse (provided) or default
-    if (mouse_desc != NULL && mouse_len > 0)
+    // Copy mouse descriptor (possibly patched with injected Report ID)
+    if (mouse_desc_final != NULL && mouse_len_final > 0)
     {
-        if (pos + mouse_len >= HID_DESC_BUF_SIZE)
+        if (pos + mouse_len_final >= HID_DESC_BUF_SIZE)
             return;
-        memcpy(&desc_hid_report_runtime[pos], mouse_desc, mouse_len);
-        pos += mouse_len;
+        memcpy(&desc_hid_report_runtime[pos], mouse_desc_final, mouse_len_final);
+        pos += mouse_len_final;
     }
     else
     {
+        // Fallback to standard boot-protocol mouse descriptor (report ID 2)
         size_t dlen = sizeof(desc_hid_mouse_default);
         if (pos + dlen >= HID_DESC_BUF_SIZE)
             return;
@@ -310,21 +809,37 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
         pos += dlen;
     }
 
-    // Copy consumer
-    size_t clen = sizeof(desc_hid_consumer);
-    if (pos + clen >= HID_DESC_BUF_SIZE)
+    // Copy consumer control descriptor
+    if (pos + sizeof(consumer_desc) >= HID_DESC_BUF_SIZE)
         return;
-    memcpy(&desc_hid_report_runtime[pos], desc_hid_consumer, clen);
-    pos += clen;
+    memcpy(&desc_hid_report_runtime[pos], consumer_desc, sizeof(consumer_desc));
+    pos += sizeof(consumer_desc);
 
-    // Pad remainder with END_COLLECTION (0xC0) which is a safe terminator
-    for (; pos < HID_DESC_BUF_SIZE; ++pos)
-    {
-        desc_hid_report_runtime[pos] = 0xC0;
+    // Zero-fill remainder
+    if (pos < HID_DESC_BUF_SIZE) {
+        memset(&desc_hid_report_runtime[pos], 0, HID_DESC_BUF_SIZE - pos);
     }
 
-    desc_hid_runtime_len = HID_DESC_BUF_SIZE;
+    // Set actual content length so host reads only valid descriptor data
+    desc_hid_runtime_len = pos;
     desc_hid_runtime_valid = true;
+    
+    // Store the runtime IDs for use by all report-sending paths
+    runtime_kbd_report_id = kbd_report_id;
+    runtime_consumer_report_id = consumer_report_id;
+    
+    char msg[96];
+    snprintf(msg, sizeof(msg), "HID desc: %zu bytes, kbd_id=%u mouse_rid=%s consumer_id=%u",
+             pos, kbd_report_id,
+             mouse_has_report_ids ? "native" : "injected",
+             consumer_report_id);
+    kmbox_send_status(msg);
+    
+    if (kbd_report_id != REPORT_ID_KEYBOARD || consumer_report_id != REPORT_ID_CONSUMER_CONTROL) {
+        snprintf(msg, sizeof(msg), "Remapped IDs: kbd=%u consumer=%u (was %u/%u)",
+                 kbd_report_id, consumer_report_id, REPORT_ID_KEYBOARD, REPORT_ID_CONSUMER_CONTROL);
+        kmbox_send_status(msg);
+    }
 }
 
 bool usb_hid_init(void)
@@ -337,8 +852,14 @@ bool usb_hid_init(void)
     // Initialize connection state
     memset(&connection_state, 0, sizeof(connection_state));
 
+    // Initialize per-instance HID tracking
+    memset(hid_instances, 0, sizeof(hid_instances));
+
     // Build default runtime HID report descriptor (keyboard + default mouse + consumer)
     build_runtime_hid_report_with_mouse(NULL, 0);
+
+    // Build initial runtime config descriptor with defaults
+    rebuild_configuration_descriptor();
 
     (void)0; // suppressed init log
     return true;
@@ -444,8 +965,16 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
         return false;
     }
 
-    // Fast path: skip ready check for maximum performance
-    bool success = tud_hid_report(REPORT_ID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+    // CRITICAL FIX: Check readiness before attempting to send
+    // If endpoint is busy, return true anyway to avoid blocking the HID report pipeline
+    // The keyboard state will be sent with the next available opportunity
+    if (!tud_hid_ready())
+    {
+        return true;  // Endpoint busy, continue processing without blocking
+    }
+
+    // Fast path: send report immediately if endpoint is ready
+    bool success = tud_hid_report(runtime_kbd_report_id, report, sizeof(hid_keyboard_report_t));
     if (success)
     {
         // Skip error counter reset for performance
@@ -457,15 +986,159 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
     }
 }
 
+// Helper: forward a raw mouse report with kmbox/smooth deltas injected.
+// When we have parsed the host mouse's HID descriptor layout we can
+// modify the raw bytes in-place so the downstream PC gets a report that
+// exactly matches the cloned descriptor.  Falls back to the legacy
+// hid_mouse_report_t path when the layout is unknown.
+static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, uint16_t raw_len)
+{
+    // We need a mutable copy to inject deltas
+    uint8_t buf[64];
+    if (raw_len > sizeof(buf)) raw_len = sizeof(buf);
+    memcpy(buf, raw, raw_len);
+
+    const mouse_report_layout_t *L = &host_mouse_layout;
+
+    // --- Extract physical movement from the raw report ---
+    int16_t phys_x = 0, phys_y = 0;
+    int8_t  phys_wheel = 0;
+    uint8_t phys_buttons = 0;
+
+    if (L->buttons_offset < raw_len) {
+        phys_buttons = buf[L->buttons_offset] & ((1u << L->buttons_bits) - 1);
+    }
+
+    if (L->x_is_16bit) {
+        if (L->x_offset + 1 < raw_len)
+            phys_x = (int16_t)(buf[L->x_offset] | (buf[L->x_offset + 1] << 8));
+    } else {
+        if (L->x_offset < raw_len)
+            phys_x = (int8_t)buf[L->x_offset];
+    }
+
+    if (L->y_is_16bit) {
+        if (L->y_offset + 1 < raw_len)
+            phys_y = (int16_t)(buf[L->y_offset] | (buf[L->y_offset + 1] << 8));
+    } else {
+        if (L->y_offset < raw_len)
+            phys_y = (int8_t)buf[L->y_offset];
+    }
+
+    if (L->has_wheel && L->wheel_offset < raw_len) {
+        phys_wheel = (int8_t)buf[L->wheel_offset];
+    }
+
+    // --- Feed physical data into the kmbox accumulator / smooth system ---
+    kmbox_update_physical_buttons(phys_buttons & 0x1F);
+
+    if (phys_x != 0 || phys_y != 0) {
+        int16_t tx, ty;
+        kmbox_transform_movement(phys_x, phys_y, &tx, &ty);
+        smooth_record_physical_movement(tx, ty);
+        kmbox_add_mouse_movement(tx, ty);
+    }
+    if (phys_wheel != 0) {
+        kmbox_add_wheel_movement(phys_wheel);
+    }
+
+    // --- Get combined movement (physical + bridge/kmbox pending) ---
+    uint8_t btn_send;
+    int8_t  mx8, my8, mwheel, mpan;
+    kmbox_get_mouse_report(&btn_send, &mx8, &my8, &mwheel, &mpan);
+
+    // Widen to 16-bit for accumulation
+    int16_t mx = mx8, my = my8;
+
+    // Blend smooth injection
+    int8_t smooth_x = 0, smooth_y = 0;
+    if (smooth_has_pending()) {
+        smooth_process_frame(&smooth_x, &smooth_y);
+        mx += smooth_x;
+        my += smooth_y;
+    }
+
+    // --- Check endpoint readiness ---
+    if (!tud_hid_ready()) {
+        // Re-accumulate raw (pre-smooth) movement to avoid losing it
+        int16_t raw_mx = mx - smooth_x;
+        int16_t raw_my = my - smooth_y;
+        if (raw_mx != 0 || raw_my != 0)
+            kmbox_add_mouse_movement((int16_t)raw_mx, (int16_t)raw_my);
+        if (mwheel != 0)
+            kmbox_add_wheel_movement(mwheel);
+        return true;
+    }
+
+    // --- Patch the raw report buffer with combined values ---
+    // Buttons
+    if (L->buttons_offset < raw_len) {
+        // Preserve any high bits (extra buttons) from the physical report
+        uint8_t btn_mask = (uint8_t)((1u << L->buttons_bits) - 1);
+        buf[L->buttons_offset] = (buf[L->buttons_offset] & ~btn_mask) | (btn_send & btn_mask);
+    }
+
+    // X axis
+    if (L->x_is_16bit) {
+        // Clamp to int16 range
+        int32_t cx = mx;
+        if (cx > 32767) cx = 32767;
+        if (cx < -32768) cx = -32768;
+        if (L->x_offset + 1 < raw_len) {
+            buf[L->x_offset]     = (uint8_t)(cx & 0xFF);
+            buf[L->x_offset + 1] = (uint8_t)((cx >> 8) & 0xFF);
+        }
+    } else {
+        int16_t cx = mx;
+        if (cx > 127) cx = 127;
+        if (cx < -128) cx = -128;
+        if (L->x_offset < raw_len)
+            buf[L->x_offset] = (uint8_t)(int8_t)cx;
+    }
+
+    // Y axis
+    if (L->y_is_16bit) {
+        int32_t cy = my;
+        if (cy > 32767) cy = 32767;
+        if (cy < -32768) cy = -32768;
+        if (L->y_offset + 1 < raw_len) {
+            buf[L->y_offset]     = (uint8_t)(cy & 0xFF);
+            buf[L->y_offset + 1] = (uint8_t)((cy >> 8) & 0xFF);
+        }
+    } else {
+        int16_t cy = my;
+        if (cy > 127) cy = 127;
+        if (cy < -128) cy = -128;
+        if (L->y_offset < raw_len)
+            buf[L->y_offset] = (uint8_t)(int8_t)cy;
+    }
+
+    // Wheel
+    if (L->has_wheel && L->wheel_offset < raw_len) {
+        int16_t cw = mwheel;
+        if (cw > 127) cw = 127;
+        if (cw < -128) cw = -128;
+        buf[L->wheel_offset] = (uint8_t)(int8_t)cw;
+    }
+
+    // Pan
+    if (L->has_pan && L->pan_offset < raw_len) {
+        int16_t cp = mpan;
+        if (cp > 127) cp = 127;
+        if (cp < -128) cp = -128;
+        buf[L->pan_offset] = (uint8_t)(int8_t)cp;
+    }
+
+    // Send the raw report using the mouse report ID from the parsed layout.
+    // When the host mouse descriptor uses Report IDs, we must forward with
+    // the same ID.  When it doesn't, use our default REPORT_ID_MOUSE.
+    uint8_t rid = L->has_report_id ? L->mouse_report_id : REPORT_ID_MOUSE;
+    return tud_hid_report(rid, buf, raw_len);
+}
+
 static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_report_t *report)
 {
     if (report == NULL)
-    {
-        return false;
-    }
-
-    // Check if USB device is ready to send reports
-    if (!tud_mounted() || !tud_ready())
     {
         return false;
     }
@@ -483,7 +1156,7 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         int16_t transformed_x, transformed_y;
         kmbox_transform_movement(report->x, report->y, &transformed_x, &transformed_y);
         
-        smooth_record_physical_movement((int8_t)transformed_x, (int8_t)transformed_y);
+        smooth_record_physical_movement(transformed_x, transformed_y);
         kmbox_add_mouse_movement(transformed_x, transformed_y);
     }
 
@@ -514,17 +1187,30 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         y = (total_y > 127) ? 127 : ((total_y < -128) ? -128 : (int8_t)total_y);
     }
 
+    // Save pre-smooth values for re-accumulation if endpoint is busy
+    int8_t raw_x = x - smooth_x;
+    int8_t raw_y = y - smooth_y;
     int8_t final_x = x;
     int8_t final_y = y;
     int8_t final_wheel = wheel;
 
-    // Check if HID interface is ready
+    // Check readiness right before send to minimize latency
+    // If not ready, re-accumulate ONLY the raw kmbox values (before smooth injection)
+    // to avoid doubling the smooth injection delta on next cycle
     if (!tud_hid_ready())
     {
-        return false;
+        // Endpoint busy - put back only the raw consumed movement (pre-smooth)
+        // We must NOT re-add the smooth injection delta or it compounds each miss
+        if (raw_x != 0 || raw_y != 0) {
+            kmbox_add_mouse_movement(raw_x, raw_y);
+        }
+        if (wheel != 0) {
+            kmbox_add_wheel_movement(wheel);
+        }
+        return true;
     }
 
-    // Fast path: skip ready check for maximum performance
+    // Send the report
     bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons_to_send, final_x, final_y, final_wheel, pan);
     return success;
 }
@@ -583,15 +1269,14 @@ bool find_key_in_report(const hid_keyboard_report_t *report, uint8_t keycode)
         return false;
     }
 
-    for (uint8_t i = 0; i < HID_KEYBOARD_KEYCODE_COUNT; i++)
-    {
-        if (report->keycode[i] == keycode)
-        {
-            return true;
-        }
-    }
-
-    return false;
+    // Unrolled loop - HID_KEYBOARD_KEYCODE_COUNT is always 6
+    // Avoids branch overhead on RP2350 Cortex-M33 pipeline
+    return (report->keycode[0] == keycode) |
+           (report->keycode[1] == keycode) |
+           (report->keycode[2] == keycode) |
+           (report->keycode[3] == keycode) |
+           (report->keycode[4] == keycode) |
+           (report->keycode[5] == keycode);
 }
 
 void hid_device_task(void)
@@ -620,48 +1305,114 @@ void hid_device_task(void)
         return;
     }
 
-    // CRITICAL FIX: Always check for pending bridge movements and flush them
-    // This ensures bridge commands work even when physical mouse is connected but idle
-    // BUT: Don't send standalone smooth injection reports when physical mouse is connected
-    // (smooth injections piggyback on physical reports to avoid doubling report count)
-    if (kmbox_has_pending_movement() && tud_hid_ready())
+    // Flush pending bridge/smooth movements from Core0
+    // CRITICAL: When a physical mouse IS connected, Core1 handles physical movement
+    // via process_mouse_report_internal() which drains kmbox accumulators.
+    // We must NOT drain accumulators here when mouse is connected or we race Core1
+    // and steal its movement data. Only drain smooth injection standalone when
+    // mouse is connected but idle.
+    if (tud_hid_ready())
     {
-        // Only send standalone reports if no physical mouse is connected
-        // Otherwise, smooth injections will blend with physical mouse reports
+        bool has_kmbox = kmbox_has_pending_movement();
+        bool has_smooth = smooth_has_pending();
+        
+        if (!has_kmbox && !has_smooth) goto skip_flush;
+        
         if (!connection_state.mouse_connected)
         {
-            // Flush any pending bridge movements by sending a mouse report
+            // No physical mouse — Core0 is the only sender, safe to drain everything
             uint8_t buttons;
             int8_t x, y, wheel, pan;
             kmbox_get_mouse_report(&buttons, &x, &y, &wheel, &pan);
             
-            // Process smooth injection queue for standalone injection
             int8_t smooth_x = 0, smooth_y = 0;
-            if (smooth_has_pending())
-            {
+            if (has_smooth) {
                 smooth_process_frame(&smooth_x, &smooth_y);
-                // Add smooth injection to the kmbox movement
                 int16_t total_x = (int16_t)x + (int16_t)smooth_x;
                 int16_t total_y = (int16_t)y + (int16_t)smooth_y;
                 x = (total_x > 127) ? 127 : ((total_x < -128) ? -128 : (int8_t)total_x);
                 y = (total_y > 127) ? 127 : ((total_y < -128) ? -128 : (int8_t)total_y);
             }
             
-            tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
-            return;  // One report per task call to avoid overwhelming USB
+            if (x != 0 || y != 0 || wheel != 0 || buttons != 0) {
+                // When we have a cloned gaming mouse layout, build a raw report
+                // that matches the descriptor format.  Otherwise use the standard API.
+                if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
+                    uint8_t raw[64];
+                    memset(raw, 0, sizeof(raw));
+                    uint8_t sz = host_mouse_layout.report_size;
+                    if (sz > sizeof(raw)) sz = sizeof(raw);
+
+                    const mouse_report_layout_t *L = &host_mouse_layout;
+                    if (L->buttons_offset < sz)
+                        raw[L->buttons_offset] = buttons;
+                    if (L->x_is_16bit) {
+                        if (L->x_offset + 1 < sz) { raw[L->x_offset] = (uint8_t)x; raw[L->x_offset+1] = (x < 0) ? 0xFF : 0x00; }
+                    } else {
+                        if (L->x_offset < sz) raw[L->x_offset] = (uint8_t)x;
+                    }
+                    if (L->y_is_16bit) {
+                        if (L->y_offset + 1 < sz) { raw[L->y_offset] = (uint8_t)y; raw[L->y_offset+1] = (y < 0) ? 0xFF : 0x00; }
+                    } else {
+                        if (L->y_offset < sz) raw[L->y_offset] = (uint8_t)y;
+                    }
+                    if (L->has_wheel && L->wheel_offset < sz)
+                        raw[L->wheel_offset] = (uint8_t)wheel;
+                    if (L->has_pan && L->pan_offset < sz)
+                        raw[L->pan_offset] = (uint8_t)pan;
+
+                    uint8_t rid = L->has_report_id ? L->mouse_report_id : REPORT_ID_MOUSE;
+                    tud_hid_report(rid, raw, sz);
+                } else {
+                    tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
+                }
+                return;
+            }
+        }
+        else if (has_smooth)
+        {
+            // Physical mouse IS connected — only send standalone smooth injection.
+            // Do NOT drain kmbox accumulators (Core1 owns those).
+            int8_t smooth_x = 0, smooth_y = 0;
+            smooth_process_frame(&smooth_x, &smooth_y);
+            if (smooth_x != 0 || smooth_y != 0) {
+                if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
+                    uint8_t raw[64];
+                    memset(raw, 0, sizeof(raw));
+                    uint8_t sz = host_mouse_layout.report_size;
+                    if (sz > sizeof(raw)) sz = sizeof(raw);
+
+                    const mouse_report_layout_t *L = &host_mouse_layout;
+                    if (L->x_is_16bit) {
+                        if (L->x_offset + 1 < sz) { raw[L->x_offset] = (uint8_t)smooth_x; raw[L->x_offset+1] = (smooth_x < 0) ? 0xFF : 0x00; }
+                    } else {
+                        if (L->x_offset < sz) raw[L->x_offset] = (uint8_t)smooth_x;
+                    }
+                    if (L->y_is_16bit) {
+                        if (L->y_offset + 1 < sz) { raw[L->y_offset] = (uint8_t)smooth_y; raw[L->y_offset+1] = (smooth_y < 0) ? 0xFF : 0x00; }
+                    } else {
+                        if (L->y_offset < sz) raw[L->y_offset] = (uint8_t)smooth_y;
+                    }
+
+                    uint8_t rid = L->has_report_id ? L->mouse_report_id : REPORT_ID_MOUSE;
+                    tud_hid_report(rid, raw, sz);
+                } else {
+                    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, smooth_x, smooth_y, 0, 0);
+                }
+                return;
+            }
         }
     }
+skip_flush:
 
     // Only send reports when devices are not connected
     if (!connection_state.mouse_connected && !connection_state.keyboard_connected)
     {
         send_hid_report(REPORT_ID_MOUSE);
     }
-    else
-    {
-        // Send empty consumer control report to maintain connection
-        send_hid_report(REPORT_ID_CONSUMER_CONTROL);
-    }
+    // Note: No need to send periodic empty consumer control reports
+    // when devices are connected — HID connections are maintained by
+    // the regular mouse/keyboard reports from the physical devices.
 }
 
 void send_hid_report(uint8_t report_id)
@@ -694,7 +1445,7 @@ void send_hid_report(uint8_t report_id)
             {
                 // Use static array to avoid stack allocation overhead
                 static const uint8_t empty_keycode[HID_KEYBOARD_KEYCODE_COUNT] = {0};
-                tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, empty_keycode);
+                tud_hid_keyboard_report(runtime_kbd_report_id, 0, empty_keycode);
             }
         }
         break;
@@ -735,7 +1486,7 @@ void send_hid_report(uint8_t report_id)
         if (tud_hid_ready())
         {
             static const uint16_t empty_key = 0;
-            tud_hid_report(REPORT_ID_CONSUMER_CONTROL, &empty_key, HID_CONSUMER_CONTROL_SIZE);
+            tud_hid_report(runtime_consumer_report_id, &empty_key, HID_CONSUMER_CONTROL_SIZE);
         }
         break;
     }
@@ -820,70 +1571,192 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
 {
     uint16_t vid, pid;
     tuh_vid_pid_get(dev_addr, &vid, &pid);
-    printf("HID device mounted, VID: %04x, PID: %04x\n", vid, pid);
     
     // Send status to bridge
     char status_msg[128];
-    snprintf(status_msg, sizeof(status_msg), "HID Device: VID=%04X PID=%04X", vid, pid);
+    snprintf(status_msg, sizeof(status_msg), "HID Mount: VID=%04X PID=%04X inst=%u desc=%u",
+             vid, pid, instance, desc_len);
     kmbox_send_status(status_msg);
-    
-    // Fetch string descriptors from the attached device
-    fetch_device_string_descriptors(dev_addr);
-    
-    set_attached_device_vid_pid(vid, pid);
 
-    // Capture host report descriptor for later mirroring
-    host_mouse_has_report_id = false;
-    host_mouse_report_id = 0;
-    if (desc_report != NULL && desc_len > 0)
-    {
+    // === DEVICE-LEVEL CLONING (once per physical device) ===
+    // Composite devices (e.g. Razer Basilisk V3 = 4 HID interfaces) trigger
+    // tuh_hid_mount_cb once per interface. Device/config descriptors and strings
+    // are device-level, so we only need to fetch them once.
+    bool first_interface_for_device = (cloned_dev_addr != dev_addr);
+    
+    if (first_interface_for_device) {
+        cloned_dev_addr = dev_addr;
+        
+        // Fetch string descriptors from the attached device
+        fetch_device_string_descriptors(dev_addr);
+        
+        // Capture full device descriptor for identity cloning
+        tusb_desc_device_t host_dev_desc;
+        if (tuh_descriptor_get_device_sync(dev_addr, &host_dev_desc, sizeof(host_dev_desc)) == XFER_RESULT_SUCCESS) {
+            host_device_info.bcdUSB          = host_dev_desc.bcdUSB;
+            host_device_info.bDeviceClass    = host_dev_desc.bDeviceClass;
+            host_device_info.bDeviceSubClass = host_dev_desc.bDeviceSubClass;
+            host_device_info.bDeviceProtocol = host_dev_desc.bDeviceProtocol;
+            host_device_info.bMaxPacketSize0 = host_dev_desc.bMaxPacketSize0;
+            host_device_info.bcdDevice       = host_dev_desc.bcdDevice;
+            host_device_info.valid           = true;
+            
+            snprintf(status_msg, sizeof(status_msg), "Clone DEV: USB%04X bcd=%04X ep0=%u",
+                     host_dev_desc.bcdUSB, host_dev_desc.bcdDevice, host_dev_desc.bMaxPacketSize0);
+            kmbox_send_status(status_msg);
+        }
+        
+        // Capture configuration descriptor (contains all interfaces + endpoints)
+        uint8_t cfg_buf[256];
+        if (tuh_descriptor_get_configuration_sync(dev_addr, 0, cfg_buf, sizeof(cfg_buf)) == XFER_RESULT_SUCCESS) {
+            parse_host_config_descriptor(cfg_buf, sizeof(cfg_buf));
+        }
+    }
+
+    // === DETERMINE EFFECTIVE PROTOCOL ===
+    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    hid_instance_info_t *inst_info = alloc_hid_instance(dev_addr, instance);
+    uint8_t effective_protocol = itf_protocol;
+    
+    if (itf_protocol == HID_ITF_PROTOCOL_NONE && desc_report != NULL && desc_len > 0) {
+        // Non-boot protocol device — detect usage from report descriptor
+        effective_protocol = detect_usage_from_report_descriptor(desc_report, desc_len, inst_info);
+        
+        snprintf(status_msg, sizeof(status_msg), "Protocol: itf=%u effective=%u inst=%u",
+                 itf_protocol, effective_protocol, instance);
+        kmbox_send_status(status_msg);
+    }
+    
+    if (inst_info) {
+        inst_info->effective_protocol = effective_protocol;
+    }
+
+    // === MOUSE INTERFACE: Capture HID report descriptor ===
+    // CRITICAL: Only capture the mouse descriptor from the mouse interface!
+    // Composite devices have multiple interfaces with different descriptors.
+    // e.g. Razer Basilisk V3:
+    //   Interface 0: Boot Mouse (protocol=2), 79 byte desc — THIS IS THE MOUSE
+    //   Interface 1: Keyboard (protocol=1), 159 byte desc — macro keys
+    //   Interface 2: Keyboard (protocol=1), 61 byte desc — more keys
+    //   Interface 3: Vendor (protocol=0), 22 byte desc — lighting control
+    // We MUST NOT let interfaces 1-3 overwrite the mouse descriptor from interface 0.
+    bool is_mouse_interface = (effective_protocol == HID_ITF_PROTOCOL_MOUSE);
+    
+    if (is_mouse_interface && desc_report != NULL && desc_len > 0) {
+        // Capture this interface's HID report descriptor as the mouse descriptor
         size_t copy_len = desc_len;
         if (copy_len > sizeof(host_mouse_desc))
             copy_len = sizeof(host_mouse_desc);
         memcpy(host_mouse_desc, desc_report, copy_len);
         host_mouse_desc_len = copy_len;
 
-        // Simple scan for Report ID (tag 0x85) in the descriptor to detect if report IDs are used
-        for (size_t i = 0; i + 1 < host_mouse_desc_len; ++i)
-        {
-            if (host_mouse_desc[i] == 0x85)
-            {
-                host_mouse_has_report_id = true;
-                host_mouse_report_id = host_mouse_desc[i + 1];
-                break;
+        // Parse the mouse report layout to discover field offsets for raw forwarding
+        parse_mouse_report_layout(host_mouse_desc, host_mouse_desc_len, &host_mouse_layout);
+        
+        // Use the layout-parsed report ID (extracted from the mouse collection context)
+        // instead of blindly scanning for the first 0x85 tag
+        if (host_mouse_layout.valid && host_mouse_layout.has_report_id) {
+            host_mouse_has_report_id = true;
+            host_mouse_report_id = host_mouse_layout.mouse_report_id;
+        } else {
+            // Fallback: scan for any Report ID tag in the descriptor
+            host_mouse_has_report_id = false;
+            host_mouse_report_id = 0;
+            for (size_t i = 0; i + 1 < host_mouse_desc_len; ++i) {
+                if (host_mouse_desc[i] == 0x85) {
+                    host_mouse_has_report_id = true;
+                    host_mouse_report_id = host_mouse_desc[i + 1];
+                    break;
+                }
             }
         }
+        
+        // Also update instance info with the correct mouse report ID
+        if (inst_info) {
+            inst_info->has_report_id = host_mouse_has_report_id;
+            inst_info->mouse_report_id = host_mouse_report_id;
+        }
 
-    // Rebuild runtime HID report descriptor referencing the host mouse descriptor
-    build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
+        snprintf(status_msg, sizeof(status_msg), "Mouse desc: %zuB rid=%u layout=%s",
+                 host_mouse_desc_len, host_mouse_report_id,
+                 host_mouse_layout.valid ? "OK" : "FAIL");
+        kmbox_send_status(status_msg);
+        
+        // Build runtime HID report descriptor (keyboard + mouse + consumer)
+        build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
+        rebuild_configuration_descriptor();
+        
+        // CRITICAL: set_attached_device_vid_pid() triggers force_usb_reenumeration()
+        // which disconnects/reconnects the device stack. This MUST happen AFTER all
+        // descriptors are fully rebuilt. It also only triggers if VID/PID changed.
+        set_attached_device_vid_pid(vid, pid);
     }
-    else
-    {
-        host_mouse_desc_len = 0;
+    else if (first_interface_for_device && !is_mouse_interface) {
+        // First interface mounted but it's not the mouse — still need to set VID/PID
+        // so we present the correct identity. The mouse descriptor will be captured
+        // when the mouse interface mounts (if it exists).
+        // Don't overwrite host_mouse_desc or host_mouse_layout here!
+        
+        // If we haven't seen a mouse interface yet for this device, build
+        // descriptors with defaults. They'll be rebuilt when mouse mounts.
+        if (host_mouse_desc_len == 0) {
+            build_runtime_hid_report_with_mouse(NULL, 0);
+            rebuild_configuration_descriptor();
+            set_attached_device_vid_pid(vid, pid);
+        }
     }
 
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    // Handle HID device connection using effective protocol
+    handle_hid_device_connection(dev_addr, effective_protocol);
 
-    // Handle HID device connection
-    handle_hid_device_connection(dev_addr, itf_protocol);
-
-    // Start receiving reports
-    if (!tuh_hid_receive_report(dev_addr, instance))
-    {
-    // Receiving reports failed - indicate via LED error flash
-    neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
+    // Start receiving reports — but only from interfaces we actually want.
+    //
+    // Composite gaming mice (e.g. Razer Basilisk V3) expose multiple HID
+    // interfaces on a single dev_addr:
+    //   Interface 0: Boot Mouse (protocol=2)  — WE WANT THIS
+    //   Interface 1: Keyboard (protocol=1)    — macro keys, NOT a real keyboard
+    //   Interface 2: Keyboard (protocol=1)    — media keys, NOT a real keyboard
+    //   Interface 3: Vendor (protocol=0)      — lighting control
+    //
+    // If we receive reports from the non-mouse interfaces, their periodic
+    // status/idle reports get forwarded as keyboard input, causing garbage
+    // keypresses (e.g. '#' flood).
+    //
+    // Rule: Only receive from mouse interfaces, OR from keyboard/vendor
+    // interfaces on a DIFFERENT device (i.e. a standalone keyboard).
+    bool should_receive = false;
+    
+    if (is_mouse_interface) {
+        // Always receive from mouse interfaces
+        should_receive = true;
+    } else if (dev_addr != connection_state.mouse_dev_addr) {
+        // This interface is on a different physical device than the mouse,
+        // so it's a standalone keyboard — receive its reports
+        should_receive = true;
     }
-    else
-    {
-    // Successfully started receiving reports; update status LED
-    neopixel_update_status();
+    // else: non-mouse interface on the same device as the mouse → skip
+
+    if (should_receive) {
+        if (!tuh_hid_receive_report(dev_addr, instance)) {
+            neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
+        } else {
+            neopixel_update_status();
+        }
+    } else {
+        char skip_msg[64];
+        snprintf(skip_msg, sizeof(skip_msg), "Skip recv inst=%u proto=%u (composite non-mouse)",
+                 instance, effective_protocol);
+        kmbox_send_status(skip_msg);
     }
     neopixel_update_status();
 }
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
-    (void)instance; // Suppress unused parameter warning
+    (void)instance;
+
+    // Free per-instance tracking for this device
+    free_hid_instances_for_device(dev_addr);
 
     // Reset string descriptors when device is disconnected
     reset_device_string_descriptors();
@@ -896,6 +1769,58 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
     neopixel_update_status();
 }
 
+// Helper: parse a mouse report from raw bytes, handling variable report sizes.
+// When we have a parsed host mouse layout (gaming mice), forward the raw bytes
+// with kmbox/smooth deltas injected.  Otherwise fall back to the legacy path
+// that re-encodes through hid_mouse_report_t.
+static void __not_in_flash_func(parse_and_forward_mouse_report)(const uint8_t *data, uint16_t data_len)
+{
+    if (data_len < 3) return;
+
+    // --- RAW FORWARDING PATH (gaming mice with cloned descriptor) ---
+    if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
+        forward_raw_mouse_report(data, data_len);
+        return;
+    }
+
+    // --- LEGACY FALLBACK PATH (boot-protocol / unknown mice) ---
+    hid_mouse_report_t mouse_report_local;
+    
+    if (data_len == 8) {
+        // 16-bit coordinate mouse - direct extraction
+        mouse_report_local.buttons = data[0];
+        
+        // Extract and scale 16-bit coordinates inline
+        int16_t x16 = (int16_t)(data[4] | (data[5] << 8)) >> 2;
+        int16_t y16 = (int16_t)(data[6] | (data[7] << 8)) >> 2;
+        
+        // Clamp inline
+        mouse_report_local.x = (x16 > 127) ? 127 : (x16 < -128) ? -128 : (int8_t)x16;
+        mouse_report_local.y = (y16 > 127) ? 127 : (y16 < -128) ? -128 : (int8_t)y16;
+        
+        // Wheel detection
+        mouse_report_local.wheel = (data[1] != 0) ? (int8_t)data[1] : 
+                                   (data[2] != 0) ? (int8_t)data[2] : (int8_t)data[3];
+        mouse_report_local.pan = 0;
+        
+    } else {
+        // Standard format - can cast directly if length allows
+        if (data_len >= sizeof(hid_mouse_report_t)) {
+            process_mouse_report((const hid_mouse_report_t*)data);
+            return;
+        }
+        
+        // Partial report - build manually
+        mouse_report_local.buttons = data[0];
+        mouse_report_local.x = (int8_t)data[1];
+        mouse_report_local.y = (int8_t)data[2];
+        mouse_report_local.wheel = (data_len >= 4) ? (int8_t)data[3] : 0;
+        mouse_report_local.pan = (data_len >= 5) ? (int8_t)data[4] : 0;
+    }
+
+    process_mouse_report(&mouse_report_local);
+}
+
 void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len)
 {
     if (report == NULL || len == 0)
@@ -904,61 +1829,69 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         return;
     }
 
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    // Look up effective protocol from our per-instance tracking
+    // This handles non-boot-protocol devices (Logitech, gaming mice, etc.)
+    uint8_t effective_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    hid_instance_info_t *inst_info = find_hid_instance(dev_addr, instance);
+    bool has_report_id = false;
+    uint8_t mouse_report_id = 0;
+    
+    if (inst_info) {
+        effective_protocol = inst_info->effective_protocol;
+        has_report_id = inst_info->has_report_id;
+        mouse_report_id = inst_info->mouse_report_id;
+    }
 
     // Direct processing without extra copying for better performance
-    switch (itf_protocol)
+    // SAFETY: Only forward keyboard reports from standalone keyboard devices,
+    // not from keyboard interfaces on composite mouse devices (e.g. Razer
+    // Basilisk V3 exposes macro/media key interfaces that send garbage data).
+    switch (effective_protocol)
     {
     case HID_ITF_PROTOCOL_KEYBOARD:
-        // Process directly from USB buffer - it's already aligned
-        if (len >= (int)sizeof(hid_keyboard_report_t))
         {
-            process_kbd_report((const hid_keyboard_report_t*)report);
+            // Only forward if this is a standalone keyboard (different device than mouse)
+            if (dev_addr == connection_state.mouse_dev_addr) {
+                // This keyboard interface is on the same device as the mouse —
+                // it's a composite gaming mouse's macro/media keys, skip it
+                break;
+            }
+            
+            const uint8_t *kbd_data = report;
+            uint16_t kbd_len = len;
+            
+            // Strip report ID prefix if present
+            if (has_report_id && kbd_len > 0) {
+                kbd_data++;
+                kbd_len--;
+            }
+            
+            if (kbd_len >= (int)sizeof(hid_keyboard_report_t))
+            {
+                process_kbd_report((const hid_keyboard_report_t*)kbd_data);
+            }
         }
         break;
 
     case HID_ITF_PROTOCOL_MOUSE:
-        // Process mouse reports through kmbox system - optimize for zero-copy
-        if (len >= 3)
         {
-            // Stack-allocated report for fast processing (no heap)
-            hid_mouse_report_t mouse_report_local;
+            const uint8_t *mouse_data = report;
+            uint16_t mouse_len = len;
             
-            if (len == 8) {
-                // 16-bit coordinate mouse - direct extraction
-                mouse_report_local.buttons = report[0];
-                
-                // Extract and scale 16-bit coordinates inline
-                int16_t x16 = (int16_t)(report[4] | (report[5] << 8)) >> 2;
-                int16_t y16 = (int16_t)(report[6] | (report[7] << 8)) >> 2;
-                
-                // Clamp inline
-                mouse_report_local.x = (x16 > 127) ? 127 : (x16 < -128) ? -128 : (int8_t)x16;
-                mouse_report_local.y = (y16 > 127) ? 127 : (y16 < -128) ? -128 : (int8_t)y16;
-                
-                // Wheel detection
-                mouse_report_local.wheel = (report[1] != 0) ? (int8_t)report[1] : 
-                                           (report[2] != 0) ? (int8_t)report[2] : (int8_t)report[3];
-                mouse_report_local.pan = 0;
-                
-            } else {
-                // Standard format - can cast directly if length allows
-                if (len >= sizeof(hid_mouse_report_t)) {
-                    // Direct cast for standard reports
-                    process_mouse_report((const hid_mouse_report_t*)report);
+            // For composite/report-ID devices, the first byte is the report ID
+            // We need to strip it before parsing the mouse data
+            if (has_report_id && mouse_len > 0) {
+                uint8_t received_id = mouse_data[0];
+                // Only process if this report ID matches the mouse report ID
+                if (received_id != mouse_report_id) {
+                    // Not a mouse report from this composite device - skip
                     break;
                 }
-                
-                // Partial report - build manually
-                mouse_report_local.buttons = report[0];
-                mouse_report_local.x = (int8_t)report[1];
-                mouse_report_local.y = (int8_t)report[2];
-                mouse_report_local.wheel = (len >= 4) ? (int8_t)report[3] : 0;
-                mouse_report_local.pan = (len >= 5) ? (int8_t)report[4] : 0;
+                mouse_data++;
+                mouse_len--;
             }
-
-            // Process through kmbox system
-            process_mouse_report(&mouse_report_local);
+            
+            parse_and_forward_mouse_report(mouse_data, mouse_len);
         }
         break;
 
@@ -986,7 +1919,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 {
     (void)instance;
 
-    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == REPORT_ID_KEYBOARD)
+    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == runtime_kbd_report_id)
     {
         // Validate buffer
         if (buffer == NULL || bufsize < MIN_BUFFER_SIZE)
@@ -1131,7 +2064,7 @@ void usb_stack_error_check(void)
 
 // Device Descriptors
 // Invoked when received GET DEVICE DESCRIPTOR
-// Application return pointer to descriptor
+// Application return pointer to descriptor — clones host mouse fields when available
 uint8_t const * tud_descriptor_device_cb(void)
 {
     static tusb_desc_device_t desc_device;
@@ -1139,15 +2072,18 @@ uint8_t const * tud_descriptor_device_cb(void)
     desc_device = (tusb_desc_device_t) {
         .bLength            = sizeof(tusb_desc_device_t),
         .bDescriptorType    = TUSB_DESC_DEVICE,
-        .bcdUSB             = 0x0200,
-        .bDeviceClass       = 0x00,
-        .bDeviceSubClass    = 0x00,
-        .bDeviceProtocol    = 0x00,
-        .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+        // Clone ALL device descriptor fields from the host mouse to look identical
+        .bcdUSB             = host_device_info.valid ? host_device_info.bcdUSB : 0x0200,
+        .bDeviceClass       = host_device_info.valid ? host_device_info.bDeviceClass : 0x00,
+        .bDeviceSubClass    = host_device_info.valid ? host_device_info.bDeviceSubClass : 0x00,
+        .bDeviceProtocol    = host_device_info.valid ? host_device_info.bDeviceProtocol : 0x00,
+        .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,  // Must match our controller's actual EP0 size
 
+        // Clone VID/PID from host device
         .idVendor           = (get_attached_vid() != 0) ? get_attached_vid() : USB_VENDOR_ID,
         .idProduct          = (get_attached_pid() != 0) ? get_attached_pid() : USB_PRODUCT_ID,
-        .bcdDevice          = 0x0100,
+        // Clone device revision from host
+        .bcdDevice          = host_device_info.valid ? host_device_info.bcdDevice : 0x0100,
 
         .iManufacturer      = 0x01,
         .iProduct           = 0x02,
@@ -1171,13 +2107,123 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
     return desc_hid_report_runtime; // still points to buffer (may contain defaults)
 }
 
-// Configuration Descriptor
+// Configuration Descriptor - now dynamic for cloning
 enum
 {
     ITF_NUM_HID,
     ITF_NUM_TOTAL
 };
 
+// Offsets within the configuration descriptor for fields we patch
+#define CFG_DESC_OFFSET_BMATTRIBUTES    7
+#define CFG_DESC_OFFSET_BMAXPOWER       8
+#define HID_ITF_OFFSET_SUBCLASS         (TUD_CONFIG_DESC_LEN + 6)  // bInterfaceSubClass
+#define HID_ITF_OFFSET_PROTOCOL         (TUD_CONFIG_DESC_LEN + 7)  // bInterfaceProtocol
+#define HID_DESC_OFFSET_REPORT_LEN_LO   (TUD_CONFIG_DESC_LEN + 9 + 7)  // wDescriptorLength low byte
+#define HID_DESC_OFFSET_REPORT_LEN_HI   (TUD_CONFIG_DESC_LEN + 9 + 8)  // wDescriptorLength high byte
+#define HID_EP_OFFSET_MAXPACKET_LO      (TUD_CONFIG_DESC_LEN + 9 + 9 + 4) // wMaxPacketSize low byte
+#define HID_EP_OFFSET_MAXPACKET_HI      (TUD_CONFIG_DESC_LEN + 9 + 9 + 5) // wMaxPacketSize high byte
+#define HID_EP_OFFSET_INTERVAL          (TUD_CONFIG_DESC_LEN + 9 + 9 + 6) // bInterval
+
+// Build the configuration descriptor from current runtime state
+static void rebuild_configuration_descriptor(void) {
+    // Determine actual report descriptor length
+    size_t report_desc_len = desc_hid_runtime_valid ? desc_hid_runtime_len : sizeof(desc_hid_report);
+    
+    // Clone ALL configuration descriptor fields from the host mouse.
+    // The goal is to present as the exact same device to the downstream PC.
+    uint8_t cfg_attributes = TU_BIT(7) | (host_config_info.valid ? host_config_info.bmAttributes : TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP);
+    uint8_t cfg_max_power = host_config_info.valid ? host_config_info.bMaxPower : (USB_CONFIG_POWER_MA / 2);
+    uint8_t itf_sub_class = host_config_info.valid ? host_config_info.bInterfaceSubClass : 0;
+    uint8_t itf_protocol = host_config_info.valid ? host_config_info.bInterfaceProtocol : HID_ITF_PROTOCOL_NONE;
+    // CRITICAL: wMaxPacketSize must be our actual EP buffer size, NOT the host mouse's.
+    // We re-encode reports through tud_hid_mouse_report() / tud_hid_keyboard_report(),
+    // and our keyboard report (1 + 8 = 9 bytes) may exceed a small mouse EP size (e.g. 8).
+    // The downstream PC uses this to allocate its receive buffer — it must fit our largest report.
+    uint16_t ep_max_packet = CFG_TUD_HID_EP_BUFSIZE;
+    uint8_t ep_interval = host_config_info.valid ? host_config_info.bInterval : HID_POLLING_INTERVAL_MS;
+    
+    // Build using the TinyUSB macros as a base template, then patch
+    uint8_t template[] = {
+        TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, USB_CONFIG_POWER_MA),
+        TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, HID_POLLING_INTERVAL_MS)
+    };
+    
+    _Static_assert(sizeof(template) == TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN, "config descriptor size mismatch");
+    memcpy(desc_configuration_runtime, template, sizeof(template));
+    
+    // Patch config descriptor fields
+    desc_configuration_runtime[CFG_DESC_OFFSET_BMATTRIBUTES] = cfg_attributes;
+    desc_configuration_runtime[CFG_DESC_OFFSET_BMAXPOWER] = cfg_max_power;
+    
+    // Patch HID interface descriptor fields
+    desc_configuration_runtime[HID_ITF_OFFSET_SUBCLASS] = itf_sub_class;
+    desc_configuration_runtime[HID_ITF_OFFSET_PROTOCOL] = itf_protocol;
+    
+    // Patch HID report descriptor length (critical — must match what tud_hid_descriptor_report_cb returns)
+    desc_configuration_runtime[HID_DESC_OFFSET_REPORT_LEN_LO] = (uint8_t)(report_desc_len & 0xFF);
+    desc_configuration_runtime[HID_DESC_OFFSET_REPORT_LEN_HI] = (uint8_t)((report_desc_len >> 8) & 0xFF);
+    
+    // Patch endpoint descriptor fields  
+    desc_configuration_runtime[HID_EP_OFFSET_MAXPACKET_LO] = (uint8_t)(ep_max_packet & 0xFF);
+    desc_configuration_runtime[HID_EP_OFFSET_MAXPACKET_HI] = (uint8_t)((ep_max_packet >> 8) & 0xFF);
+    desc_configuration_runtime[HID_EP_OFFSET_INTERVAL] = ep_interval;
+    
+    desc_config_runtime_valid = true;
+}
+
+// Parse host configuration descriptor to extract endpoint size, interval, power, etc.
+static void parse_host_config_descriptor(const uint8_t *cfg_desc, uint16_t cfg_len) {
+    if (!cfg_desc || cfg_len < TUD_CONFIG_DESC_LEN) return;
+    
+    // Extract config-level fields
+    host_config_info.bmAttributes = cfg_desc[7] & 0x7F; // Mask off reserved bit 7 (we add it back)
+    host_config_info.bMaxPower = cfg_desc[8];
+    
+    // Walk the descriptor chain to find HID interface + endpoint
+    uint16_t offset = 0;
+    bool found_hid_interface = false;
+    
+    while (offset + 1 < cfg_len) {
+        uint8_t desc_length = cfg_desc[offset];
+        uint8_t desc_type = cfg_desc[offset + 1];
+        
+        if (desc_length == 0) break; // Prevent infinite loop on malformed descriptors
+        
+        // Interface descriptor
+        if (desc_type == TUSB_DESC_INTERFACE && desc_length >= 9 && offset + 8 < cfg_len) {
+            uint8_t itf_class = cfg_desc[offset + 5];
+            if (itf_class == TUSB_CLASS_HID) {
+                host_config_info.bInterfaceSubClass = cfg_desc[offset + 6];
+                host_config_info.bInterfaceProtocol = cfg_desc[offset + 7];
+                found_hid_interface = true;
+            }
+        }
+        
+        // Endpoint descriptor (IN endpoint after HID interface)
+        if (found_hid_interface && desc_type == TUSB_DESC_ENDPOINT && desc_length >= 7 && offset + 6 < cfg_len) {
+            uint8_t ep_addr = cfg_desc[offset + 2];
+            uint8_t ep_attr = cfg_desc[offset + 3];
+            
+            // Only capture IN interrupt endpoint (direction bit 7 set, transfer type = interrupt)
+            if ((ep_addr & 0x80) && (ep_attr & 0x03) == TUSB_XFER_INTERRUPT) {
+                host_config_info.wMaxPacketSize = cfg_desc[offset + 4] | (cfg_desc[offset + 5] << 8);
+                host_config_info.bInterval = cfg_desc[offset + 6];
+                host_config_info.valid = true;
+                
+                char msg[96];
+                snprintf(msg, sizeof(msg), "Clone EP: pkt=%u interval=%ums power=%umA",
+                         host_config_info.wMaxPacketSize, host_config_info.bInterval, host_config_info.bMaxPower * 2);
+                kmbox_send_status(msg);
+                break; // Found what we need
+            }
+        }
+        
+        offset += desc_length;
+    }
+}
+
+// Static fallback (used only for initial sizeof reference)
 uint8_t const desc_configuration[] =
     {
         // Config number, interface count, string index, total length, attribute, power in mA
@@ -1187,9 +2233,13 @@ uint8_t const desc_configuration[] =
         TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, HID_POLLING_INTERVAL_MS)};
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
+// Returns the runtime (cloned) config descriptor if available
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 {
     (void)index; // for multiple configurations
+    if (desc_config_runtime_valid) {
+        return desc_configuration_runtime;
+    }
     return desc_configuration;
 }
 

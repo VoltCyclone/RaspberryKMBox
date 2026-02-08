@@ -91,18 +91,10 @@
 //--------------------------------------------------------------------
 
 // Size of buffer to hold descriptors and other data used for enumeration
-#define CFG_TUH_ENUMERATION_BUFSIZE 256
-
-#define CFG_TUH_HUB                 1
-// max device support (excluding hub device)
-#define CFG_TUH_DEVICE_MAX          (CFG_TUH_HUB ? 4 : 1) // hub typically has 4 ports
-
-#define CFG_TUH_HID                  4
-#define CFG_TUH_HID_EPIN_BUFSIZE    64
-#define CFG_TUH_HID_EPOUT_BUFSIZE   64
-
-// Size of buffer to hold descriptors and other data used for enumeration
-#define CFG_TUH_ENUMERATION_BUFSIZE 256
+// Gaming mice (Razer, Logitech, SteelSeries) can have very large composite
+// descriptors — 500-1000+ bytes. If descriptor > this size, tuh_hid_mount_cb
+// gets desc_report=NULL, desc_len=0 and we can't clone the device identity.
+#define CFG_TUH_ENUMERATION_BUFSIZE 1024
 
 #define CFG_TUH_HUB                 1
 // max device support (excluding hub device)

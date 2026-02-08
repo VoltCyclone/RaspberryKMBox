@@ -12,12 +12,14 @@
 #include "led_control.h"
 #include "smooth_injection.h"
 #include "uart_buffers.h"
+#include "dcp_helpers.h"
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
 #include "hardware/clocks.h"
 #include "hardware/adc.h"
+#include "hardware/dma.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -29,15 +31,27 @@
 #define UART_RX_BUFFER_MASK     (UART_RX_BUFFER_SIZE - 1)
 
 //--------------------------------------------------------------------+
-// Temperature Sensor
+// Temperature Sensor (with caching for performance)
 //--------------------------------------------------------------------+
+
+static int16_t g_cached_temperature = 250;  // 25.0°C default
+static uint32_t g_last_temp_read_ms = 0;
+#define TEMP_CACHE_MS 1000
 
 static inline int16_t read_temperature_decidegrees(void) {
     adc_select_input(4);
     uint16_t raw = adc_read();
-    float voltage = raw * (3.3f / 4096.0f);
-    float temp_c = 27.0f - (voltage - 0.706f) / 0.001721f;
+    // Use DCP hardware acceleration for temperature conversion
+    float temp_c = dcp_adc_to_temp(raw);
     return (int16_t)(temp_c * 10.0f);  // Return in 0.1°C units
+}
+
+static inline int16_t get_cached_temperature(uint32_t now_ms) {
+    if ((now_ms - g_last_temp_read_ms) >= TEMP_CACHE_MS) {
+        g_cached_temperature = read_temperature_decidegrees();
+        g_last_temp_read_ms = now_ms;
+    }
+    return g_cached_temperature;
 }
 
 //--------------------------------------------------------------------+
@@ -49,12 +63,32 @@ static inline int16_t read_i16_le(const uint8_t *p) {
 }
 
 //--------------------------------------------------------------------+
-// RX Ring Buffer (IRQ producer, main loop consumer)
+// RX DMA Circular Buffer (zero-CPU reception)
+// DMA writes continuously, main loop reads via write pointer comparison
 //--------------------------------------------------------------------+
 
 static uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE] __attribute__((aligned(UART_RX_BUFFER_SIZE)));
-static volatile uint16_t uart_rx_head = 0;  // IRQ writes here
-static volatile uint16_t uart_rx_tail = 0;  // Main loop reads here
+static volatile uint32_t uart_rx_read_pos = 0;
+static int uart_rx_dma_chan = -1;
+
+// DMA-based RX: get current write position from DMA write address
+static inline uint32_t rx_get_write_pos(void) {
+    if (uart_rx_dma_chan < 0) return 0;
+    uintptr_t write_addr = (uintptr_t)dma_channel_hw_addr(uart_rx_dma_chan)->write_addr;
+    return (uint32_t)((write_addr - (uintptr_t)uart_rx_buffer) & UART_RX_BUFFER_MASK);
+}
+
+static inline uint16_t rx_available(void) {
+    return (uint16_t)((rx_get_write_pos() - uart_rx_read_pos) & UART_RX_BUFFER_MASK);
+}
+
+static inline uint8_t rx_peek_at(uint16_t offset) {
+    return uart_rx_buffer[(uart_rx_read_pos + offset) & UART_RX_BUFFER_MASK];
+}
+
+static inline void rx_consume(uint16_t count) {
+    uart_rx_read_pos = (uart_rx_read_pos + count) & UART_RX_BUFFER_MASK;
+}
 
 //--------------------------------------------------------------------+
 // TX Ring Buffer (Non-blocking IRQ-based transmission)
@@ -63,30 +97,8 @@ static volatile uint16_t uart_rx_tail = 0;  // Main loop reads here
 static uart_tx_buffer_t g_uart_tx_buffer;
 static volatile uint32_t g_uart_tx_dropped = 0;
 
-// Forward declarations for IRQ handlers
-static void __not_in_flash_func(on_uart_rx)(void);
+// Forward declaration for TX IRQ handler
 static void __not_in_flash_func(on_uart_tx)(void);
-static void __not_in_flash_func(on_uart_irq)(void);
-
-static inline bool rx_put(uint8_t byte) {
-    uint16_t next = (uart_rx_head + 1) & UART_RX_BUFFER_MASK;
-    if (next == uart_rx_tail) return false;  // Full
-    uart_rx_buffer[uart_rx_head] = byte;
-    uart_rx_head = next;
-    return true;
-}
-
-static inline uint16_t rx_available(void) {
-    return (uart_rx_head - uart_rx_tail) & UART_RX_BUFFER_MASK;
-}
-
-static inline uint8_t rx_peek_at(uint16_t offset) {
-    return uart_rx_buffer[(uart_rx_tail + offset) & UART_RX_BUFFER_MASK];
-}
-
-static inline void rx_consume(uint16_t count) {
-    uart_rx_tail = (uart_rx_tail + count) & UART_RX_BUFFER_MASK;
-}
 
 //--------------------------------------------------------------------+
 // Connection State
@@ -136,22 +148,11 @@ static uint32_t fast_cmd_count = 0;
 static uint32_t fast_cmd_errors = 0;
 
 //--------------------------------------------------------------------+
-// UART IRQ Handlers (RX and TX)
+// UART TX IRQ Handler (RX now uses DMA)
 //--------------------------------------------------------------------+
 
-static void __not_in_flash_func(on_uart_rx)(void) {
-    while (uart_is_readable(KMBOX_UART)) {
-        rx_put(uart_getc(KMBOX_UART));
-    }
-}
-
-// Combined UART IRQ handler
+// Combined UART IRQ handler - TX only (RX via DMA circular buffer)
 static void __not_in_flash_func(on_uart_irq)(void) {
-    // Handle RX
-    if (uart_is_readable(KMBOX_UART)) {
-        on_uart_rx();
-    }
-    
     // Handle TX
     if (uart_is_writable(KMBOX_UART) && g_uart_tx_buffer.tx_active) {
         on_uart_tx();
@@ -172,9 +173,9 @@ static void __not_in_flash_func(on_uart_tx)(void) {
         }
     }
     
-    // Disable TX IRQ if buffer empty
+    // Disable TX IRQ if buffer empty (RX handled by DMA, not IRQ)
     if (!tx_buffer_has_data(&g_uart_tx_buffer)) {
-        uart_set_irq_enables(KMBOX_UART, true, false);  // RX enabled, TX disabled
+        uart_set_irq_enables(KMBOX_UART, false, false);  // Both disabled, RX via DMA
         g_uart_tx_buffer.tx_active = false;
     }
 }
@@ -183,18 +184,19 @@ static void __not_in_flash_func(on_uart_tx)(void) {
 static bool uart_send_bytes(const uint8_t *data, size_t len) {
     if (!data || len == 0) return true;
     
-    // Disable IRQ while modifying buffer
-    uint32_t irq_state = save_and_disable_interrupts();
+    // Only disable the UART IRQ, not all interrupts (allows USB to continue)
+    int uart_irq = (KMBOX_UART == uart0) ? UART0_IRQ : UART1_IRQ;
+    irq_set_enabled(uart_irq, false);
     
     uint16_t written = tx_buffer_write(&g_uart_tx_buffer, data, len);
     
     // Enable TX IRQ to start transmission
     if (written > 0 && !g_uart_tx_buffer.tx_active) {
         g_uart_tx_buffer.tx_active = true;
-        uart_set_irq_enables(KMBOX_UART, true, true);  // Enable both RX and TX IRQ
+        uart_set_irq_enables(KMBOX_UART, false, true);  // RX disabled (DMA), TX enabled
     }
     
-    restore_interrupts(irq_state);
+    irq_set_enabled(uart_irq, true);
     
     // Track dropped bytes
     if (written < len) {
@@ -288,7 +290,7 @@ static inline void mark_activity(uint32_t now_ms) {
 // Bridge Protocol Parser (variable-length binary, sync byte 0xBD)
 //--------------------------------------------------------------------+
 
-static uint8_t process_bridge_packet(const uint8_t *data, size_t available) {
+static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, size_t available) {
     if (available < 2) return 0;
     if (data[0] != BRIDGE_SYNC_BYTE) return 1;  // Skip invalid sync
     
@@ -470,7 +472,8 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
         }
         
         case FAST_CMD_INFO: {
-            int16_t temp = read_temperature_decidegrees();
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            int16_t temp = get_cached_temperature(now_ms);
             uint8_t resp[8] = {
                 FAST_CMD_INFO,
                 (uint8_t)smooth_get_humanization_mode(),
@@ -494,6 +497,37 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
 }
 
 //--------------------------------------------------------------------+
+// Fast Integer Parser (replaces sscanf for performance)
+//--------------------------------------------------------------------+
+
+// Fast signed integer parser - returns pointer to char after number, or NULL on error
+static const char* __not_in_flash_func(parse_int16)(const char *p, int16_t *out) {
+    int32_t val = 0;
+    bool neg = false;
+    
+    if (*p == '-') { neg = true; p++; }
+    else if (*p == '+') { p++; }
+    
+    if (*p < '0' || *p > '9') return NULL;
+    
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10 + (*p - '0');
+        // Bail out early if value exceeds int16_t range (prevents int32_t overflow
+        // on pathologically long digit strings)
+        if (val > 32767) {
+            val = 32767;
+            // Skip remaining digits
+            while (*(++p) >= '0' && *p <= '9') {}
+            break;
+        }
+        p++;
+    }
+    
+    *out = (int16_t)(neg ? -val : val);
+    return p;
+}
+
+//--------------------------------------------------------------------+
 // Text Protocol Handling
 //--------------------------------------------------------------------+
 
@@ -502,18 +536,23 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     
     // Mouse move: M<x>,<y>
     if (len >= 3 && line[0] == 'M') {
-        int x, y;
-        if (sscanf(line, "M%d,%d", &x, &y) == 2) {
-            neopixel_trigger_activity_flash_color(0x0000FF00);
-            kmbox_add_mouse_movement((int16_t)x, (int16_t)y);
-            return true;
+        int16_t x, y;
+        const char *p = parse_int16(line + 1, &x);
+        if (p && *p == ',') {
+            p = parse_int16(p + 1, &y);
+            if (p) {
+                neopixel_trigger_activity_flash_color(0x0000FF00);
+                kmbox_add_mouse_movement(x, y);
+                return true;
+            }
         }
     }
     
     // Wheel: W<delta>
     if (len >= 2 && line[0] == 'W') {
-        int delta;
-        if (sscanf(line, "W%d", &delta) == 1) {
+        int16_t delta;
+        const char *p = parse_int16(line + 1, &delta);
+        if (p) {
             kmbox_add_wheel_movement((int8_t)delta);
             return true;
         }
@@ -521,8 +560,9 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     
     // Buttons: B<mask>
     if (len >= 2 && line[0] == 'B') {
-        int mask;
-        if (sscanf(line, "B%d", &mask) == 1) {
+        int16_t mask;
+        const char *p = parse_int16(line + 1, &mask);
+        if (p) {
             kmbox_update_physical_buttons((uint8_t)mask);
             return true;
         }
@@ -540,7 +580,6 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         uart_send_string("ECHO:");
         uart_send_string(line + 1);
         uart_send_string("\r\n");
-        uart_tx_wait_blocking(KMBOX_UART);
         return true;
     }
     
@@ -651,8 +690,7 @@ void kmbox_serial_init(void) {
     }
     
     // Initialize state
-    uart_rx_head = 0;
-    uart_rx_tail = 0;
+    uart_rx_read_pos = 0;
     
     // Initialize TX ring buffer
     tx_buffer_init(&g_uart_tx_buffer);
@@ -662,7 +700,6 @@ void kmbox_serial_init(void) {
     g_last_data_time_ms = to_ms_since_boot(get_absolute_time());
     
     // Configure GPIO pins
-    // Use GPIO_FUNC_UART for default UART pins (GPIO0/GPIO1 for UART0)
     gpio_set_function(KMBOX_UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(KMBOX_UART_RX_PIN, GPIO_FUNC_UART);
     gpio_pull_up(KMBOX_UART_RX_PIN);
@@ -675,12 +712,20 @@ void kmbox_serial_init(void) {
     // Disable hardware flow control (no CTS/RTS)
     uart_set_hw_flow(KMBOX_UART, false, false);
     
-    // Set up combined RX/TX interrupt handler
+    // Disable UART RX interrupts - we use DMA for RX
+    // TX IRQ handler still needed for non-blocking TX
+    uart_set_irq_enables(KMBOX_UART, false, false);
+    
+    // Set up TX-only IRQ handler
     int uart_irq = (KMBOX_UART == uart0) ? UART0_IRQ : UART1_IRQ;
     irq_set_exclusive_handler(uart_irq, on_uart_irq);
-    irq_set_priority(uart_irq, 0);  // Highest priority
+    irq_set_priority(uart_irq, 0);  // Highest priority for TX
     irq_set_enabled(uart_irq, true);
-    uart_set_irq_enables(KMBOX_UART, true, false);  // RX enabled, TX starts disabled
+    
+    // Drain any garbage from UART FIFO
+    while (uart_is_readable(KMBOX_UART)) {
+        uart_getc(KMBOX_UART);
+    }
     
     // Initialize kmbox commands library
     kmbox_commands_init();
@@ -695,7 +740,33 @@ void kmbox_serial_init(void) {
 }
 
 void kmbox_serial_init_dma(void) {
-    // DMA disabled - using IRQ-based RX for reliability
+    // Set up DMA circular buffer for UART RX (zero-CPU reception)
+    uart_rx_dma_chan = dma_claim_unused_channel(false);
+    if (uart_rx_dma_chan < 0) {
+        printf("[KMBOX] WARNING: Failed to claim RX DMA channel, falling back to polling\n");
+        return;
+    }
+    
+    // Configure RX DMA with circular (ring) buffer
+    dma_channel_config rx_cfg = dma_channel_get_default_config(uart_rx_dma_chan);
+    channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx_cfg, false);   // Always read from UART DR
+    channel_config_set_write_increment(&rx_cfg, true);    // Increment write pointer
+    channel_config_set_dreq(&rx_cfg, uart_get_dreq(KMBOX_UART, false));  // RX DREQ
+    channel_config_set_ring(&rx_cfg, true, __builtin_ctz(UART_RX_BUFFER_SIZE));  // Ring on write side
+    channel_config_set_high_priority(&rx_cfg, true);      // High priority for low latency
+    
+    // Start continuous RX DMA - transfers indefinitely into circular buffer
+    dma_channel_configure(
+        uart_rx_dma_chan,
+        &rx_cfg,
+        uart_rx_buffer,                          // Write to ring buffer
+        &uart_get_hw(KMBOX_UART)->dr,           // Read from UART data register
+        0xFFFFFFFF,                              // Transfer "forever"
+        true                                     // Start immediately
+    );
+    
+    printf("[KMBOX] DMA RX initialized: ch=%d, buf=%u bytes\n", uart_rx_dma_chan, UART_RX_BUFFER_SIZE);
 }
 
 //--------------------------------------------------------------------+
@@ -730,7 +801,17 @@ void kmbox_serial_task(void) {
             
             uint8_t pkt[8];
             size_t copy = (avail < 8) ? avail : 8;
-            for (size_t i = 0; i < copy; i++) pkt[i] = rx_peek_at(i);
+            // Optimized peek - use memcpy if data is contiguous
+            uint16_t tail = (uint16_t)(uart_rx_read_pos & UART_RX_BUFFER_MASK);
+            uint16_t first_chunk = UART_RX_BUFFER_SIZE - tail;
+            if (first_chunk >= copy) {
+                // Data is contiguous, use fast memcpy
+                memcpy(pkt, &uart_rx_buffer[tail], copy);
+            } else {
+                // Data wraps around, copy in two chunks
+                memcpy(pkt, &uart_rx_buffer[tail], first_chunk);
+                memcpy(pkt + first_chunk, uart_rx_buffer, copy - first_chunk);
+            }
             
             uint8_t consumed = process_bridge_packet(pkt, copy);
             if (consumed >= 2) {

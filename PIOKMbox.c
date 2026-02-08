@@ -124,6 +124,12 @@ static void core1_main(void) {
     // Configure host stack with PIO USB configuration
     tuh_configure(USB_HOST_PORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
     
+    // CRITICAL: Use Report protocol by default (not Boot protocol).
+    // Boot protocol is simpler but many devices (Logitech receivers, gaming mice)
+    // only work correctly in Report protocol mode with proper report descriptors.
+    // This must be set BEFORE tuh_init().
+    tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
+    
     // Initialize host stack on core1
     tuh_init(USB_HOST_PORT);
     
@@ -214,7 +220,7 @@ static bool initialize_system(void) {
     // Add startup delay for cold boot stability
     sleep_ms(200);
     
-    // Overclock RP2040 to 240MHz, increase VREG voltage to 1.25V (max for RP2040)
+    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.25V
     vreg_set_voltage(VREG_VOLTAGE_1_25);
     sleep_ms(10);  // Let voltage stabilize
     
@@ -508,7 +514,6 @@ int main(void) {
         return -1;
     }
     
-    watchdog_init();
     neopixel_enable_power();    
     printf("=== PIOKMBox Ready ===\n");
     

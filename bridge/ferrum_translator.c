@@ -1,17 +1,28 @@
 /**
- * Translates Ferrum text protocol to efficient binary bridge protocol
+ * Translates Ferrum text protocol to KMBox text protocol
  */
 
 #include "ferrum_translator.h"
 #include "ferrum_protocol.h"
-#include "../lib/bridge-protocol/bridge_protocol.h"
+#include "protocol_luts.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <ctype.h>
+#include <stdio.h>
 
 void ferrum_translator_init(void) {
     // Nothing to initialize
+}
+
+// Helper: Convert button name to HID mask
+static uint8_t ferrum_button_to_mask(const char* name) {
+    if (strcmp(name, "left") == 0) return 0x01;
+    if (strcmp(name, "right") == 0) return 0x02;
+    if (strcmp(name, "middle") == 0) return 0x04;
+    if (strcmp(name, "side1") == 0) return 0x08;
+    if (strcmp(name, "side2") == 0) return 0x10;
+    return 0x00;
 }
 
 // Parse integer argument
@@ -72,8 +83,8 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &y)) return false;
         if (*p != ')') return false;
         
-        // Build bridge protocol: [SYNC, CMD, x_lo, x_hi, y_lo, y_hi]
-        out->length = bridge_build_mouse_move(out->buffer, (int16_t)x, (int16_t)y);
+        // Build KMBox text protocol: "M<x>,<y>\n"
+        out->length = fast_build_move((char*)out->buffer, (int16_t)x, (int16_t)y);
         out->needs_response = true;
         return true;
     }
@@ -88,8 +99,8 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &wheel)) return false;
         if (*p != ')') return false;
         
-        // Build bridge protocol: [SYNC, CMD, wheel]
-        out->length = bridge_build_mouse_wheel(out->buffer, (int8_t)wheel);
+        // Build KMBox text protocol: "W<wheel>\n"
+        out->length = fast_build_wheel((char*)out->buffer, (int8_t)wheel);
         out->needs_response = true;
         return true;
     }
@@ -104,8 +115,9 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
         
-        // Build bridge protocol: [SYNC, CMD, mask, state]
-        out->length = bridge_build_button_set(out->buffer, BRIDGE_BTN_LEFT, (state != 0) ? 1 : 0);
+        // Build KMBox text protocol: "B<mask>\n"
+        uint8_t mask = ferrum_button_to_mask("left");
+        out->length = fast_build_button((char*)out->buffer, (state != 0) ? mask : 0);
         out->needs_response = true;
         return true;
     }
@@ -120,7 +132,8 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
         
-        out->length = bridge_build_button_set(out->buffer, BRIDGE_BTN_RIGHT, (state != 0) ? 1 : 0);
+        uint8_t mask = ferrum_button_to_mask("right");
+        out->length = fast_build_button((char*)out->buffer, (state != 0) ? mask : 0);
         out->needs_response = true;
         return true;
     }
@@ -135,7 +148,8 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
         
-        out->length = bridge_build_button_set(out->buffer, BRIDGE_BTN_MIDDLE, (state != 0) ? 1 : 0);
+        uint8_t mask = ferrum_button_to_mask("middle");
+        out->length = fast_build_button((char*)out->buffer, (state != 0) ? mask : 0);
         out->needs_response = true;
         return true;
     }
@@ -150,7 +164,8 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
         
-        out->length = bridge_build_button_set(out->buffer, BRIDGE_BTN_SIDE1, (state != 0) ? 1 : 0);
+        uint8_t mask = ferrum_button_to_mask("side1");
+        out->length = fast_build_button((char*)out->buffer, (state != 0) ? mask : 0);
         out->needs_response = true;
         return true;
     }
@@ -165,7 +180,8 @@ bool ferrum_translate_line(const char* line, size_t len, ferrum_translated_t* ou
         if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
         
-        out->length = bridge_build_button_set(out->buffer, BRIDGE_BTN_SIDE2, (state != 0) ? 1 : 0);
+        uint8_t mask = ferrum_button_to_mask("side2");
+        out->length = fast_build_button((char*)out->buffer, (state != 0) ? mask : 0);
         out->needs_response = true;
         return true;
     }
