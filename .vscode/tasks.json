@@ -2,18 +2,6 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build RP2040 (Pico)",
-            "type": "shell",
-            "command": "./build.sh",
-            "args": ["pico"],
-            "group": "build",
-            "presentation": {
-                "reveal": "always",
-                "panel": "dedicated"
-            },
-            "problemMatcher": "$gcc"
-        },
-        {
             "label": "Build RP2350 (Pico 2)",
             "type": "shell",
             "command": "./build.sh",
@@ -65,22 +53,6 @@
             "problemMatcher": "$gcc"
         },
         {
-            "label": "Compile Project (RP2040)",
-            "type": "process",
-            "isBuildCommand": true,
-            "command": "${userHome}/.pico-sdk/ninja/v1.12.1/ninja",
-            "args": ["-C", "${workspaceFolder}/build-pico"],
-            "group": "build",
-            "presentation": {
-                "reveal": "always",
-                "panel": "dedicated"
-            },
-            "problemMatcher": "$gcc",
-            "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe"
-            }
-        },
-        {
             "label": "Compile Project (RP2350)",
             "type": "process",
             "isBuildCommand": true,
@@ -94,24 +66,6 @@
             "problemMatcher": "$gcc",
             "windows": {
                 "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe"
-            }
-        },
-        {
-            "label": "Run Project (RP2040)",
-            "type": "process",
-            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
-            "args": [
-                "load",
-                "${workspaceFolder}/build-pico/PIOKMbox.uf2",
-                "-fx"
-            ],
-            "presentation": {
-                "reveal": "always",
-                "panel": "dedicated"
-            },
-            "problemMatcher": [],
-            "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
             }
         },
         {
@@ -148,25 +102,6 @@
             "problemMatcher": [],
             "windows": {
                 "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
-            }
-        },
-        {
-            "label": "Flash (RP2040)",
-            "type": "process",
-            "command": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
-            "args": [
-                "-s",
-                "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
-                "-f",
-                "interface/cmsis-dap.cfg",
-                "-f",
-                "target/rp2040.cfg",
-                "-c",
-                "adapter speed 5000; program \"${workspaceFolder}/build-pico/PIOKMbox.elf\" verify reset exit"
-            ],
-            "problemMatcher": [],
-            "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/openocd/0.12.0+dev/openocd.exe"
             }
         },
         {

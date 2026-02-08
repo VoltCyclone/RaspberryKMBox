@@ -20,27 +20,18 @@
 #define MAIN_LOOP_TIME_SAMPLE_INTERVAL  32
 #endif
 
-// Enable RP2350 DSP instructions for fixed-point math (RP2350/Cortex-M33 only)
-// Provides ~2x speedup for multiply-accumulate operations
-#ifndef ENABLE_DSP_FIXED_POINT
-#if defined(PICO_RP2350) && PICO_RP2350
+// RP2350 DSP instructions for fixed-point math (Cortex-M33 SMULL)
+// Always enabled - RP2040 support has been dropped
+// Note: SDK's pico_float/pico_double already use DCP hardware acceleration
+// automatically on RP2350 (LIB_PICO_DOUBLE_PICO=1, LIB_PICO_FLOAT_PICO_VFP=1)
 #define ENABLE_DSP_FIXED_POINT  1
-#else
-#define ENABLE_DSP_FIXED_POINT  0
-#endif
-#endif
 
 //--------------------------------------------------------------------+
 // HARDWARE CONFIGURATION
 //--------------------------------------------------------------------+
-#if PICO_PLATFORM == rp2040
-#define DEFAULT_CPU_FREQ 240000
-#elif PICO_PLATFORM == rp2350
-// Overclock RP2350 to match RP2040 performance for real-time tracking
+// RP2350 overclocked to 240MHz for real-time tracking
 // NOTE: This increases power draw and may be unstable on some boards.
-// Default increased from 120 MHz -> 240 MHz (kHz units)
 #define DEFAULT_CPU_FREQ 240000
-#endif
 
 #ifndef CPU_FREQ
 #define CPU_FREQ DEFAULT_CPU_FREQ

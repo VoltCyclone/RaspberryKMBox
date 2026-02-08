@@ -1,0 +1,23 @@
+{
+    "device": {
+        "vid": "0x2e8a",
+        "pid": "0x000f",
+        "bcd": 1.00,
+        "lang_id": "0x0409",
+        "manufacturer": "Hurricane",
+        "product": "KMBox Bridge",
+        "serial_number": "KMBRIDGE-001"
+    },
+    "scsi": {
+        "vendor": "HURRCNE",
+        "product": "KMBox Bridge",
+        "version": "1.0"
+    },
+    "volume": {
+        "label": "KMBOX-BRDG",
+        "redirect_url": "https://github.com/ramseymcgrath/RaspberryKMBox",
+        "redirect_name": "RaspberryKMBox",
+        "model": "Hurricane KMBox Bridge",
+        "board_id": "KMBOX-BRIDGE"
+    }
+}

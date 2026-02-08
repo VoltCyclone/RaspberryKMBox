@@ -93,26 +93,20 @@ static inline int32_t rng_range_fp(int32_t min_fp, int32_t max_fp) {
 // Fixed-Point Math Helpers
 //--------------------------------------------------------------------+
 
-#if ENABLE_DSP_FIXED_POINT
-// RP2350 DSP-optimized fixed-point multiply using SMMULR
-// Single-cycle signed multiply with rounding
-static inline int32_t fp_mul(int32_t a, int32_t b) {
-    int32_t result;
-    // SMMULR: Signed Most Significant Word Multiply with Round
-    // Returns high 32 bits of (a * b) with rounding
+// RP2350 DSP-optimized fixed-point multiply (16.16 format)
+// Uses SMULL to get full 64-bit product, then extracts middle 32 bits (>> 16).
+// SMMULR only returns the top 32 bits (>> 32), losing 16 bits of precision
+// which causes small values (e.g., 0.5 * 0.5) to round to zero.
+static inline int32_t __not_in_flash_func(fp_mul)(int32_t a, int32_t b) {
+    int32_t hi;
+    uint32_t lo;
     __asm__ volatile (
-        "smmulr %0, %1, %2"
-        : "=r" (result)
+        "smull %0, %1, %2, %3"
+        : "=r" (lo), "=r" (hi)
         : "r" (a), "r" (b)
     );
-    return result;
+    return (int32_t)((uint32_t)(hi << SMOOTH_FP_SHIFT) | (lo >> SMOOTH_FP_SHIFT));
 }
-#else
-// Standard fixed-point multiply for RP2040
-static inline int32_t fp_mul(int32_t a, int32_t b) {
-    return (int32_t)(((int64_t)a * b) >> SMOOTH_FP_SHIFT);
-}
-#endif
 
 static inline int32_t fp_div(int32_t a, int32_t b) {
     if (b == 0) return 0;
@@ -154,12 +148,12 @@ static inline int8_t clamp_i8(int32_t val) {
 static int32_t g_velocity_sum_x_fp = 0;
 static int32_t g_velocity_sum_y_fp = 0;
 
-static void velocity_update(int8_t x, int8_t y) {
+static void velocity_update(int16_t x, int16_t y) {
     velocity_tracker_t *v = &g_smooth.velocity;
     
     // Get old value that will be replaced
-    int8_t old_x = v->x_history[v->history_index];
-    int8_t old_y = v->y_history[v->history_index];
+    int16_t old_x = v->x_history[v->history_index];
+    int16_t old_y = v->y_history[v->history_index];
     
     // Store new values in history
     v->x_history[v->history_index] = x;
@@ -427,7 +421,7 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     return true;
 }
 
-void smooth_record_physical_movement(int8_t x, int8_t y) {
+void smooth_record_physical_movement(int16_t x, int16_t y) {
     velocity_update(x, y);
 }
 
@@ -452,6 +446,14 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
     
     // Early exit if no active entries
     if (g_smooth.queue_count == 0) {
+        goto apply_accumulator;
+    }
+    
+    // Safety: if queue_count > 0 but linked list is empty, reset to prevent hang
+    if (g_active_head == NULL) {
+        g_smooth.queue_count = 0;
+        g_free_bitmap = 0xFFFFFFFF;
+        g_active_node_bitmap = 0;
         goto apply_accumulator;
     }
     
@@ -585,8 +587,20 @@ apply_accumulator:
     }
     
     // Update sub-pixel accumulator with remainder
+    // CRITICAL: Only keep the sub-pixel fractional residual, not excess from rate limiting.
+    // Rate-limited excess was already accounted for in the queue entries' remaining fields.
+    // Keeping it here would cause it to trickle out slowly after the queue drains, appearing
+    // as a movement hang/drift.
     g_smooth.x_accumulator_fp = frame_x_fp - int_to_fp(out_x_int);
     g_smooth.y_accumulator_fp = frame_y_fp - int_to_fp(out_y_int);
+    
+    // Clamp accumulator to prevent unbounded growth from rate limiting
+    // Max 2 pixels of residual (in fixed-point) prevents movement hang
+    const int32_t max_accum = int_to_fp(2);
+    if (g_smooth.x_accumulator_fp > max_accum) g_smooth.x_accumulator_fp = max_accum;
+    else if (g_smooth.x_accumulator_fp < -max_accum) g_smooth.x_accumulator_fp = -max_accum;
+    if (g_smooth.y_accumulator_fp > max_accum) g_smooth.y_accumulator_fp = max_accum;
+    else if (g_smooth.y_accumulator_fp < -max_accum) g_smooth.y_accumulator_fp = -max_accum;
     
     // Output
     *out_x = clamp_i8(out_x_int);
@@ -616,6 +630,9 @@ void smooth_clear_queue(void) {
     g_smooth.x_accumulator_fp = 0;
     g_smooth.y_accumulator_fp = 0;
     g_free_bitmap = 0xFFFFFFFF;
+    // Reset active linked list to prevent stale pointer traversal
+    g_active_head = NULL;
+    g_active_node_bitmap = 0;
     // Also reset velocity tracking accumulators for consistency
     g_velocity_sum_x_fp = 0;
     g_velocity_sum_y_fp = 0;

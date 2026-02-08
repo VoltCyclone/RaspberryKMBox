@@ -52,9 +52,9 @@ typedef struct {
     uint8_t last_button_state;     // Last reported button state for callback
     
     // Mouse movement state
-    int16_t mouse_x_accumulator;  // Accumulated X movement
-    int16_t mouse_y_accumulator;  // Accumulated Y movement
-    int8_t wheel_accumulator;      // Accumulated wheel movement
+    int32_t mouse_x_accumulator;  // Accumulated X movement (int32 to prevent overflow)
+    int32_t mouse_y_accumulator;  // Accumulated Y movement (int32 to prevent overflow)
+    int16_t wheel_accumulator;     // Accumulated wheel movement
     
     // Axis lock states
     bool lock_mx;  // Lock X axis (left/right movement)

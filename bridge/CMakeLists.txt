@@ -7,8 +7,8 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-# Board selection: feather (default) or metro
-set(PICO_BOARD adafruit_feather_rp2350 CACHE STRING "Board type")
+# Board selection: metro (default, ILI9341 TFT) or feather (ST7735 TFT)
+set(PICO_BOARD adafruit_metro_rp2350 CACHE STRING "Board type")
 set(PICO_PLATFORM rp2350-arm-s)
 
 # Custom board headers (for adafruit_metro_rp2350)
@@ -37,6 +37,8 @@ if(PICO_BOARD STREQUAL "adafruit_metro_rp2350")
     set(BRIDGE_TFT_DC    9)    # D9
     set(BRIDGE_TFT_RST   8)    # D8
     set(BRIDGE_TFT_BL    3)    # D3 (D7 is MODE_BUTTON)
+    set(BRIDGE_TOUCH_CS  4)    # D4 (typical for ILI9341 Arduino shields)
+    set(BRIDGE_TOUCH_IRQ 2)    # D2 (IRQ pin for touch interrupt)
     set(BRIDGE_MODE_BTN  7)    # D7
     message(STATUS "Bridge: Metro RP2350 + ILI9341 240x320 TFT")
 else()
@@ -69,6 +71,7 @@ add_executable(kmbox_bridge
     st7735.c
     ili9341.c
     font.c
+    xpt2046_touch.c
 )
 
 # Generate PIO header for WS2812 NeoPixel from SDK
@@ -96,6 +99,9 @@ target_link_libraries(kmbox_bridge
 # Add custom TinyUSB configuration and board-specific TFT pin definitions
 target_compile_definitions(kmbox_bridge PRIVATE
     CFG_TUSB_CONFIG_FILE="tusb_config.h"
+    USBD_MANUFACTURER="Hurricane"
+    USBD_PRODUCT="KMBox\ Bridge\ ${TFT_DRIVER_NAME}"
+    USBD_DESC_STR_MAX=32
     BRIDGE_TFT_DRIVER=${BRIDGE_TFT_DRIVER}
     BRIDGE_TFT_SCK_PIN=${BRIDGE_TFT_SCK}
     BRIDGE_TFT_MOSI_PIN=${BRIDGE_TFT_MOSI}
@@ -105,6 +111,18 @@ target_compile_definitions(kmbox_bridge PRIVATE
     BRIDGE_TFT_BL_PIN=${BRIDGE_TFT_BL}
     BRIDGE_MODE_BTN_PIN=${BRIDGE_MODE_BTN}
 )
+
+# Add touch CS pin for ILI9341 displays
+if(DEFINED BRIDGE_TOUCH_CS)
+    target_compile_definitions(kmbox_bridge PRIVATE
+        BRIDGE_TOUCH_CS_PIN=${BRIDGE_TOUCH_CS}
+    )
+    if(DEFINED BRIDGE_TOUCH_IRQ)
+        target_compile_definitions(kmbox_bridge PRIVATE
+            BRIDGE_TOUCH_IRQ_PIN=${BRIDGE_TOUCH_IRQ}
+        )
+    endif()
+endif()
 
 # Enable USB CDC output (this is our PC interface)
 pico_enable_stdio_usb(kmbox_bridge 1)

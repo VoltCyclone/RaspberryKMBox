@@ -4,12 +4,12 @@
  * This firmware runs on an Adafruit Feather RP2350 and provides:
  * - USB CDC interface for receiving RGB frames from PC
  * - Color-based target tracking with configurable parameters
- * - Hardware UART0 for high-speed communication with RP2040 KMBox UART0
+ * - Hardware UART0 for high-speed communication with RP2350 KMBox UART0
  * - NeoPixel and onboard LED status indicators
  * - High-precision latency tracking using freed PIO resources
  * 
  * Architecture:
- *   PC (capture tool) -> USB CDC -> RP2350 (this) -> UART0 (crossed) -> RP2040 KMBox UART0
+ *   PC (capture tool) -> USB CDC -> RP2350 (this) -> UART0 (crossed) -> RP2350 KMBox UART0
  * 
  * Wiring: Bridge UART0 (GPIO27/28) <-> crossed <-> KMBox UART0 (GPIO11/12)
  * This allows direct hardware UART usage instead of PIO-based pin swapping.
@@ -51,11 +51,12 @@
 
 static api_mode_t current_api_mode = API_MODE_KMBOX;
 
-// Button handling - disabled, variables kept for future re-enablement
-#if 0  // Fix #11: Button feature disabled - wrap in #if 0 instead of silencing warnings
+// Button handling - tracking for stats, not for mode switching
 static uint32_t last_button_check = 0;
 static bool button_state = false;
 static uint32_t button_press_start = 0;
+
+#if 0  // Fix #11: Button feature disabled - wrap in #if 0 instead of silencing warnings
 static bool button_init_done = false;
 #endif
 
@@ -116,6 +117,14 @@ static uint32_t kmbox_connect_attempts = 0;
 // TFT display tracking variables
 static uint32_t boot_time_ms = 0;
 static uint32_t tft_mouse_activity_count = 0;
+static uint32_t button_press_count = 0;
+static uint32_t uart_error_count = 0;
+static uint32_t frame_error_count = 0;
+
+// Command rate tracking
+static uint32_t last_cmd_rate_calc_ms = 0;
+static uint32_t last_cmd_count = 0;
+static uint32_t commands_per_sec = 0;
 
 // UART rate tracking for TFT display
 static uint32_t last_rate_calc_time_ms = 0;
@@ -123,6 +132,8 @@ static uint32_t last_tx_bytes_for_rate = 0;
 static uint32_t last_rx_bytes_for_rate = 0;
 static uint32_t uart_tx_rate_bps = 0;  // Calculated TX rate
 static uint32_t uart_rx_rate_bps = 0;  // Calculated RX rate
+static uint32_t uart_tx_peak_bps = 0;  // Peak TX rate seen
+static uint32_t uart_rx_peak_bps = 0;  // Peak RX rate seen
 static uint32_t injection_count = 0;   // Number of successful km.move injections
 
 // Attached device info from KMBox
@@ -188,7 +199,10 @@ static void ws2812_init(void) {
 void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
     // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
     uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
-    pio_sm_put_blocking(ws2812_pio, ws2812_sm, grb << 8);
+    // Non-blocking: skip update if PIO FIFO is full (LED is cosmetic, not critical)
+    if (!pio_sm_is_tx_fifo_full(ws2812_pio, ws2812_sm)) {
+        pio_sm_put(ws2812_pio, ws2812_sm, grb << 8);
+    }
 }
 
 // ============================================================================
@@ -264,6 +278,23 @@ static void button_init(void) {
 static void button_task(void) {
     // Fix #11: Button feature disabled - API mode fixed to KMBox
     // TODO: Fix button debouncing before re-enabling (see #if 0 block)
+    
+    // Track button presses for display stats
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_button_check >= 50) {  // Debounce check every 50ms
+        last_button_check = now;
+        bool pressed = !gpio_get(MODE_BUTTON_PIN);  // Active low
+        
+        if (pressed && !button_state) {
+            // Button just pressed
+            button_state = true;
+            button_press_start = now;
+        } else if (!pressed && button_state) {
+            // Button just released
+            button_state = false;
+            button_press_count++;
+        }
+    }
 }
 
 // Send packet via Hardware UART (DMA accelerated)
@@ -383,11 +414,13 @@ static void uart_rx_task(void) {
     // Cache timestamp ONCE at start, not per-byte (saves ~50 cycles per byte)
     const uint32_t now = to_ms_since_boot(get_absolute_time());
     
-    // Batch process up to 64 bytes per call to avoid blocking too long
-    uint8_t batch_count = 0;
-    while (uart_rx_available() && batch_count < 64) {
-        uint8_t c = uart_rx_getc();
-        batch_count++;
+    // Batch read up to 64 bytes at once from DMA ring buffer (single memcpy)
+    uint8_t rx_batch[64];
+    size_t batch_count = hw_uart_read(rx_batch, sizeof(rx_batch));
+    if (batch_count == 0) return;
+    
+    for (size_t batch_i = 0; batch_i < batch_count; batch_i++) {
+        uint8_t c = rx_batch[batch_i];
         
         // Update last RX time once per batch (moved outside loop)
         kmbox_last_rx_time = now;
@@ -470,7 +503,7 @@ static void uart_rx_task(void) {
             }
         }
         // Ignore other non-printable bytes
-    }
+    } // end for batch_i
 }
 
 // ============================================================================
@@ -1155,6 +1188,19 @@ static void tft_update_task(void) {
         uart_tx_rate_bps = tx_delta;  // Exactly bytes/sec
         uart_rx_rate_bps = rx_delta;
         
+        // Track peak rates
+        if (uart_tx_rate_bps > uart_tx_peak_bps) {
+            uart_tx_peak_bps = uart_tx_rate_bps;
+        }
+        if (uart_rx_rate_bps > uart_rx_peak_bps) {
+            uart_rx_peak_bps = uart_rx_rate_bps;
+        }
+        
+        // Calculate command rate (mouse moves per second)
+        uint32_t cmd_delta = tft_mouse_activity_count - last_cmd_count;
+        commands_per_sec = cmd_delta;
+        last_cmd_count = tft_mouse_activity_count;
+        
         last_tx_bytes_for_rate = uart_tx_bytes_total;
         last_rx_bytes_for_rate = uart_rx_bytes_total;
         last_rate_calc_ms = now_ms;
@@ -1178,6 +1224,10 @@ static void tft_update_task(void) {
     stats.rx_rate_bps = uart_rx_rate_bps;
     stats.uart_baud = UART_BAUD;  // From config.h
     
+    // Peak rates
+    stats.tx_peak_bps = uart_tx_peak_bps;
+    stats.rx_peak_bps = uart_rx_peak_bps;
+    
     // Attached device info from KMBox
     stats.device_vid = attached_vid;
     stats.device_pid = attached_pid;
@@ -1187,11 +1237,29 @@ static void tft_update_task(void) {
     stats.humanization_mode = kmbox_humanization_mode;
     stats.humanization_valid = kmbox_humanization_valid;
     
-    // Mouse activity
+    // Mouse activity and other counters
     stats.mouse_moves = tft_mouse_activity_count;
+    stats.button_presses = button_press_count;
+    stats.commands_per_sec = commands_per_sec;
+    
+    // Error counters
+    stats.uart_errors = uart_error_count;
+    stats.frame_errors = frame_error_count;
+    
+    // System info
+    stats.cpu_freq_mhz = clock_get_hz(clk_sys) / 1000000;
     
     // Uptime
     stats.uptime_sec = (now_ms - boot_time_ms) / 1000;
+    
+    // Latency statistics
+    latency_stats_t lat_stats;
+    latency_get_stats(&lat_stats);
+    stats.latency_min_us = lat_stats.min_us;
+    stats.latency_avg_us = lat_stats.avg_us;
+    stats.latency_max_us = lat_stats.max_us;
+    stats.latency_jitter_us = lat_stats.jitter_us;
+    stats.latency_samples = lat_stats.sample_count;
     
     // Temperature: read only every 500ms (ADC is slow), cache result
     static uint32_t last_temp_read_ms = 0;
@@ -1274,6 +1342,7 @@ int main(void) {
         
         kmbox_connection_task();
         button_task();
+        tft_display_handle_touch();  // Handle touch screen input (view switching)
         
         // Periodic UART echo test (every 2 seconds while not connected)
         static uint32_t last_echo_test = 0;

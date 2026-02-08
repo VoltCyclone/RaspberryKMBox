@@ -235,15 +235,14 @@ static inline int32_t lut_get_progress(uint8_t total_frames, uint8_t current_fra
 static inline void lut_get_jitter(uint32_t frame_counter, int32_t jitter_scale,
                                    int32_t *out_x, int32_t *out_y) {
     // Select pattern and check if jitter applies this frame
-    // Uses split 32-bit masks for RP2040 efficiency (no native 64-bit ops)
+    // RP2350 Cortex-M33 handles 64-bit operations natively
     uint32_t pattern_idx = (frame_counter >> 6) & 0x3;  // Change pattern every 64 frames
     uint32_t bit_idx = frame_counter & 63;
     
-    // Select lo or hi mask based on bit position
-    uint32_t mask = (bit_idx < 32) ? g_jitter_mask_lo_lut[pattern_idx] 
-                                   : g_jitter_mask_hi_lut[pattern_idx];
+    // Construct 64-bit mask from lo/hi halves and test bit
+    uint64_t mask = (uint64_t)g_jitter_mask_hi_lut[pattern_idx] << 32 | g_jitter_mask_lo_lut[pattern_idx];
     
-    if (!((mask >> (bit_idx & 31)) & 1)) {
+    if (!((mask >> bit_idx) & 1)) {
         // No jitter this frame
         *out_x = 0;
         *out_y = 0;
@@ -337,12 +336,19 @@ static inline void lut_get_tremor(uint32_t time_ms, int32_t amplitude,
     if (quadrant_x >= 2) sin_x = -sin_x;
     if (quadrant_y >= 2) sin_y = -sin_y;
     
-    // Apply velocity-based scaling (tremor suppression during fast movement)
-    // Then scale by base amplitude
-    int32_t scaled_amplitude = ((int64_t)amplitude * velocity_scale) >> SMOOTH_FP_SHIFT;
-    
-    *out_x = ((int64_t)sin_x * scaled_amplitude) >> SMOOTH_FP_SHIFT;
-    *out_y = ((int64_t)sin_y * scaled_amplitude) >> SMOOTH_FP_SHIFT;
+    // Apply velocity-based scaling using SMULL for full 16.16 precision
+    // SMMULR loses bottom 16 bits which causes small tremor values to vanish
+    {
+        int32_t hi; uint32_t lo;
+        __asm__ volatile ("smull %0, %1, %2, %3" : "=r" (lo), "=r" (hi) : "r" (amplitude), "r" (velocity_scale));
+        int32_t scaled_amplitude = (int32_t)((uint32_t)(hi << SMOOTH_FP_SHIFT) | (lo >> SMOOTH_FP_SHIFT));
+        
+        int32_t hi2, hi3; uint32_t lo2, lo3;
+        __asm__ volatile ("smull %0, %1, %2, %3" : "=r" (lo2), "=r" (hi2) : "r" (sin_x), "r" (scaled_amplitude));
+        __asm__ volatile ("smull %0, %1, %2, %3" : "=r" (lo3), "=r" (hi3) : "r" (sin_y), "r" (scaled_amplitude));
+        *out_x = (int32_t)((uint32_t)(hi2 << SMOOTH_FP_SHIFT) | (lo2 >> SMOOTH_FP_SHIFT));
+        *out_y = (int32_t)((uint32_t)(hi3 << SMOOTH_FP_SHIFT) | (lo3 >> SMOOTH_FP_SHIFT));
+    }
 }
 
 /**
@@ -413,9 +419,15 @@ static inline int32_t lut_calc_tremor_suppression(int32_t velocity_mag) {
     }
     
     // Linear interpolation between thresholds
-    int32_t range = HIGH_THRESH - LOW_THRESH;
+    // Use SMULL for full 16.16 precision (SMMULR loses bottom 16 bits)
+    // range = 6 * SMOOTH_FP_ONE, reciprocal factor ≈ 0.1458... ≈ 9557 in 16.16
     int32_t pos = velocity_mag - LOW_THRESH;
-    int32_t suppression = SMOOTH_FP_ONE - ((pos * (SMOOTH_FP_ONE - (SMOOTH_FP_ONE >> 3))) / range);
+    int32_t max_suppression = SMOOTH_FP_ONE - (SMOOTH_FP_ONE >> 3);  // 0.875
+    (void)max_suppression; // factor already pre-computed below
+    int32_t hi; uint32_t lo;
+    __asm__ volatile ("smull %0, %1, %2, %3" : "=r" (lo), "=r" (hi) : "r" (pos), "r" ((int32_t)9557));
+    int32_t factor = (int32_t)((uint32_t)(hi << SMOOTH_FP_SHIFT) | (lo >> SMOOTH_FP_SHIFT));
+    int32_t suppression = SMOOTH_FP_ONE - factor;
     
     return suppression;
 }

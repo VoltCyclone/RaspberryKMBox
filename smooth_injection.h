@@ -189,7 +189,7 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode);
  * @param x Physical X movement
  * @param y Physical Y movement
  */
-void smooth_record_physical_movement(int8_t x, int8_t y);
+void smooth_record_physical_movement(int16_t x, int16_t y);
 
 /**
  * Process one frame of smooth injection

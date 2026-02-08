@@ -221,8 +221,15 @@ bool hw_uart_send(const uint8_t *data, size_t len) {
         return true;
     }
     
-    while (tx_busy) {
-        tight_loop_contents();
+    // Non-blocking: if DMA is still busy, copy to the other buffer
+    // and return false so caller knows to retry or drop
+    if (tx_busy) {
+        // Check if DMA actually finished (IRQ may be delayed)
+        if (!dma_channel_is_busy(tx_dma_chan)) {
+            tx_busy = false;
+        } else {
+            return false;  // Non-blocking: DMA still active, caller should retry
+        }
     }
     
     uint8_t *buf = using_buffer_a ? tx_buffer_a : tx_buffer_b;
@@ -238,11 +245,15 @@ bool hw_uart_send(const uint8_t *data, size_t len) {
 }
 
 void hw_uart_putc(uint8_t c) {
-    while (!uart_is_writable(HW_UART)) {
+    // Non-blocking with brief spin (max ~10µs at 2Mbaud)
+    uint32_t timeout = 100;  // ~100 iterations
+    while (!uart_is_writable(HW_UART) && --timeout) {
         tight_loop_contents();
     }
-    uart_putc_raw(HW_UART, c);
-    total_tx_bytes++;
+    if (timeout) {
+        uart_putc_raw(HW_UART, c);
+        total_tx_bytes++;
+    }
 }
 
 void hw_uart_puts(const char *str) {
@@ -265,28 +276,7 @@ static inline uint32_t get_rx_write_pos(void) {
 
 bool hw_uart_rx_available(void) {
     uint32_t write_pos = get_rx_write_pos();
-    bool has_data = (write_pos != rx_read_pos);
-    
-    static uint32_t last_debug = 0;
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_debug > 5000) {
-        bool dma_busy = (rx_dma_chan >= 0) ? dma_channel_is_busy(rx_dma_chan) : false;
-        
-        // Get DMA transfer count to see if it's actually transferring
-        uint32_t transfer_count = 0;
-        if (rx_dma_chan >= 0) {
-            transfer_count = dma_channel_hw_addr(rx_dma_chan)->transfer_count;
-        }
-        
-        // Check if UART has data in hardware FIFO
-        bool uart_readable = uart_is_readable(HW_UART);
-        
-        printf("[RX] wr=%u rd=%u has_data=%d dma_busy=%d xfer_count=%u uart_readable=%d total=%u\n", 
-               write_pos, (uint32_t)rx_read_pos, has_data, dma_busy, transfer_count, uart_readable, total_rx_bytes);
-        last_debug = now;
-    }
-    
-    return has_data;
+    return (write_pos != rx_read_pos);
 }
 
 size_t hw_uart_rx_count(void) {

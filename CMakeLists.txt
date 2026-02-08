@@ -24,8 +24,8 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-# Board selection: metro (Adafruit Metro RP2350), feather (Adafruit Feather), pico, pico2
-set(PICO_BOARD adafruit_feather_rp2040_usb_host CACHE STRING "Board type")
+# Board selection: metro (Adafruit Metro RP2350) or pico2 (RP2350 only)
+set(PICO_BOARD adafruit_metro_rp2350 CACHE STRING "Board type")
 
 # Tell the SDK where to find custom board headers (e.g. adafruit_metro_rp2350.h)
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
@@ -39,14 +39,6 @@ if(PICO_BOARD STREQUAL "adafruit_metro_rp2350")
     set(NEOPIXEL_PIN 25 CACHE STRING "NeoPixel data pin")
     set(NEOPIXEL_POWER_PIN 255 CACHE STRING "NeoPixel power pin (255=not used)")
     message(STATUS "Configuring for Adafruit Metro RP2350 - USB Host on GPIO32/33")
-elseif(PICO_BOARD STREQUAL "adafruit_feather_rp2040_usb_host")
-    set(USB_HOST_DP_PIN 16 CACHE STRING "USB Host D+ pin")
-    set(USB_HOST_DM_PIN 17 CACHE STRING "USB Host D- pin")
-    set(USB_HOST_5V_PIN 18 CACHE STRING "USB Host 5V power pin")
-    set(LED_PIN 13 CACHE STRING "Status LED pin")
-    set(NEOPIXEL_PIN 21 CACHE STRING "NeoPixel data pin")
-    set(NEOPIXEL_POWER_PIN 20 CACHE STRING "NeoPixel power pin")
-    message(STATUS "Configuring for Adafruit Feather RP2040 USB Host - USB Host on GPIO16/17")
 else()
     # Default: Pico/Pico2 with common GPIO16/17 for PIO USB
     set(USB_HOST_DP_PIN 16 CACHE STRING "USB Host D+ pin")
@@ -77,6 +69,7 @@ add_executable(PIOKMbox
     kmbox_serial_handler.c
     smooth_injection.c
     humanization_lut.c
+    dcp_helpers.S
 )
 
 # generate the header file into the source tree as it is included in the RP2040 datasheet
@@ -107,6 +100,7 @@ target_link_libraries(PIOKMbox
         hardware_adc
         pico_unique_id
         pico_multicore
+        hardware_dcp
         m)
 
 # Add PIO USB library

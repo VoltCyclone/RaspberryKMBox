@@ -1280,6 +1280,14 @@ void kmbox_add_mouse_movement(int16_t x, int16_t y)
         g_kmbox_state.mouse_y_accumulator += y;
         ay = y;
     }
+    
+    // Clamp accumulators to prevent unbounded growth
+    // Max ±4096 (~32 frames of max movement) is plenty of headroom
+    // while preventing wrap-around that causes movement hangs
+    if (g_kmbox_state.mouse_x_accumulator > 4096) g_kmbox_state.mouse_x_accumulator = 4096;
+    else if (g_kmbox_state.mouse_x_accumulator < -4096) g_kmbox_state.mouse_x_accumulator = -4096;
+    if (g_kmbox_state.mouse_y_accumulator > 4096) g_kmbox_state.mouse_y_accumulator = 4096;
+    else if (g_kmbox_state.mouse_y_accumulator < -4096) g_kmbox_state.mouse_y_accumulator = -4096;
 
     // Record actual movement applied (post-lock) using the latest known time
     // from update loop. This may lag slightly for command-initiated moves,

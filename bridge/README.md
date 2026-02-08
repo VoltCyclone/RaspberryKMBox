@@ -72,3 +72,47 @@ km.click(1)
 - Bridge not detected: Check USB cable, try different port, re-flash firmware
 - No KMBox response: Verify wiring (TX→RX, GND→GND) and matching baud rates
 - Garbled data: Check GND connection, try shorter wires
+
+## USB White-Labelling (OTP Branding)
+
+The bridge RP2350 can be **permanently** branded so that BOOTSEL mode shows custom
+identifiers instead of the default "Raspberry Pi" / "RP2350" / "RPI-RP2".
+
+> ⚠️ **OTP writes are irreversible.** Once burned, the branding cannot be changed.
+
+### What Changes
+
+| Field | Default | White-Labeled |
+|-------|---------|---------------|
+| USB Manufacturer | Raspberry Pi | Hurricane |
+| USB Product | RP2350 Boot | KMBox Bridge |
+| Volume Label | RPI-RP2 | KMBOX-BRDG |
+| UF2 Model | Raspberry Pi RP2350 | Hurricane KMBox Bridge |
+| Board ID | RP2350 | KMBOX-BRIDGE |
+| SCSI Vendor | RPI | HURRCNE |
+| INDEX.HTM | raspberrypi.com | GitHub repo |
+
+> **Note:** This only affects BOOTSEL mode. The running firmware's USB descriptors
+> (CDC device name, etc.) are set at compile time in `CMakeLists.txt` and are already
+> branded as "Hurricane".
+
+### Usage
+
+```bash
+# From the repo root:
+./build.sh white-label          # Interactive — prompts before writing
+./build.sh white-label-verify   # Read back current OTP state
+
+# Or directly:
+cd bridge/
+./white_label.sh                # Interactive
+./white_label.sh --dry-run      # Preview without writing
+./white_label.sh --verify       # Read current state
+./white_label.sh --force        # No prompt (CI/automation)
+```
+
+### Custom Branding
+
+Edit `bridge/white_label.json` to change any field before burning. See the
+[RP2350 Datasheet §5.7](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf)
+for full details on available fields and limits.
