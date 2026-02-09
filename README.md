@@ -4,7 +4,7 @@ A high-performance dual-role USB HID firmware for RP2350 boards that creates a *
 
 ## ⚠️ Warning
 
-This firmware runs at high clock speeds (300MHz+) for optimal performance. Monitor temperature if using extended automation sessions, especially with the TFT display enabled.
+This firmware runs at high clock speeds (240MHz+) for optimal performance. Monitor temperature if using extended automation sessions, especially with the TFT display enabled.
 
 ## What It Does
 
@@ -46,7 +46,7 @@ This firmware runs at high clock speeds (300MHz+) for optimal performance. Monit
 - **Board**: Adafruit Metro RP2350
 - **Role**: Computer vision tracking + ILI9341 display driver
 - **Connections**:
-  - USB-C port → PC (for frame data)
+  - USB-C port → PC (for serial input commands)
   - GPIO TX → Board 1 RX (crossed)
   - GPIO RX → Board 1 TX (crossed)
   - GND → Board 1 GND
@@ -117,7 +117,7 @@ GND          ────────────── GND
 
 1. **Mouse/Keyboard** → Board 1 USB-A port
 2. **Board 1 USB-C** → PC (appears as passthrough device)
-3. **Board 2 USB-C** → PC (optional, for CV frame data)
+3. **Board 2 USB-C** → PC (for serial input commands)
 
 ### 5. Verify Operation
 
@@ -336,8 +336,8 @@ An optional companion firmware that runs on a separate **Adafruit Metro RP2350**
 ### Architecture
 ```
 ┌─────────────┐  USB CDC     ┌──────────────────┐  UART (crossed)  ┌───────────────┐
-│   PC Tool   │ (RGB frames) │  Metro RP2350    │   115200 baud    │ KMBox Metro   │
-│  (capture)  │◄───────────►│  (Bridge/Display)│◄───────────────►│  (USB Proxy)  │
+│   PC Tool   │  (commands)  │  Metro RP2350    │   115200 baud    │ KMBox Metro   │
+│  (input)    │◄───────────►│  (Bridge/Display)│◄───────────────►│  (USB Proxy)  │
 └─────────────┘              └──────────────────┘                   └───────────────┘
                                       │
                                       ├─ ILI9341 TFT (SPI)
@@ -346,7 +346,7 @@ An optional companion firmware that runs on a separate **Adafruit Metro RP2350**
 
 ### Key Features
 - **ILI9341 Display**: 320x240 real-time status, latency graphs, connection indicators
-- **USB CDC Interface**: Receives RGB frame data from PC capture tool for CV tracking
+- **USB CDC Interface**: Receives serial input commands from PC for tracking and automation
 - **Color Tracking**: Hardware-accelerated blob detection and centroid calculation
 - **UART Communication**: Bidirectional serial between bridge and main KMBox
 - **Touch Support**: Optional XPT2046/FT6206 for interactive controls
