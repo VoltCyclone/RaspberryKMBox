@@ -49,7 +49,7 @@
 #if defined(BRIDGE_TFT_DRIVER) && BRIDGE_TFT_DRIVER == 3
 // Metro RP2350: ILI9341 on SPI1 via Arduino ICSP header
 #define TFT_SPI_DEV     spi1
-#define TFT_BAUDRATE    32000000                    // 32 MHz (ILI9341 supports up to 40MHz)
+#define TFT_BAUDRATE    40000000                    // 40 MHz (ILI9341 max; SDK rounds to nearest achievable)
 #else
 // Feather RP2350: ST7735 on SPI0
 #define TFT_SPI_DEV     spi0
@@ -66,6 +66,11 @@
 #define TFT_MOSI_PIN    BRIDGE_TFT_MOSI_PIN
 #else
 #define TFT_MOSI_PIN    PICO_DEFAULT_SPI_TX_PIN     // SPI TX
+#endif
+
+// MISO pin (required for touch controller SPI reads)
+#ifdef BRIDGE_TFT_MISO_PIN
+#define TFT_MISO_PIN    BRIDGE_TFT_MISO_PIN
 #endif
 
 // ============================================================================

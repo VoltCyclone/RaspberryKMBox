@@ -2,10 +2,11 @@
  * TFT Display Implementation for KMBox Bridge - OPTIMIZED
  * 
  * Optimizations:
- * - Dirty-region tracking to avoid full redraws
- * - Pre-formatted string buffers to reduce snprintf overhead
+ * - Full-screen redraw per update (no dirty-region tracking)
+ * - Pre-formatted string buffers with lean u32/hex formatters (no snprintf)
+ * - Precomputed sin/cos LUT for gauge arcs (no runtime trig)
+ * - Cached string lengths to avoid redundant strlen calls
  * - Single rate-limit layer (100ms)
- * - Intelligent change detection per display region
  */
 
 #include "tft_display.h"
@@ -14,14 +15,15 @@
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
+#include "hardware/i2c.h"
+#include "hardware/timer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
-#if (TFT_RAW_WIDTH >= 240)
-// Touch screen support for ILI9341
-#include "xpt2046_touch.h"
+#if (TFT_RAW_WIDTH >= 240) && defined(BRIDGE_TOUCH_SDA_PIN)
+// Capacitive touch via FT6206 over I2C (Adafruit ILI9341 shield)
+#include "ft6206_touch.h"
 #define TOUCH_ENABLED 1
 #else
 #define TOUCH_ENABLED 0
@@ -53,50 +55,160 @@ extern void picotft_init(void);
 #define SECTION_GAP         2
 #endif
 
-// RGB332 palette colors
-#define COL_BG              0x00
-#define COL_WHITE           0xFF
-#define COL_GREEN           0x1C
-#define COL_YELLOW          0xFC
-#define COL_RED             0xE0
-#define COL_CYAN            0x1F
-#define COL_GRAY            0x92
-#define COL_DARK            0x6D
-#define COL_DIM_LINE        0x49
+// Palette indices into tft_palette[256]
+// Indices 0x00-0x0F = grayscale ramp (black→white)
+// Indices 0xF0-0xFF = saturated colors
+#define COL_BG              0x00        // Black
+#define COL_WHITE           0x0F        // Pure white  (255,255,255)
+#define COL_GREEN           0xF4        // Bright green (32,255,0)
+#define COL_YELLOW          0xF1        // Bright yellow-orange (255,186,0)
+#define COL_RED             0xFF        // Pure red (255,0,0)
+#define COL_CYAN            0xF7        // Bright cyan (0,255,255)
+#define COL_GRAY            0x0A        // Medium-bright gray (172,170,172) - labels
+#define COL_DARK            0x06        // Medium gray (98,101,98) - secondary text
+#define COL_DIM_LINE        0x04        // Dim gray (65,68,65) - separator lines & zone hints
 
 // ============================================================================
-// State
+// Fast integer-to-string helpers (avoid snprintf overhead)
+// ============================================================================
+
+// Write uint32 to buf, return pointer past last char written.
+static char *u32_to_str(char *buf, uint32_t v) {
+    char tmp[10];
+    int i = 0;
+    if (v == 0) { *buf++ = '0'; return buf; }
+    while (v) { tmp[i++] = '0' + (v % 10); v /= 10; }
+    while (i--) *buf++ = tmp[i];
+    return buf;
+}
+
+// Write uint32 as zero-padded 2-digit decimal.
+static char *u32_to_str02(char *buf, uint32_t v) {
+    *buf++ = '0' + (v / 10) % 10;
+    *buf++ = '0' + v % 10;
+    return buf;
+}
+
+// Write uint16 as 4-digit uppercase hex.
+static char *u16_to_hex4(char *buf, uint16_t v) {
+    static const char hex[] = "0123456789ABCDEF";
+    *buf++ = hex[(v >> 12) & 0xF];
+    *buf++ = hex[(v >> 8)  & 0xF];
+    *buf++ = hex[(v >> 4)  & 0xF];
+    *buf++ = hex[v & 0xF];
+    return buf;
+}
+
+// Format into buf, NUL-terminate, return length.
+static inline int fmt_len(const char *buf, char *end) {
+    *end = '\0';
+    return (int)(end - buf);
+}
+
+// ============================================================================
+// Precomputed sin/cos LUT for gauge arcs (step=2°, 0..358°)
+// Stored as Q15 fixed-point: value = (int)(sinf(a) * 32767)
+// ============================================================================
+
+#define SINCOS_LUT_SIZE 180  // 360° / 2° step
+
+static const int16_t sin_lut[SINCOS_LUT_SIZE] = {
+        0,   1143,   2285,   3425,   4560,   5690,   6812,   7927,
+     9032,  10125,  11207,  12274,  13327,  14364,  15383,  16383,
+    17363,  18323,  19260,  20173,  21062,  21925,  22762,  23570,
+    24350,  25100,  25820,  26509,  27165,  27787,  28377,  28931,
+    29450,  29934,  30381,  30791,  31163,  31497,  31793,  32050,
+    32269,  32448,  32587,  32687,  32747,  32767,  32747,  32687,
+    32587,  32448,  32269,  32050,  31793,  31497,  31163,  30791,
+    30381,  29934,  29450,  28931,  28377,  27787,  27165,  26509,
+    25820,  25100,  24350,  23570,  22762,  21925,  21062,  20173,
+    19260,  18323,  17363,  16383,  15383,  14364,  13327,  12274,
+    11207,  10125,   9032,   7927,   6812,   5690,   4560,   3425,
+     2285,   1143,      0,  -1143,  -2285,  -3425,  -4560,  -5690,
+    -6812,  -7927,  -9032, -10125, -11207, -12274, -13327, -14364,
+   -15383, -16383, -17363, -18323, -19260, -20173, -21062, -21925,
+   -22762, -23570, -24350, -25100, -25820, -26509, -27165, -27787,
+   -28377, -28931, -29450, -29934, -30381, -30791, -31163, -31497,
+   -31793, -32050, -32269, -32448, -32587, -32687, -32747, -32767,
+   -32747, -32687, -32587, -32448, -32269, -32050, -31793, -31497,
+   -31163, -30791, -30381, -29934, -29450, -28931, -28377, -27787,
+   -27165, -26509, -25820, -25100, -24350, -23570, -22762, -21925,
+   -21062, -20173, -19260, -18323, -17363, -16383, -15383, -14364,
+   -13327, -12274, -11207, -10125,  -9032,  -7927,  -6812,  -5690,
+    -4560,  -3425,  -2285,  -1143,
+};
+
+// cos(a) = sin(a + 90°)
+static inline int16_t lut_sin(int angle_idx) { return sin_lut[angle_idx % SINCOS_LUT_SIZE]; }
+static inline int16_t lut_cos(int angle_idx) { return sin_lut[(angle_idx + 45) % SINCOS_LUT_SIZE]; } // +45 entries = +90°
+
+// ============================================================================
+// State — timer-driven background rendering
+//
+// Architecture:
+//   Main loop calls tft_display_submit_stats() to copy stats into shared buf.
+//   A repeating hardware timer fires every 100ms, picks up the latest stats,
+//   formats strings, and draws into the tft_input framebuffer.
+//   Main loop calls tft_display_flush() which does tft_swap_sync() (SPI DMA)
+//   only when a new frame has been rendered.
 // ============================================================================
 
 static bool initialized = false;
-static uint32_t last_update_ms = 0;
 static uint32_t last_tx_bytes = 0;
 static uint32_t last_rx_bytes = 0;
 static tft_view_mode_t current_view = TFT_VIEW_DETAILED;
 
-// Touch handling - interrupt driven
-static volatile bool touch_toggle_requested = false;
+// Touch handling - zone-based tap detection
+// Screen is divided into 3 horizontal zones:
+//   Top    (y 0..106):   Cycle display view
+//   Middle (y 107..213): Cycle API protocol
+//   Bottom (y 214..319): Cycle humanization mode
+static volatile bool touch_view_requested = false;
+static volatile bool touch_api_requested = false;
+static volatile bool touch_human_requested = false;
 
-// Pre-allocated format buffers (avoid snprintf in hot path)
-static char fmt_baud[8];
-static char fmt_uptime[12];
-static char fmt_tx_rate[12];
-static char fmt_rx_rate[12];
-static char fmt_rx_buf[8];
-static char fmt_moves[12];
-static char fmt_vid_pid[12];
-static char fmt_br_temp[8];
-static char fmt_km_temp[8];
-static char fmt_hmode[4];
-static char fmt_cpu[8];
-static char fmt_cmd_rate[12];
-static char fmt_lat_avg[12];
-static char fmt_lat_range[24];
-static char fmt_lat_jitter[12];
-static char fmt_errors[16];
-static char fmt_buttons[12];
-static char fmt_tx_peak[12];
-static char fmt_rx_peak[12];
+// Touch zone boundaries (240x320 display split into thirds)
+#define TOUCH_ZONE_TOP_END     106
+#define TOUCH_ZONE_MID_END     213
+
+// Double-buffered stats: main loop writes, timer ISR reads
+static tft_stats_t shared_stats;           // Latest stats from main loop
+static volatile bool stats_pending = false; // Main loop set, timer clears
+
+// Frame ready flag: timer ISR sets after drawing, main loop clears after DMA
+static volatile bool frame_ready = false;
+
+// Repeating timer handle
+static repeating_timer_t tft_render_timer;
+
+// Pre-allocated format buffers with cached lengths
+typedef struct { char str[24]; int len; } fmtbuf_t;
+
+static fmtbuf_t fmt_baud;
+static fmtbuf_t fmt_uptime;
+static fmtbuf_t fmt_tx_rate;
+static fmtbuf_t fmt_rx_rate;
+static fmtbuf_t fmt_rx_buf;
+static fmtbuf_t fmt_moves;
+static fmtbuf_t fmt_vid_pid;
+static fmtbuf_t fmt_br_temp;
+static fmtbuf_t fmt_km_temp;
+static fmtbuf_t fmt_hmode;
+static fmtbuf_t fmt_hdetail;
+static fmtbuf_t fmt_queuebar;
+static fmtbuf_t fmt_injcount;
+static fmtbuf_t fmt_cpu;
+static fmtbuf_t fmt_cmd_rate;
+static fmtbuf_t fmt_lat_avg;
+static fmtbuf_t fmt_lat_range;
+static fmtbuf_t fmt_lat_jitter;
+static fmtbuf_t fmt_errors;
+static fmtbuf_t fmt_buttons;
+static fmtbuf_t fmt_tx_peak;
+static fmtbuf_t fmt_rx_peak;
+
+// Helper to clear a fmtbuf
+static inline void fmt_clear(fmtbuf_t *f) { f->str[0] = '\0'; f->len = 0; }
 
 // ============================================================================
 // Drawing Helpers
@@ -117,8 +229,8 @@ static inline void clear_line(int y) {
 static inline void clear_region(int y, int h) {
     int y0 = (y < 0) ? 0 : y;
     int y1 = (y + h > TFT_HEIGHT) ? TFT_HEIGHT : y + h;
-    for (int i = y0; i < y1; i++) {
-        memset(&tft_input[i * TFT_WIDTH], COL_BG, TFT_WIDTH);
+    if (y1 > y0) {
+        memset(&tft_input[y0 * TFT_WIDTH], COL_BG, (y1 - y0) * TFT_WIDTH);
     }
 }
 
@@ -154,9 +266,16 @@ static inline uint8_t hmode_color(uint8_t m) {
 // ============================================================================
 
 #if TOUCH_ENABLED
-static void touch_event_callback(void) {
-    // Called from ISR - just set flag, don't do heavy work
-    touch_toggle_requested = true;
+static void touch_event_callback(uint16_t x, uint16_t y) {
+    // Route tap to the correct zone flag based on Y coordinate
+    // The display is 240x320, divided into 3 horizontal bands
+    if (y <= TOUCH_ZONE_TOP_END) {
+        touch_view_requested = true;       // Top: cycle view
+    } else if (y <= TOUCH_ZONE_MID_END) {
+        touch_api_requested = true;        // Middle: cycle API protocol
+    } else {
+        touch_human_requested = true;      // Bottom: cycle humanization
+    }
 }
 #endif
 
@@ -165,98 +284,202 @@ static void touch_event_callback(void) {
 // ============================================================================
 
 static void format_stats(const tft_stats_t *stats) {
-    // Pre-format all strings once (avoids snprintf during drawing)
-    snprintf(fmt_baud, sizeof(fmt_baud), "%luK", stats->uart_baud / 1000);
-    
-    uint32_t mins = stats->uptime_sec / 60;
-    uint32_t secs = stats->uptime_sec % 60;
-    snprintf(fmt_uptime, sizeof(fmt_uptime), "%lum%02lus", mins, secs);
-    
-    snprintf(fmt_tx_rate, sizeof(fmt_tx_rate), "%lu", stats->tx_rate_bps);
-    snprintf(fmt_rx_rate, sizeof(fmt_rx_rate), "%lu", stats->rx_rate_bps);
-    
+    char *p;
+
+    // Baud rate: "115K" or "921K"
+    p = u32_to_str(fmt_baud.str, stats->uart_baud / 1000);
+    *p++ = 'K';
+    fmt_baud.len = fmt_len(fmt_baud.str, p);
+
+    // Uptime: "12m05s"
+    p = u32_to_str(fmt_uptime.str, stats->uptime_sec / 60);
+    *p++ = 'm';
+    p = u32_to_str02(p, stats->uptime_sec % 60);
+    *p++ = 's';
+    fmt_uptime.len = fmt_len(fmt_uptime.str, p);
+
+    // TX/RX byte rates
+    p = u32_to_str(fmt_tx_rate.str, stats->tx_rate_bps);
+    *p++ = ' '; *p++ = 'B'; *p++ = '/'; *p++ = 's';
+    fmt_tx_rate.len = fmt_len(fmt_tx_rate.str, p);
+
+    p = u32_to_str(fmt_rx_rate.str, stats->rx_rate_bps);
+    *p++ = ' '; *p++ = 'B'; *p++ = '/'; *p++ = 's';
+    fmt_rx_rate.len = fmt_len(fmt_rx_rate.str, p);
+
+    // RX buffer level
     if (stats->rx_buffer_level > 0) {
-        snprintf(fmt_rx_buf, sizeof(fmt_rx_buf), "[%lu]", stats->rx_buffer_level);
-    } else {
-        fmt_rx_buf[0] = '\0';
-    }
-    
-    snprintf(fmt_moves, sizeof(fmt_moves), "%lu", stats->mouse_moves);
-    
+        p = fmt_rx_buf.str;
+        *p++ = 'b'; *p++ = 'u'; *p++ = 'f'; *p++ = ' ';
+        p = u32_to_str(p, stats->rx_buffer_level);
+        fmt_rx_buf.len = fmt_len(fmt_rx_buf.str, p);
+    } else { fmt_clear(&fmt_rx_buf); }
+
+    // Mouse moves
+    p = u32_to_str(fmt_moves.str, stats->mouse_moves);
+    fmt_moves.len = fmt_len(fmt_moves.str, p);
+
+    // VID:PID
     if (stats->device_vid != 0) {
-        snprintf(fmt_vid_pid, sizeof(fmt_vid_pid), "%04X:%04X", 
-                 stats->device_vid, stats->device_pid);
-    } else {
-        fmt_vid_pid[0] = '\0';
-    }
-    
+        p = u16_to_hex4(fmt_vid_pid.str, stats->device_vid);
+        *p++ = ':';
+        p = u16_to_hex4(p, stats->device_pid);
+        fmt_vid_pid.len = fmt_len(fmt_vid_pid.str, p);
+    } else { fmt_clear(&fmt_vid_pid); }
+
+    // Bridge temp: "Bridge 42C"
     if (TEMP_VALID(stats->bridge_temperature_c)) {
-        snprintf(fmt_br_temp, sizeof(fmt_br_temp), "BR%.0f", stats->bridge_temperature_c);
-    } else {
-        fmt_br_temp[0] = '\0';
-    }
-    
+        p = fmt_br_temp.str;
+        p = u32_to_str(p, (uint32_t)(stats->bridge_temperature_c + 0.5f));
+        *p++ = 'C';
+        fmt_br_temp.len = fmt_len(fmt_br_temp.str, p);
+    } else { fmt_clear(&fmt_br_temp); }
+
+    // KMBox temp: "KMBox 38C"
     if (stats->kmbox_connected && TEMP_VALID(stats->kmbox_temperature_c)) {
-        snprintf(fmt_km_temp, sizeof(fmt_km_temp), "KM%.0f", stats->kmbox_temperature_c);
-    } else {
-        fmt_km_temp[0] = '\0';
-    }
-    
+        p = fmt_km_temp.str;
+        p = u32_to_str(p, (uint32_t)(stats->kmbox_temperature_c + 0.5f));
+        *p++ = 'C';
+        fmt_km_temp.len = fmt_len(fmt_km_temp.str, p);
+    } else { fmt_clear(&fmt_km_temp); }
+
+    // Humanization mode: "Off", "Low", "Med", "High"
     if (stats->humanization_valid) {
-        snprintf(fmt_hmode, sizeof(fmt_hmode), "H%d", stats->humanization_mode);
-    } else {
-        fmt_hmode[0] = '\0';
-    }
-    
-    // CPU frequency
-    snprintf(fmt_cpu, sizeof(fmt_cpu), "%luM", stats->cpu_freq_mhz);
-    
-    // Command rate
+        static const char *hmode_labels[] = { "Off", "Low", "Med", "High" };
+        const char *label = (stats->humanization_mode < 4) ? hmode_labels[stats->humanization_mode] : "?";
+        p = fmt_hmode.str;
+        const char *lp = label;
+        while (*lp) *p++ = *lp++;
+        fmt_hmode.len = fmt_len(fmt_hmode.str, p);
+    } else { fmt_clear(&fmt_hmode); }
+
+    // Humanization detail flags
+    if (stats->humanization_valid) {
+        p = fmt_hdetail.str;
+        if (stats->jitter_enabled && stats->velocity_matching) {
+            const char *s = "Jit+Vel";
+            while (*s) *p++ = *s++;
+        } else if (stats->jitter_enabled) {
+            const char *s = "Jitter";
+            while (*s) *p++ = *s++;
+        } else if (stats->velocity_matching) {
+            const char *s = "VelMatch";
+            while (*s) *p++ = *s++;
+        } else {
+            const char *s = "None";
+            while (*s) *p++ = *s++;
+        }
+        fmt_hdetail.len = fmt_len(fmt_hdetail.str, p);
+    } else { fmt_clear(&fmt_hdetail); }
+
+    // Queue depth: "3/32"
+    if (stats->humanization_valid) {
+        p = fmt_queuebar.str;
+        p = u32_to_str(p, stats->queue_depth);
+        *p++ = '/';
+        p = u32_to_str(p, stats->queue_capacity);
+        fmt_queuebar.len = fmt_len(fmt_queuebar.str, p);
+    } else { fmt_clear(&fmt_queuebar); }
+
+    // Injection count
+    if (stats->humanization_valid && stats->total_injected > 0) {
+        p = u32_to_str(fmt_injcount.str, stats->total_injected);
+        fmt_injcount.len = fmt_len(fmt_injcount.str, p);
+    } else { fmt_clear(&fmt_injcount); }
+
+    // CPU frequency: "150 MHz"
+    p = u32_to_str(fmt_cpu.str, stats->cpu_freq_mhz);
+    *p++ = ' '; *p++ = 'M'; *p++ = 'H'; *p++ = 'z';
+    fmt_cpu.len = fmt_len(fmt_cpu.str, p);
+
+    // Command rate: "123 cmd/s"
     if (stats->commands_per_sec > 0) {
-        snprintf(fmt_cmd_rate, sizeof(fmt_cmd_rate), "%lu/s", stats->commands_per_sec);
-    } else {
-        fmt_cmd_rate[0] = '\0';
-    }
-    
-    // Latency stats
+        p = u32_to_str(fmt_cmd_rate.str, stats->commands_per_sec);
+        *p++ = ' '; *p++ = 'c'; *p++ = 'm'; *p++ = 'd'; *p++ = '/'; *p++ = 's';
+        fmt_cmd_rate.len = fmt_len(fmt_cmd_rate.str, p);
+    } else { fmt_clear(&fmt_cmd_rate); }
+
+    // Latency
     if (stats->latency_samples > 0) {
-        snprintf(fmt_lat_avg, sizeof(fmt_lat_avg), "%lu", stats->latency_avg_us);
-        snprintf(fmt_lat_range, sizeof(fmt_lat_range), "%lu-%lu", 
-                 stats->latency_min_us, stats->latency_max_us);
-        snprintf(fmt_lat_jitter, sizeof(fmt_lat_jitter), "~%lu", stats->latency_jitter_us);
+        p = u32_to_str(fmt_lat_avg.str, stats->latency_avg_us);
+        *p++ = ' '; *p++ = 'u'; *p++ = 's';
+        fmt_lat_avg.len = fmt_len(fmt_lat_avg.str, p);
+
+        p = u32_to_str(fmt_lat_range.str, stats->latency_min_us);
+        *p++ = '-';
+        p = u32_to_str(p, stats->latency_max_us);
+        *p++ = ' '; *p++ = 'u'; *p++ = 's';
+        fmt_lat_range.len = fmt_len(fmt_lat_range.str, p);
+
+        p = fmt_lat_jitter.str; *p++ = '+'; *p++ = '/';
+        *p++ = '-';
+        p = u32_to_str(p, stats->latency_jitter_us);
+        *p++ = ' '; *p++ = 'u'; *p++ = 's';
+        fmt_lat_jitter.len = fmt_len(fmt_lat_jitter.str, p);
     } else {
-        fmt_lat_avg[0] = '\0';
-        fmt_lat_range[0] = '\0';
-        fmt_lat_jitter[0] = '\0';
+        fmt_clear(&fmt_lat_avg);
+        fmt_clear(&fmt_lat_range);
+        fmt_clear(&fmt_lat_jitter);
     }
-    
+
     // Errors
     if (stats->uart_errors > 0 || stats->frame_errors > 0) {
-        snprintf(fmt_errors, sizeof(fmt_errors), "E:%lu/%lu", 
-                 stats->uart_errors, stats->frame_errors);
-    } else {
-        fmt_errors[0] = '\0';
-    }
-    
+        p = fmt_errors.str;
+        p = u32_to_str(p, stats->uart_errors);
+        *p++ = ' '; *p++ = 'U'; *p++ = 'A'; *p++ = 'R'; *p++ = 'T';
+        *p++ = ' ';
+        p = u32_to_str(p, stats->frame_errors);
+        *p++ = ' '; *p++ = 'F'; *p++ = 'r'; *p++ = 'm';
+        fmt_errors.len = fmt_len(fmt_errors.str, p);
+    } else { fmt_clear(&fmt_errors); }
+
     // Button presses
     if (stats->button_presses > 0) {
-        snprintf(fmt_buttons, sizeof(fmt_buttons), "Btn:%lu", stats->button_presses);
-    } else {
-        fmt_buttons[0] = '\0';
-    }
-    
+        p = u32_to_str(fmt_buttons.str, stats->button_presses);
+        fmt_buttons.len = fmt_len(fmt_buttons.str, p);
+    } else { fmt_clear(&fmt_buttons); }
+
     // Peak rates
     if (stats->tx_peak_bps > 0) {
-        snprintf(fmt_tx_peak, sizeof(fmt_tx_peak), "pk:%lu", stats->tx_peak_bps);
-    } else {
-        fmt_tx_peak[0] = '\0';
-    }
-    
+        p = fmt_tx_peak.str;
+        *p++ = 'p'; *p++ = 'k'; *p++ = ' ';
+        p = u32_to_str(p, stats->tx_peak_bps);
+        fmt_tx_peak.len = fmt_len(fmt_tx_peak.str, p);
+    } else { fmt_clear(&fmt_tx_peak); }
+
     if (stats->rx_peak_bps > 0) {
-        snprintf(fmt_rx_peak, sizeof(fmt_rx_peak), "pk:%lu", stats->rx_peak_bps);
-    } else {
-        fmt_rx_peak[0] = '\0';
-    }
+        p = fmt_rx_peak.str;
+        *p++ = 'p'; *p++ = 'k'; *p++ = ' ';
+        p = u32_to_str(p, stats->rx_peak_bps);
+        fmt_rx_peak.len = fmt_len(fmt_rx_peak.str, p);
+    } else { fmt_clear(&fmt_rx_peak); }
+}
+
+// Helper to draw a section header label
+static int draw_section_header(int y, const char *title) {
+    hline(y, COL_DIM_LINE);
+    y += SEP_GAP + 1;
+    tft_draw_string(MARGIN, y, COL_CYAN, title);
+    y += LINE_H;
+    return y;
+}
+
+// Helper to draw a label: value pair, right-aligned value
+static void draw_label_value(int y, const char *label, const char *value, uint8_t val_color) {
+    tft_draw_string(MARGIN, y, COL_GRAY, label);
+    int lbl_len = 0;
+    const char *lp = label;
+    while (*lp++) lbl_len++;
+    int val_x = MARGIN + (lbl_len + 1) * FONT_W;
+    tft_draw_string(val_x, y, val_color, value);
+}
+
+// Helper to draw label on left, value right-aligned
+static void draw_row_lr(int y, const char *label, uint8_t lbl_col,
+                        const char *value, int val_len, uint8_t val_col) {
+    tft_draw_string(MARGIN, y, lbl_col, label);
+    int rx = TFT_WIDTH - MARGIN - val_len * FONT_W;
+    tft_draw_string(rx, y, val_col, value);
 }
 
 static void draw_stats(const tft_stats_t *stats) {
@@ -268,213 +491,275 @@ static void draw_stats(const tft_stats_t *stats) {
     hline(y, COL_DIM_LINE);
     y += SEP_GAP + 2;
     
-    // === ROW 1: CDC / KM / Humanization ===
-    uint8_t cdc_col = stats->cdc_connected ? COL_GREEN : COL_RED;
-    uint8_t km_col = stats->kmbox_connected ? COL_GREEN : COL_RED;
-    
-    tft_draw_string(MARGIN, y, COL_GRAY, "CDC:");
-    tft_draw_string(MARGIN + 32, y, cdc_col, stats->cdc_connected ? "Y" : "N");
-    tft_draw_string(MARGIN + 48, y, COL_GRAY, "KM:");
-    tft_draw_string(MARGIN + 72, y, km_col, stats->kmbox_connected ? "Y" : "N");
-    
-    if (fmt_hmode[0]) {
-        tft_draw_string(TFT_WIDTH - MARGIN - 16, y, hmode_color(stats->humanization_mode), fmt_hmode);
-    }
-    y += LINE_H;
-    
+    // === CONNECTION STATUS ===
+    {
+        uint8_t cdc_col = stats->cdc_connected ? COL_GREEN : COL_RED;
+        uint8_t km_col  = stats->kmbox_connected ? COL_GREEN : COL_RED;
+        
+        tft_draw_string(MARGIN, y, COL_GRAY, "Host");
+        tft_draw_string(MARGIN + 5 * FONT_W, y, cdc_col,
+                        stats->cdc_connected ? "OK" : "--");
+
 #if (TFT_RAW_WIDTH >= 240)
-    // === ROW 1b: API Mode (extra space on ILI9341) ===
+        tft_draw_string(MARGIN + 10 * FONT_W, y, COL_GRAY, "KMBox");
+        tft_draw_string(MARGIN + 16 * FONT_W, y, km_col,
+                        stats->kmbox_connected ? "OK" : "--");
+#else
+        tft_draw_string(MARGIN + 8 * FONT_W, y, COL_GRAY, "KM");
+        tft_draw_string(MARGIN + 11 * FONT_W, y, km_col,
+                        stats->kmbox_connected ? "OK" : "--");
+#endif
+        y += LINE_H;
+    }
+    
+    // === API + Uptime row ===
     {
         const char *mode_names[] = { "KMBox", "Makcu", "Ferrum" };
         const char *mode_str = (stats->api_mode < 3) ? mode_names[stats->api_mode] : "???";
-        tft_draw_string(MARGIN, y, COL_GRAY, "API:");
-        tft_draw_string(MARGIN + 40, y, COL_CYAN, mode_str);
-    }
-    y += LINE_H;
-#endif
-    
-    // === ROW 2: Baud + Uptime ===
-    tft_draw_string(MARGIN, y, COL_GREEN, fmt_baud);
-    int uptime_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_uptime) * FONT_W;
-    tft_draw_string(uptime_x, y, COL_CYAN, fmt_uptime);
-    y += LINE_H;
-    
-    // === ROW 2b: CPU + Command Rate ===
-    tft_draw_string(MARGIN, y, COL_GRAY, "CPU:");
-    tft_draw_string(MARGIN + 32, y, COL_CYAN, fmt_cpu);
-    if (fmt_cmd_rate[0]) {
-        int cmd_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_cmd_rate) * FONT_W;
-        tft_draw_string(cmd_x, y, COL_GREEN, fmt_cmd_rate);
-    }
-    y += LINE_H;
-    
-    // === ROW 3: TX ===
-    bool tx_active = (stats->tx_bytes != last_tx_bytes);
-    uint8_t tx_val_col = tx_active ? COL_GREEN : (stats->tx_rate_bps == 0 ? COL_RED : COL_WHITE);
-    tft_draw_string(MARGIN, y, COL_GRAY, "TX");
-    tft_draw_string(MARGIN + 24, y, tx_val_col, fmt_tx_rate);
-    if (fmt_tx_peak[0]) {
-        int peak_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_tx_peak) * FONT_W;
-        tft_draw_string(peak_x, y, COL_GRAY, fmt_tx_peak);
-    } else if (tx_active) {
-        tft_draw_string(TFT_WIDTH - MARGIN - 8, y, COL_GREEN, "^");
-    }
-    y += LINE_H;
-    
-    // === ROW 4: RX ===
-    bool rx_active = (stats->rx_bytes != last_rx_bytes);
-    uint8_t rx_val_col = rx_active ? COL_GREEN : (stats->rx_rate_bps == 0 ? COL_RED : COL_WHITE);
-    tft_draw_string(MARGIN, y, COL_GRAY, "RX");
-    tft_draw_string(MARGIN + 24, y, rx_val_col, fmt_rx_rate);
-    if (fmt_rx_buf[0]) {
-        int buf_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_rx_buf) * FONT_W;
-        tft_draw_string(buf_x, y, COL_YELLOW, fmt_rx_buf);
-    } else if (fmt_rx_peak[0]) {
-        int peak_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_rx_peak) * FONT_W;
-        tft_draw_string(peak_x, y, COL_GRAY, fmt_rx_peak);
-    } else if (rx_active) {
-        tft_draw_string(TFT_WIDTH - MARGIN - 8, y, COL_GREEN, "v");
-    }
-    y += LINE_H;
-    
-    // === ROW 5: Mouse + Buttons ===
-    uint8_t mv_col = (stats->mouse_moves > 0) ? COL_WHITE : COL_RED;
-    tft_draw_string(MARGIN, y, COL_GRAY, "Mv");
-    tft_draw_string(MARGIN + 24, y, mv_col, fmt_moves);
-    if (fmt_buttons[0]) {
-        int btn_x = TFT_WIDTH - MARGIN - (int)strlen(fmt_buttons) * FONT_W;
-        tft_draw_string(btn_x, y, COL_YELLOW, fmt_buttons);
-    }
-    y += LINE_H;
-    
-    // === ROW 6: Errors (if any) ===
-    if (fmt_errors[0]) {
-        tft_draw_string(MARGIN, y, COL_RED, fmt_errors);
+        tft_draw_string(MARGIN, y, COL_GRAY, "API");
+        tft_draw_string(MARGIN + 4 * FONT_W, y, COL_WHITE, mode_str);
+        // Uptime right-aligned
+        int ux = TFT_WIDTH - MARGIN - fmt_uptime.len * FONT_W;
+        tft_draw_string(ux, y, COL_CYAN, fmt_uptime.str);
         y += LINE_H;
     }
     
-    y += SECTION_GAP;
-    
-    // === LATENCY STATS ===
-    if (fmt_lat_avg[0]) {
-        hline(y, COL_DIM_LINE);
-        y += SEP_GAP + 2;
+    // === HUMANIZATION SECTION ===
+    if (fmt_hmode.len) {
+        y += SECTION_GAP;
+        y = draw_section_header(y, "Humanize");
         
-        tft_draw_string(MARGIN, y, COL_GRAY, "Lat:");
-        tft_draw_string(MARGIN + 32, y, COL_GREEN, fmt_lat_avg);
-        tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_avg) * FONT_W, y, COL_GRAY, "us");
+        // Mode + detail flags
+        tft_draw_string(MARGIN, y, COL_GRAY, "Mode");
+        tft_draw_string(MARGIN + 5 * FONT_W, y,
+                        hmode_color(stats->humanization_mode), fmt_hmode.str);
+        if (fmt_hdetail.len) {
+            int dx = TFT_WIDTH - MARGIN - fmt_hdetail.len * FONT_W;
+            tft_draw_string(dx, y, COL_GRAY, fmt_hdetail.str);
+        }
+        y += LINE_H;
+        
+        // Queue bar + injection count
+        if (fmt_queuebar.len) {
+            tft_draw_string(MARGIN, y, COL_GRAY, "Queue");
+            uint8_t q_col = COL_GREEN;
+            if (stats->queue_depth > stats->queue_capacity * 3 / 4) q_col = COL_RED;
+            else if (stats->queue_depth > stats->queue_capacity / 2) q_col = COL_YELLOW;
+            tft_draw_string(MARGIN + 6 * FONT_W, y, q_col, fmt_queuebar.str);
+            
+            if (fmt_injcount.len) {
+                int ix = TFT_WIDTH - MARGIN - fmt_injcount.len * FONT_W;
+                tft_draw_string(ix, y, COL_GRAY, fmt_injcount.str);
+            }
+            y += LINE_H;
+        }
+        
+        // Queue overflows (if any)
+        if (stats->queue_overflows > 0) {
+            char ovf_buf[16]; char *op = ovf_buf;
+            const char *s = "Overflow ";
+            while (*s) *op++ = *s++;
+            op = u32_to_str(op, stats->queue_overflows);
+            *op = '\0';
+            tft_draw_string(MARGIN, y, COL_RED, ovf_buf);
+            y += LINE_H;
+        }
+    }
+    
+    // === DATA SECTION ===
+    y += SECTION_GAP;
+    y = draw_section_header(y, "Data");
+    
+    // TX row
+    {
+        bool tx_active = (stats->tx_bytes != last_tx_bytes);
+        uint8_t tx_col = tx_active ? COL_GREEN : (stats->tx_rate_bps == 0 ? COL_RED : COL_WHITE);
+        tft_draw_string(MARGIN, y, COL_GRAY, "TX");
+        tft_draw_string(MARGIN + 3 * FONT_W, y, tx_col, fmt_tx_rate.str);
+        if (fmt_tx_peak.len) {
+            int px = TFT_WIDTH - MARGIN - fmt_tx_peak.len * FONT_W;
+            tft_draw_string(px, y, COL_DARK, fmt_tx_peak.str);
+        }
+        y += LINE_H;
+    }
+    
+    // RX row
+    {
+        bool rx_active = (stats->rx_bytes != last_rx_bytes);
+        uint8_t rx_col = rx_active ? COL_GREEN : (stats->rx_rate_bps == 0 ? COL_RED : COL_WHITE);
+        tft_draw_string(MARGIN, y, COL_GRAY, "RX");
+        tft_draw_string(MARGIN + 3 * FONT_W, y, rx_col, fmt_rx_rate.str);
+        if (fmt_rx_buf.len) {
+            int bx = TFT_WIDTH - MARGIN - fmt_rx_buf.len * FONT_W;
+            tft_draw_string(bx, y, COL_YELLOW, fmt_rx_buf.str);
+        } else if (fmt_rx_peak.len) {
+            int px = TFT_WIDTH - MARGIN - fmt_rx_peak.len * FONT_W;
+            tft_draw_string(px, y, COL_DARK, fmt_rx_peak.str);
+        }
+        y += LINE_H;
+    }
+    
+    // UART baud + command rate
+    {
+        tft_draw_string(MARGIN, y, COL_GRAY, "Baud");
+        tft_draw_string(MARGIN + 5 * FONT_W, y, COL_GREEN, fmt_baud.str);
+        if (fmt_cmd_rate.len) {
+            int cx = TFT_WIDTH - MARGIN - fmt_cmd_rate.len * FONT_W;
+            tft_draw_string(cx, y, COL_GREEN, fmt_cmd_rate.str);
+        }
+        y += LINE_H;
+    }
+    
+    // Mouse moves + button presses
+    {
+        uint8_t mv_col = (stats->mouse_moves > 0) ? COL_WHITE : COL_DARK;
+        tft_draw_string(MARGIN, y, COL_GRAY, "Mouse");
+        tft_draw_string(MARGIN + 6 * FONT_W, y, mv_col, fmt_moves.str);
+        if (fmt_buttons.len) {
+            tft_draw_string(TFT_WIDTH - MARGIN - (fmt_buttons.len + 5) * FONT_W, y, COL_GRAY, "Btns");
+            int bx = TFT_WIDTH - MARGIN - fmt_buttons.len * FONT_W;
+            tft_draw_string(bx, y, COL_YELLOW, fmt_buttons.str);
+        }
+        y += LINE_H;
+    }
+    
+    // Errors (only when present)
+    if (fmt_errors.len) {
+        tft_draw_string(MARGIN, y, COL_RED, fmt_errors.str);
+        y += LINE_H;
+    }
+    
+    // === LATENCY SECTION ===
+    if (fmt_lat_avg.len) {
+        y += SECTION_GAP;
+        y = draw_section_header(y, "Latency");
+        
+        draw_row_lr(y, "Avg", COL_GRAY, fmt_lat_avg.str, fmt_lat_avg.len, COL_GREEN);
         y += LINE_H;
         
 #if (TFT_RAW_WIDTH >= 240)
-        // ILI9341: Show range and jitter on separate lines
-        if (fmt_lat_range[0]) {
-            tft_draw_string(MARGIN, y, COL_GRAY, "Rng:");
-            tft_draw_string(MARGIN + 32, y, COL_GRAY, fmt_lat_range);
-            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_range) * FONT_W, y, COL_GRAY, "us");
-            y += LINE_H;
-        }
-        if (fmt_lat_jitter[0]) {
-            tft_draw_string(MARGIN, y, COL_GRAY, "Jtr:");
-            tft_draw_string(MARGIN + 32, y, COL_YELLOW, fmt_lat_jitter);
-            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_jitter) * FONT_W, y, COL_GRAY, "us");
-            y += LINE_H;
-        }
-#else
-        // ST7735: Compact format - just show jitter
-        if (fmt_lat_jitter[0]) {
-            tft_draw_string(MARGIN, y, COL_GRAY, "Jtr:");
-            tft_draw_string(MARGIN + 32, y, COL_YELLOW, fmt_lat_jitter);
-            tft_draw_string(MARGIN + 32 + (int)strlen(fmt_lat_jitter) * FONT_W, y, COL_GRAY, "us");
+        if (fmt_lat_range.len) {
+            draw_row_lr(y, "Range", COL_GRAY, fmt_lat_range.str, fmt_lat_range.len, COL_GRAY);
             y += LINE_H;
         }
 #endif
-        y += SECTION_GAP;
+        if (fmt_lat_jitter.len) {
+            draw_row_lr(y, "Jitter", COL_GRAY, fmt_lat_jitter.str, fmt_lat_jitter.len, COL_YELLOW);
+            y += LINE_H;
+        }
     }
     
-    // === DEVICE INFO ===
-    if (fmt_vid_pid[0]) {
-        hline(y, COL_DIM_LINE);
-        y += SEP_GAP + 2;
+    // === SYSTEM SECTION ===
+    {
+        y += SECTION_GAP;
+        y = draw_section_header(y, "System");
         
-        tft_draw_string(MARGIN, y, COL_CYAN, fmt_vid_pid);
+        // CPU + Device ID
+        tft_draw_string(MARGIN, y, COL_GRAY, "CPU");
+        tft_draw_string(MARGIN + 4 * FONT_W, y, COL_WHITE, fmt_cpu.str);
+        if (fmt_vid_pid.len) {
+            int vx = TFT_WIDTH - MARGIN - fmt_vid_pid.len * FONT_W;
+            tft_draw_string(vx, y, COL_CYAN, fmt_vid_pid.str);
+        }
         y += LINE_H;
         
+        // Product name (if available)
         if (stats->device_product[0]) {
 #if (TFT_RAW_WIDTH >= 240)
-            // ILI9341: can show full product name (up to 29 chars)
             char prod[30];
             int i;
-            for (i = 0; i < 29 && stats->device_product[i]; i++) {
+            for (i = 0; i < 29 && stats->device_product[i]; i++)
                 prod[i] = stats->device_product[i];
-            }
 #else
             char prod[16];
             int i;
-            for (i = 0; i < 15 && stats->device_product[i]; i++) {
+            for (i = 0; i < 15 && stats->device_product[i]; i++)
                 prod[i] = stats->device_product[i];
-            }
 #endif
             prod[i] = '\0';
-            tft_draw_string(MARGIN, y, COL_GRAY, prod);
+            tft_draw_string(MARGIN, y, COL_DARK, prod);
             y += LINE_H;
+        }
+        
+        // Temperatures
+        if (fmt_br_temp.len || fmt_km_temp.len) {
+            tft_draw_string(MARGIN, y, COL_GRAY, "Temp");
+            int tx = MARGIN + 5 * FONT_W;
+            if (fmt_br_temp.len) {
+                tft_draw_string(tx, y, temp_color(stats->bridge_temperature_c), fmt_br_temp.str);
+                tx += (fmt_br_temp.len + 1) * FONT_W;
+            }
+            if (fmt_km_temp.len) {
+                tft_draw_string(tx, y, temp_color(stats->kmbox_temperature_c), fmt_km_temp.str);
+            }
         }
     }
     
-    // === TEMPERATURES ===
-    if (fmt_br_temp[0] || fmt_km_temp[0]) {
-        y += SECTION_GAP;
-        hline(y, COL_DIM_LINE);
-        y += SEP_GAP + 2;
-        
-        int x = MARGIN;
-        if (fmt_br_temp[0]) {
-            tft_draw_string(x, y, temp_color(stats->bridge_temperature_c), fmt_br_temp);
-            x += 40;
-        }
-        if (fmt_km_temp[0]) {
-            tft_draw_string(x, y, temp_color(stats->kmbox_temperature_c), fmt_km_temp);
-        }
+#if TOUCH_ENABLED
+    // === TOUCH ZONE HINTS (right edge, centered in each zone) ===
+    // No hlines — they overlap content rows. Small right-edge labels only.
+    {
+        int zone_x = TFT_WIDTH - MARGIN - FONT_W;  // Single-char width from right edge
+        // Zone 1 (top):    y 0 .. TOUCH_ZONE_TOP_END  → center vertically
+        int z1_y = (TOUCH_ZONE_TOP_END) / 2 - FONT_H / 2;
+        // Zone 2 (middle): y TOUCH_ZONE_TOP_END+1 .. TOUCH_ZONE_MID_END
+        int z2_y = (TOUCH_ZONE_TOP_END + 1 + TOUCH_ZONE_MID_END) / 2 - FONT_H / 2;
+        // Zone 3 (bottom): y TOUCH_ZONE_MID_END+1 .. TFT_HEIGHT-1
+        int z3_y = (TOUCH_ZONE_MID_END + 1 + TFT_HEIGHT) / 2 - FONT_H / 2;
+        tft_draw_string(zone_x, z1_y, COL_DIM_LINE, "V");
+        tft_draw_string(zone_x, z2_y, COL_DIM_LINE, "A");
+        tft_draw_string(zone_x, z3_y, COL_DIM_LINE, "H");
     }
+#endif
 }
 
 // ============================================================================
 // Gauge View - Large Visual Indicators
 // ============================================================================
 
+// Convert angle in degrees to LUT index (step 2°, wrapping).
+// Input angle can be negative.
+static inline int angle_to_idx(int deg) {
+    int idx = ((deg % 360) + 360) / 2 % SINCOS_LUT_SIZE;
+    return idx;
+}
+
 static void draw_circular_gauge(int cx, int cy, int radius, float value, float max_value, 
                                 const char* label, uint8_t color) {
-    // Draw gauge outline
+    // Draw gauge outline using LUT
     for (int r = radius - 2; r <= radius; r++) {
-        for (int angle = 0; angle < 360; angle += 2) {
-            float rad = angle * 3.14159f / 180.0f;
-            int x = cx + (int)(r * cosf(rad));
-            int y = cy + (int)(r * sinf(rad));
+        for (int ai = 0; ai < SINCOS_LUT_SIZE; ai++) {
+            int x = cx + (r * lut_cos(ai) + 16384) / 32768;
+            int y = cy + (r * lut_sin(ai) + 16384) / 32768;
             if (x >= 0 && x < TFT_WIDTH && y >= 0 && y < TFT_HEIGHT) {
                 tft_input[y * TFT_WIDTH + x] = COL_DARK;
             }
         }
     }
     
-    // Draw value arc
+    // Draw value arc using LUT
     float percentage = (value / max_value);
     if (percentage > 1.0f) percentage = 1.0f;
-    int end_angle = (int)(percentage * 270.0f) - 135;  // -135 to 135 degrees
+    int end_angle = (int)(percentage * 270.0f) - 135;
     
     for (int angle = -135; angle < end_angle && angle < 135; angle += 2) {
-        float rad = angle * 3.14159f / 180.0f;
+        int ai = angle_to_idx(angle);
+        int16_t s = lut_sin(ai);
+        int16_t c = lut_cos(ai);
         for (int r = radius - 8; r <= radius - 3; r++) {
-            int x = cx + (int)(r * cosf(rad));
-            int y = cy + (int)(r * sinf(rad));
+            int x = cx + (r * c + 16384) / 32768;
+            int y = cy + (r * s + 16384) / 32768;
             if (x >= 0 && x < TFT_WIDTH && y >= 0 && y < TFT_HEIGHT) {
                 tft_input[y * TFT_WIDTH + x] = color;
             }
         }
     }
     
-    // Draw value text in center
+    // Draw value text in center (lean formatting)
     char value_str[16];
-    snprintf(value_str, sizeof(value_str), "%.0f", value);
-    int text_len = strlen(value_str);
+    char *p = u32_to_str(value_str, (uint32_t)(value + 0.5f));
+    *p = '\0';
+    int text_len = (int)(p - value_str);
     int text_x = cx - (text_len * FONT_W) / 2;
     tft_draw_string(text_x, cy - FONT_H / 2, color, value_str);
     
@@ -500,10 +785,12 @@ static void draw_bar_gauge(int x, int y, int width, int height, float value, flo
         box(x + 4, y + 4, fill_width, height - 8, color);
     }
     
-    // Draw value text
+    // Draw value text (lean formatting)
     char value_str[16];
-    snprintf(value_str, sizeof(value_str), "%.0f", value);
-    tft_draw_string(x + width / 2 - (strlen(value_str) * FONT_W) / 2, 
+    char *p = u32_to_str(value_str, (uint32_t)(value + 0.5f));
+    *p = '\0';
+    int text_len = (int)(p - value_str);
+    tft_draw_string(x + width / 2 - (text_len * FONT_W) / 2, 
                     y + height / 2 - FONT_H / 2, COL_WHITE, value_str);
     
     // Draw label above
@@ -570,17 +857,14 @@ static void draw_gauge_view(const tft_stats_t *stats) {
     // Temperature
     if (TEMP_VALID(stats->bridge_temperature_c)) {
         char temp_str[16];
-        snprintf(temp_str, sizeof(temp_str), "%.0fC", stats->bridge_temperature_c);
+        char *tp = u32_to_str(temp_str, (uint32_t)(stats->bridge_temperature_c + 0.5f));
+        *tp++ = 'C'; *tp = '\0';
         tft_draw_string(MARGIN, y, temp_color(stats->bridge_temperature_c), temp_str);
     }
     
-    // Uptime
-    uint32_t mins = stats->uptime_sec / 60;
-    uint32_t secs = stats->uptime_sec % 60;
-    char uptime_str[16];
-    snprintf(uptime_str, sizeof(uptime_str), "%lum%02lus", mins, secs);
-    int uptime_x = TFT_WIDTH - MARGIN - (int)strlen(uptime_str) * FONT_W;
-    tft_draw_string(uptime_x, y, COL_CYAN, uptime_str);
+    // Uptime (reuse pre-formatted buffer)
+    int uptime_x = TFT_WIDTH - MARGIN - fmt_uptime.len * FONT_W;
+    tft_draw_string(uptime_x, y, COL_CYAN, fmt_uptime.str);
 #else
     // Small display: horizontal bar gauges
     int bar_height = 24;
@@ -609,11 +893,27 @@ static void draw_gauge_view(const tft_stats_t *stats) {
     draw_bar_gauge(MARGIN, y, bar_width, bar_height, stats->rx_rate_bps / 1000.0f, 50.0f,
                   "RX (KB/s)", COL_CYAN);
 #endif
+
+#if TOUCH_ENABLED
+    // Touch zone hints (right edge, centered in each zone — no hlines)
+    {
+        int zone_x = TFT_WIDTH - MARGIN - FONT_W;
+        int z1_y = (TOUCH_ZONE_TOP_END) / 2 - FONT_H / 2;
+        int z2_y = (TOUCH_ZONE_TOP_END + 1 + TOUCH_ZONE_MID_END) / 2 - FONT_H / 2;
+        int z3_y = (TOUCH_ZONE_MID_END + 1 + TFT_HEIGHT) / 2 - FONT_H / 2;
+        tft_draw_string(zone_x, z1_y, COL_DIM_LINE, "V");
+        tft_draw_string(zone_x, z2_y, COL_DIM_LINE, "A");
+        tft_draw_string(zone_x, z3_y, COL_DIM_LINE, "H");
+    }
+#endif
 }
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+// Forward declaration — timer callback defined below
+static bool tft_render_timer_callback(repeating_timer_t *rt);
 
 bool tft_display_init(void) {
     if (initialized) return true;
@@ -630,70 +930,99 @@ bool tft_display_init(void) {
     pwm_set_enabled(slice, true);
     
 #if TOUCH_ENABLED
-    // Initialize touch controller on same SPI as display
-    // Touch CS is typically on a different pin (check your hardware)
-    // For ILI9341 Arduino shields, touch CS is usually pin 4
-    #ifdef BRIDGE_TOUCH_CS_PIN
-    int8_t touch_irq = -1;
-    #ifdef BRIDGE_TOUCH_IRQ_PIN
-    touch_irq = BRIDGE_TOUCH_IRQ_PIN;
-    #endif
-    
-    xpt2046_init(TFT_SPI_DEV, BRIDGE_TOUCH_CS_PIN, touch_irq);
-    
-    // Register interrupt callback for touch events
-    xpt2046_set_callback(touch_event_callback);
-    #endif
-    
-    // Set calibration for ILI9341 (may need adjustment)
-    touch_calibration_t cal = {
-        .x_min = 300,
-        .x_max = 3800,
-        .y_min = 300,
-        .y_max = 3800,
-        .swap_xy = true,
-        .invert_x = false,
-        .invert_y = true
-    };
-    xpt2046_set_calibration(&cal);
+    // Initialize FT6206 capacitive touch controller over I2C
+    // SDA = Arduino A4 (GPIO20), SCL = Arduino A5 (GPIO21)
+    if (ft6206_init(i2c0, BRIDGE_TOUCH_SDA_PIN, BRIDGE_TOUCH_SCL_PIN)) {
+        ft6206_set_callback(touch_event_callback);
+        printf("[TFT] FT6206 capacitive touch initialized (SDA=%d SCL=%d)\n",
+               BRIDGE_TOUCH_SDA_PIN, BRIDGE_TOUCH_SCL_PIN);
+    } else {
+        printf("[TFT] FT6206 touch controller not detected\n");
+    }
 #endif
     
     initialized = true;
+    
+    // Start background render timer (100ms = 10 FPS)
+    // Negative interval means the timer fires every 100ms regardless of callback duration.
+    add_repeating_timer_ms(-UPDATE_INTERVAL_MS, tft_render_timer_callback, NULL, &tft_render_timer);
+    
+    return true;
+}
+
+// ============================================================================
+// Timer callback — fires every 100ms from hardware alarm IRQ
+// Does all CPU-intensive work: formatting + drawing into framebuffer.
+// Does NOT touch SPI/DMA (that stays on the main loop via flush).
+// ============================================================================
+
+static bool tft_render_timer_callback(repeating_timer_t *rt) {
+    (void)rt;
+    if (!initialized) return true;
+    
+    // Skip if the previous frame hasn't been flushed yet
+    if (frame_ready) return true;
+    
+    // Grab latest stats (atomic-enough: single-word flag guard)
+    if (!stats_pending) return true;
+    tft_stats_t local_stats = shared_stats;  // Snapshot
+    stats_pending = false;
+    
+    // Render into the back buffer
+    tft_fill(COL_BG);
+    format_stats(&local_stats);
+    
+    if (current_view == TFT_VIEW_GAUGES) {
+        draw_gauge_view(&local_stats);
+    } else {
+        draw_stats(&local_stats);
+    }
+    
+    // Track activity for next frame
+    last_tx_bytes = local_stats.tx_bytes;
+    last_rx_bytes = local_stats.rx_bytes;
+    
+    // Signal main loop that a frame is ready for DMA
+    frame_ready = true;
+    return true;  // Keep timer running
+}
+
+// ============================================================================
+// Public API — lightweight calls for the main loop
+// ============================================================================
+
+void tft_display_submit_stats(const tft_stats_t *stats) {
+    // Copy stats into shared buffer — called from main loop.
+    // The timer ISR will pick these up on its next tick.
+    shared_stats = *stats;
+    stats_pending = true;
+}
+
+bool tft_display_flush(void) {
+    // If the timer ISR has rendered a new frame, push it to the display.
+    // This does the SPI DMA transfer (must run on Core0, not in ISR).
+    if (!initialized || !frame_ready) return false;
+    
+    tft_swap_sync();
+    frame_ready = false;
     return true;
 }
 
 void tft_display_update(const tft_stats_t *stats) {
-    if (!initialized) return;
-    
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_update_ms < UPDATE_INTERVAL_MS) return;
-    last_update_ms = now;
-    
-    // Simple full-screen redraw
-    tft_fill(COL_BG);
-    format_stats(stats);
-    
-    // Draw based on current view mode
-    if (current_view == TFT_VIEW_GAUGES) {
-        draw_gauge_view(stats);
-    } else {
-        draw_stats(stats);
-    }
-    
-    tft_swap_sync();
-    
-    // Track activity for next frame
-    last_tx_bytes = stats->tx_bytes;
-    last_rx_bytes = stats->rx_bytes;
+    // Convenience wrapper: submit + flush in one call.
+    // For best performance, use submit_stats/flush separately so the main
+    // loop can do other work between submitting stats and flushing DMA.
+    tft_display_submit_stats(stats);
+    tft_display_flush();
 }
 
 void tft_display_refresh(const tft_stats_t *stats) {
     if (!initialized) return;
     
+    // Force an immediate synchronous render (bypasses timer).
     tft_fill(COL_BG);
     format_stats(stats);
     
-    // Draw based on current view mode
     if (current_view == TFT_VIEW_GAUGES) {
         draw_gauge_view(stats);
     } else {
@@ -704,7 +1033,7 @@ void tft_display_refresh(const tft_stats_t *stats) {
     
     last_tx_bytes = stats->tx_bytes;
     last_rx_bytes = stats->rx_bytes;
-    last_update_ms = to_ms_since_boot(get_absolute_time());
+    frame_ready = false;
 }
 
 void tft_display_splash(void) {
@@ -763,10 +1092,27 @@ void tft_display_toggle_view(void) {
 
 void tft_display_handle_touch(void) {
 #if TOUCH_ENABLED
-    // Check flag set by interrupt callback
-    if (touch_toggle_requested) {
-        touch_toggle_requested = false;
+    // Poll FT6206 for touch events (handles debouncing internally)
+    ft6206_poll();
+    
+    // Process zone-based touch flags
+    if (touch_view_requested) {
+        touch_view_requested = false;
         tft_display_toggle_view();
+    }
+    
+    if (touch_api_requested) {
+        touch_api_requested = false;
+        // Signal API mode cycle request (checked by bridge main loop)
+        extern volatile bool api_cycle_requested;
+        api_cycle_requested = true;
+    }
+    
+    if (touch_human_requested) {
+        touch_human_requested = false;
+        // Signal humanization cycle request (checked by bridge main loop)
+        extern volatile bool humanization_cycle_requested;
+        humanization_cycle_requested = true;
     }
 #endif
 }

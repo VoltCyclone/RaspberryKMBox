@@ -35,6 +35,16 @@ typedef struct {
     uint8_t humanization_mode;
     bool humanization_valid;
     
+    // Extended humanization info (from 0x0C byte 7 flags + 0x0E ext packet)
+    uint8_t inject_mode;       // 0=Immediate, 1=Smooth, 2=VelMatch, 3=Micro
+    uint8_t max_per_frame;     // Max pixels per HID frame
+    uint8_t queue_depth;       // Current smooth injection queue entries
+    uint8_t queue_capacity;    // Max queue size (typically 32)
+    bool jitter_enabled;       // Whether jitter/tremor is active
+    bool velocity_matching;    // Whether velocity matching is on
+    uint16_t total_injected;   // Total movements injected (wrapping 16-bit)
+    uint16_t queue_overflows;  // Queue overflow count (wrapping 16-bit)
+    
     // UART stats
     uint32_t uart_baud;
     uint32_t tx_bytes;
@@ -83,13 +93,32 @@ typedef struct {
 // Public API
 // ============================================================================
 
-/** Initialize TFT display. Returns true on success. */
+/** Initialize TFT display and start background render timer. Returns true on success. */
 bool tft_display_init(void);
 
-/** Update display (rate-limited to 10 FPS). */
+/**
+ * Submit latest stats for background rendering.
+ * Lightweight memcpy — safe to call every main-loop iteration.
+ * The background timer (100ms / 10 FPS) will pick these up and
+ * render into the framebuffer without blocking the caller.
+ */
+void tft_display_submit_stats(const tft_stats_t *stats);
+
+/**
+ * Flush a rendered frame to the display via SPI DMA.
+ * Returns true if a frame was actually sent, false if nothing new.
+ * Must be called from the main loop (not ISR) because it waits on DMA.
+ */
+bool tft_display_flush(void);
+
+/**
+ * Convenience: submit + flush in one call (legacy API).
+ * For best latency, prefer calling submit_stats() early in the loop
+ * and flush() later so other work can overlap with rendering.
+ */
 void tft_display_update(const tft_stats_t *stats);
 
-/** Force immediate refresh. */
+/** Force immediate synchronous refresh (bypasses timer). */
 void tft_display_refresh(const tft_stats_t *stats);
 
 /** Show boot splash screen. */

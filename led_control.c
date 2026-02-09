@@ -10,6 +10,8 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/timer.h"
 #include "ws2812.pio.h"
 #include "tusb.h"
 #include <stdlib.h>
@@ -100,6 +102,75 @@ static led_controller_t g_led_controller = {
     .rainbow_start_time = 0,
     .rainbow_hue = 0
 };
+
+//--------------------------------------------------------------------+
+// PASSIVE LED DMA REFRESH
+//--------------------------------------------------------------------+
+// A volatile shadow register holds the current GRB color (pre-shifted for PIO).
+// The hot path writes here with a single store (~1 cycle).
+// A repeating timer fires at ~30 Hz and triggers a one-shot DMA transfer from
+// this shadow register into the WS2812 PIO TX FIFO — truly zero CPU in the
+// command processing path.
+
+static volatile uint32_t s_led_shadow_grb __attribute__((aligned(4))) = 0;
+static volatile bool     s_led_activity_pending = false;
+static volatile uint32_t s_led_activity_expire_us = 0;
+static int               s_led_dma_chan = -1;
+static struct repeating_timer s_led_refresh_timer;
+
+/**
+ * @brief Repeating timer callback (~30 Hz) — pushes shadow register to PIO via DMA.
+ *        Runs in IRQ context; the DMA transfer itself is fire-and-forget.
+ */
+static bool led_refresh_timer_callback(struct repeating_timer *t)
+{
+    (void)t;
+
+    // If an activity flash is pending, check expiration
+    if (s_led_activity_pending) {
+        if (time_us_32() >= s_led_activity_expire_us) {
+            // Activity flash expired — clear it so status task resumes normal color
+            s_led_activity_pending = false;
+        }
+    }
+
+    // Only DMA-push if there's something in the shadow register and channel is idle
+    if (s_led_shadow_grb != 0 && s_led_dma_chan >= 0 && !dma_channel_is_busy(s_led_dma_chan)) {
+        dma_channel_set_read_addr(s_led_dma_chan, (const volatile void *)&s_led_shadow_grb, true);
+    }
+    return true; // keep repeating
+}
+
+/**
+ * @brief Initialize the passive DMA LED refresh system.
+ *        Call once after neopixel_enable_power() has set up the PIO state machine.
+ */
+static void led_dma_refresh_init(void)
+{
+    // Claim a DMA channel for LED refresh
+    s_led_dma_chan = dma_claim_unused_channel(false);
+    if (s_led_dma_chan < 0) return; // no channels available — fall back to polling
+
+    // Configure DMA: read from shadow register, write to PIO TX FIFO, 1 word per transfer
+    dma_channel_config c = dma_channel_get_default_config(s_led_dma_chan);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+    channel_config_set_read_increment(&c, false);   // always read from shadow register
+    channel_config_set_write_increment(&c, false);   // always write to same FIFO addr
+    // Use DREQ_FORCE so the transfer completes immediately (we gate it via the timer)
+    channel_config_set_dreq(&c, DREQ_FORCE);
+
+    dma_channel_configure(
+        s_led_dma_chan,
+        &c,
+        &g_led_controller.pio_instance->txf[g_led_controller.state_machine], // write addr: PIO TX FIFO
+        (const volatile void *)&s_led_shadow_grb,                            // read addr: shadow register
+        1,                                                                    // transfer count: 1 word
+        false                                                                 // don't start yet
+    );
+
+    // Start repeating timer at ~30 Hz (every 33ms) — runs from hardware alarm pool
+    add_repeating_timer_ms(-33, led_refresh_timer_callback, NULL, &s_led_refresh_timer);
+}
 
 // Status configuration lookup table
 static const status_config_t g_status_configs[] = {
@@ -313,6 +384,9 @@ void neopixel_enable_power(void)
     // Set initial color
     neopixel_set_color(COLOR_BOOTING);
 
+    // Initialize passive DMA LED refresh (timer + DMA channel)
+    led_dma_refresh_init();
+
     (void)0; // suppressed init completion log
 }
 
@@ -368,14 +442,17 @@ void neopixel_set_color_with_brightness(uint32_t color, float brightness)
     // Apply brightness and convert to GRB format
     const uint32_t dimmed_color = neopixel_apply_brightness(color, brightness);
     const uint32_t grb_color = neopixel_rgb_to_grb(dimmed_color);
+    const uint32_t shifted = grb_color << WS2812_RGB_SHIFT;
+    // Update shadow register so DMA refresh keeps this color alive
+    s_led_shadow_grb = shifted;
     // Attempt non-blocking write; queue if FIFO full
     if (g_led_controller.initialized) {
         if (!pio_sm_is_tx_fifo_full(g_led_controller.pio_instance, g_led_controller.state_machine)) {
             pio_sm_put(g_led_controller.pio_instance,
                        g_led_controller.state_machine,
-                       grb_color << WS2812_RGB_SHIFT);
+                       shifted);
         } else {
-            led_queue_push(grb_color << WS2812_RGB_SHIFT);
+            led_queue_push(shifted);
         }
     }
 }
@@ -385,10 +462,13 @@ void neopixel_set_color_with_brightness_u8(uint32_t color, uint8_t brightness)
     if (!g_led_controller.initialized) return;
     const uint32_t dimmed_color = neopixel_apply_brightness_u8(color, brightness);
     const uint32_t grb_color = neopixel_rgb_to_grb(dimmed_color);
+    const uint32_t shifted = grb_color << WS2812_RGB_SHIFT;
+    // Update shadow register so DMA refresh keeps this color alive
+    s_led_shadow_grb = shifted;
     if (!pio_sm_is_tx_fifo_full(g_led_controller.pio_instance, g_led_controller.state_machine)) {
-        pio_sm_put(g_led_controller.pio_instance, g_led_controller.state_machine, grb_color << WS2812_RGB_SHIFT);
+        pio_sm_put(g_led_controller.pio_instance, g_led_controller.state_machine, shifted);
     } else {
-        led_queue_push(grb_color << WS2812_RGB_SHIFT);
+        led_queue_push(shifted);
     }
 }
 
@@ -563,6 +643,13 @@ static void log_status_change(system_status_t status, uint32_t color, bool breat
 
 static void handle_activity_flash(void)
 {
+    // Handle passive DMA-driven activity flash (from neopixel_signal_activity)
+    if (s_led_activity_pending) {
+        // The DMA timer is already pushing the shadow color to PIO.
+        // Just wait for it to expire (checked in timer callback).
+        return;
+    }
+
     if (!g_led_controller.activity_flash_active) {
         return;
     }
@@ -611,6 +698,19 @@ void neopixel_status_task(void)
     }
     last_update_time = get_current_time_ms();
 
+    // Mode flash takes HIGHEST priority — don't let status updates overwrite it
+    if (g_led_controller.mode_flash_active) {
+        if (is_time_elapsed(g_led_controller.mode_flash_start_time, 
+                            g_led_controller.mode_flash_duration)) {
+            g_led_controller.mode_flash_active = false;
+            // Flash expired — fall through to normal status update below
+        } else {
+            // Actively push mode flash color (in case status task overwrote it)
+            neopixel_set_color(g_led_controller.mode_flash_color);
+            return; // Don't process any other effects during flash
+        }
+    }
+
     // Use override status if active, otherwise update normally
     if (g_led_controller.status_override_active) {
         if (g_led_controller.current_status != g_led_controller.status_override) {
@@ -635,19 +735,25 @@ void neopixel_status_task(void)
     if (!g_led_controller.activity_flash_active && !g_led_controller.caps_lock_flash_active) {
         handle_breathing_effect();
     }
-
-    if (g_led_controller.mode_flash_active) {
-        if (is_time_elapsed(g_led_controller.mode_flash_start_time, 
-                            g_led_controller.mode_flash_duration)) {
-            g_led_controller.mode_flash_active = false;
-        }
-        return; // Don't process other effects during flash
-    }
 }
 
 //--------------------------------------------------------------------+
 // ACTIVITY TRIGGER FUNCTIONS
 //--------------------------------------------------------------------+
+
+void neopixel_signal_activity(uint32_t color)
+{
+    // Ultra-lightweight: just store the pre-computed GRB value into the shadow register.
+    // The DMA refresh timer will push it to the PIO FIFO at ~30 Hz.
+    // No timestamp calls, no branching, no FIFO checks — ~2-3 cycles total.
+    const uint8_t r = (uint8_t)(((color >> 16) & 0xFF) * (uint16_t)ACTIVITY_FLASH_BRIGHTNESS >> 8);
+    const uint8_t g = (uint8_t)(((color >> 8)  & 0xFF) * (uint16_t)ACTIVITY_FLASH_BRIGHTNESS >> 8);
+    const uint8_t b = (uint8_t)((color         & 0xFF) * (uint16_t)ACTIVITY_FLASH_BRIGHTNESS >> 8);
+    const uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+    s_led_shadow_grb = grb << WS2812_RGB_SHIFT;
+    s_led_activity_pending = true;
+    s_led_activity_expire_us = time_us_32() + (ACTIVITY_FLASH_DURATION_MS * 1000u);
+}
 
 void neopixel_trigger_activity_flash_color(uint32_t color)
 {

@@ -478,12 +478,43 @@ void tft_draw_sprite_flipped(int x, int y, int w, int h, const uint8_t *data, in
 
 void tft_draw_glyph(int x, int y, int color, char c)
 {
-	uint8_t *glyph = tft_font + (size_t)c * 16;
+	/* Apply origin offset (matches tft_draw_pixel convention). */
+	x -= tft_origin_x;
+	y -= tft_origin_y;
 
-	for (int gx = 0; gx < 8; gx++) {
+	/* Fast path: fully on-screen — write directly into framebuffer. */
+	if (x >= 0 && x + 8 <= TFT_WIDTH && y >= 0 && y + 16 <= TFT_HEIGHT) {
+		const uint8_t *glyph = tft_font + (unsigned char)c * 16;
+		uint8_t *row = &tft_input[y * TFT_WIDTH + x];
 		for (int gy = 0; gy < 16; gy++) {
-			if ((glyph[gy] >> (7 - gx)) & 1) {
-				tft_draw_pixel(x + gx, y + gy, color);
+			uint8_t bits = glyph[gy];
+			if (bits) {
+				if (bits & 0x80) row[0] = color;
+				if (bits & 0x40) row[1] = color;
+				if (bits & 0x20) row[2] = color;
+				if (bits & 0x10) row[3] = color;
+				if (bits & 0x08) row[4] = color;
+				if (bits & 0x04) row[5] = color;
+				if (bits & 0x02) row[6] = color;
+				if (bits & 0x01) row[7] = color;
+			}
+			row += TFT_WIDTH;
+		}
+		return;
+	}
+
+	/* Slow path: partially clipped — per-pixel with bounds checks. */
+	const uint8_t *glyph = tft_font + (unsigned char)c * 16;
+	for (int gy = 0; gy < 16; gy++) {
+		uint8_t bits = glyph[gy];
+		if (!bits) continue;
+		int py = y + gy;
+		if (py < tft_clip_y0 || py >= tft_clip_y1) continue;
+		for (int gx = 0; gx < 8; gx++) {
+			if ((bits >> (7 - gx)) & 1) {
+				int px = x + gx;
+				if (px >= tft_clip_x0 && px < tft_clip_x1)
+					tft_input[py * TFT_WIDTH + px] = color;
 			}
 		}
 	}
@@ -491,28 +522,22 @@ void tft_draw_glyph(int x, int y, int color, char c)
 
 void tft_draw_string(int x, int y, int color, const char *str)
 {
-	int len = strlen(str);
-
-	for (int i = 0; i < len; i++)
-		tft_draw_glyph(x + i * 8, y, color, str[i]);
+	for (; *str; str++, x += 8)
+		tft_draw_glyph(x, y, color, *str);
 }
 
 void tft_draw_string_right(int x, int y, int color, const char *str)
 {
 	int len = strlen(str);
-
 	x -= len * 8;
-
-	for (int i = 0; i < len; i++)
-		tft_draw_glyph(x + i * 8, y, color, str[i]);
+	for (; *str; str++, x += 8)
+		tft_draw_glyph(x, y, color, *str);
 }
 
 void tft_draw_string_center(int x, int y, int color, const char *str)
 {
 	int len = strlen(str);
-
 	x -= len * 4;
-
-	for (int i = 0; i < len; i++)
-		tft_draw_glyph(x + i * 8, y, color, str[i]);
+	for (; *str; str++, x += 8)
+		tft_draw_glyph(x, y, color, *str);
 }

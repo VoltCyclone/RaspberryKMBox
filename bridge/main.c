@@ -57,6 +57,12 @@ static bool button_state = false;
 static uint32_t button_press_start = 0;
 static bool button_init_done = false;
 
+// Humanization cycle request flag (set by touch handler in tft_display.c)
+volatile bool humanization_cycle_requested = false;
+
+// API mode cycle request flag (set by touch handler in tft_display.c)
+volatile bool api_cycle_requested = false;
+
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
 static uint8_t ferrum_idx = 0;
@@ -146,6 +152,11 @@ static uint8_t kmbox_humanization_mode = 0;
 static uint8_t kmbox_inject_mode = 1;  // Default SMOOTH
 static uint8_t kmbox_max_per_frame = 16;
 static bool kmbox_velocity_matching = true;
+static bool kmbox_jitter_enabled = false;
+static uint8_t kmbox_queue_depth = 0;
+static uint8_t kmbox_queue_capacity = 32;
+static uint16_t kmbox_total_injected = 0;
+static uint16_t kmbox_queue_overflows = 0;
 static bool kmbox_humanization_valid = false;
 static uint32_t last_humanization_request_ms = 0;
 #define HUMANIZATION_REQUEST_INTERVAL_MS 2000  // Request humanization info every 2 seconds (was 3s)
@@ -272,6 +283,9 @@ static void button_init(void) {
     button_init_done = true;
 }
 
+// Send packet via Hardware UART (DMA accelerated) - forward declaration
+static inline bool send_uart_packet(const uint8_t* data, size_t len);
+
 static void button_task(void) {
     if (!button_init_done) return;
     
@@ -297,14 +311,18 @@ static void button_task(void) {
             // Reset ferrum line buffer on mode change
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
+        } else {
+            // Long press: cycle humanization mode on KMBox
+            uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(cycle_pkt, 8);
+            printf("[Bridge] Long press: sent humanization cycle command\n");
         }
-        // Long press reserved for future use
     }
 }
 
 // Send packet via Hardware UART (DMA accelerated)
 // Note: Don't increment uart_tx_bytes_total here - hw_uart_send() tracks via total_tx_bytes
-// and we sync in tft_update_task() via hw_uart_get_stats()
+// and we sync in tft_submit_stats_task() via hw_uart_get_stats()
 static inline bool send_uart_packet(const uint8_t* data, size_t len) {
     return hw_uart_send(data, len);
 }
@@ -369,10 +387,11 @@ static void process_status_message(const char* msg, size_t len) {
         return;
     }
     
-    // Parse humanization info from KMBox: "KMBOX_INFO:hmode=2,imode=1,max=16,vel=1"
+    // Parse humanization info from KMBox: "KMBOX_INFO:hmode=2,imode=1,max=16,vel=1,qd=3,qc=32,inj=1234,ovf=0"
     if (len >= 11 && strncmp(msg, "KMBOX_INFO:", 11) == 0) {
         const char* data = msg + 11;
         int hmode = -1, imode = -1, max = -1, vel = -1;
+        int qd = -1, qc = -1, inj = -1, ovf = -1;
         
         // Simple key=value parser
         const char* ptr = data;
@@ -385,6 +404,14 @@ static void process_status_message(const char* msg, size_t len) {
                 max = atoi(ptr + 4);
             } else if (strncmp(ptr, "vel=", 4) == 0) {
                 vel = atoi(ptr + 4);
+            } else if (strncmp(ptr, "qd=", 3) == 0) {
+                qd = atoi(ptr + 3);
+            } else if (strncmp(ptr, "qc=", 3) == 0) {
+                qc = atoi(ptr + 3);
+            } else if (strncmp(ptr, "inj=", 4) == 0) {
+                inj = atoi(ptr + 4);
+            } else if (strncmp(ptr, "ovf=", 4) == 0) {
+                ovf = atoi(ptr + 4);
             }
             // Move to next comma or end
             while (*ptr && *ptr != ',') ptr++;
@@ -396,6 +423,12 @@ static void process_status_message(const char* msg, size_t len) {
         if (imode >= 0) kmbox_inject_mode = (uint8_t)imode;
         if (max > 0) kmbox_max_per_frame = (uint8_t)max;
         if (vel >= 0) kmbox_velocity_matching = (vel != 0);
+        if (qd >= 0) kmbox_queue_depth = (uint8_t)qd;
+        if (qc > 0) kmbox_queue_capacity = (uint8_t)qc;
+        if (inj >= 0) kmbox_total_injected = (uint16_t)inj;
+        if (ovf >= 0) kmbox_queue_overflows = (uint16_t)ovf;
+        // Infer jitter_enabled from humanization mode
+        kmbox_jitter_enabled = (kmbox_humanization_mode >= 1);
         kmbox_humanization_valid = true;
         return;
     }
@@ -436,8 +469,8 @@ static void uart_rx_task(void) {
             binary_idx = 0;
         }
         
-        // Check for start of binary response packet (0xFF, 0xFE, or 0x0C from KMBox)
-        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0C)) {
+        // Check for start of binary response packet (0xFF, 0xFE, 0x0C, or 0x0E from KMBox)
+        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0C || c == 0x0E)) {
             in_binary_packet = true;
             binary_idx = 0;
             binary_packet[binary_idx++] = c;
@@ -471,16 +504,36 @@ static void uart_rx_task(void) {
                         kmbox_state = KMBOX_CONNECTED;
                     }
                 } else if (binary_packet[0] == 0x0C) {
-                    // Info response: [0x0C] [hmode] [imode] [max_per_frame] [vel_match] [temp_lo] [temp_hi] ...
+                    // Info response: [0x0C][hmode][imode][max_per_frame][queue_count][temp_lo][temp_hi][flags]
+                    // flags: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
                     kmbox_humanization_mode = binary_packet[1];
                     kmbox_inject_mode = binary_packet[2];
                     kmbox_max_per_frame = binary_packet[3];
-                    kmbox_velocity_matching = binary_packet[4];
-                    kmbox_humanization_valid = true;  // Mark as valid when we receive data
+                    kmbox_queue_depth = binary_packet[4];
+                    kmbox_humanization_valid = true;
                     
                     // Parse temperature (int16_t in 0.1°C units)
                     int16_t temp_decideg = (int16_t)(binary_packet[5] | (binary_packet[6] << 8));
                     kmbox_temperature_c = temp_decideg / 10.0f;
+                    
+                    // Parse flags byte
+                    uint8_t flags = binary_packet[7];
+                    kmbox_jitter_enabled = (flags & 0x01) != 0;
+                    kmbox_velocity_matching = (flags & 0x02) != 0;
+                    
+                    if (kmbox_state != KMBOX_CONNECTED) {
+                        kmbox_state = KMBOX_CONNECTED;
+                    }
+                } else if (binary_packet[0] == 0x0E) {
+                    // Extended stats: [0x0E][queue_count][queue_cap][hmode][total_lo][total_hi][ovf_lo][ovf_hi]
+                    kmbox_queue_depth = binary_packet[1];
+                    kmbox_queue_capacity = binary_packet[2];
+                    // binary_packet[3] = hmode (redundant, but useful if 0x0C wasn't received)
+                    if (!kmbox_humanization_valid) {
+                        kmbox_humanization_mode = binary_packet[3];
+                    }
+                    kmbox_total_injected = (uint16_t)(binary_packet[4] | (binary_packet[5] << 8));
+                    kmbox_queue_overflows = (uint16_t)(binary_packet[6] | (binary_packet[7] << 8));
                     
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
@@ -608,15 +661,24 @@ static void kmbox_connection_task(void) {
         // Request humanization info periodically (for TFT display) - use binary
         if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
             last_humanization_request_ms = now;
-            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
-            bool sent = send_uart_packet(info_req, 8);
+            
+            // Alternate between 0x0C (basic info + temp) and 0x0E (extended stats)
+            static uint8_t info_cycle = 0;
+            if (info_cycle % 2 == 0) {
+                // Primary: humanization mode, inject mode, queue depth, temperature, flags
+                uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+                send_uart_packet(info_req, 8);
+            } else {
+                // Extended: total injected, queue overflows, queue capacity
+                uint8_t ext_req[8] = {0x0E, 0, 0, 0, 0, 0, 0, 0};
+                send_uart_packet(ext_req, 8);
+            }
+            info_cycle++;
             
             // Debug: confirm we're sending the request
             static uint32_t last_info_debug = 0;
             if (now - last_info_debug > 5000) {
-                printf("[Bridge TX] Sending 0x0C: %02X %02X %02X %02X %02X %02X %02X %02X (sent=%d)\n",
-                       info_req[0], info_req[1], info_req[2], info_req[3],
-                       info_req[4], info_req[5], info_req[6], info_req[7], sent);
+                printf("[Bridge TX] Sending info request (cycle=%d)\n", info_cycle - 1);
                 last_info_debug = now;
             }
         }
@@ -1176,32 +1238,30 @@ static void update_status_neopixel(void) {
 }
 
 // ============================================================================
-// TFT Display Update Task (non-blocking, rate-limited)
+// TFT Display — Stats Gathering (runs every main-loop iteration)
+//
+// This is now very lightweight: it gathers numbers into a struct and hands
+// them to the display module.  The CPU-intensive formatting and pixel
+// drawing happen in a 100ms hardware-timer ISR inside tft_display.c,
+// so the main loop is free to service USB/UART/tracking without stalling.
 // ============================================================================
 
-static void tft_update_task(void) {
+static void tft_submit_stats_task(void) {
     // Sync UART stats from hw_uart module (single source of truth for byte counts)
     sync_uart_stats();
     
-    // Move rate calculation to a separate 1Hz timer (removed ms delta calculation)
+    // Recalculate rates once per second
     static uint32_t last_rate_calc_ms = 0;
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     if (now_ms - last_rate_calc_ms >= 1000) {
-        // Calculate bytes per second over exactly 1s window
         uint32_t tx_delta = uart_tx_bytes_total - last_tx_bytes_for_rate;
         uint32_t rx_delta = uart_rx_bytes_total - last_rx_bytes_for_rate;
-        uart_tx_rate_bps = tx_delta;  // Exactly bytes/sec
+        uart_tx_rate_bps = tx_delta;
         uart_rx_rate_bps = rx_delta;
         
-        // Track peak rates
-        if (uart_tx_rate_bps > uart_tx_peak_bps) {
-            uart_tx_peak_bps = uart_tx_rate_bps;
-        }
-        if (uart_rx_rate_bps > uart_rx_peak_bps) {
-            uart_rx_peak_bps = uart_rx_rate_bps;
-        }
+        if (uart_tx_rate_bps > uart_tx_peak_bps) uart_tx_peak_bps = uart_tx_rate_bps;
+        if (uart_rx_rate_bps > uart_rx_peak_bps) uart_rx_peak_bps = uart_rx_rate_bps;
         
-        // Calculate command rate (mouse moves per second)
         uint32_t cmd_delta = tft_mouse_activity_count - last_cmd_count;
         commands_per_sec = cmd_delta;
         last_cmd_count = tft_mouse_activity_count;
@@ -1211,53 +1271,48 @@ static void tft_update_task(void) {
         last_rate_calc_ms = now_ms;
     }
     
-    // Gather all statistics (lightweight - no formatting here)
-    tft_stats_t stats = {0};  // Zero-initialize all fields
+    // Gather stats (cheap: just reading variables, no formatting)
+    tft_stats_t stats = {0};
     
-    // Connection status
     stats.kmbox_connected = (kmbox_state == KMBOX_CONNECTED);
     stats.cdc_connected = tud_cdc_connected();
-    
-    // API mode (numeric)
     stats.api_mode = (uint8_t)current_api_mode;
     
-    // Data rates
     stats.tx_bytes = uart_tx_bytes_total;
     stats.rx_bytes = uart_rx_bytes_total;
-    stats.rx_buffer_level = hw_uart_rx_count();  // Unread bytes in DMA buffer
+    stats.rx_buffer_level = hw_uart_rx_count();
     stats.tx_rate_bps = uart_tx_rate_bps;
     stats.rx_rate_bps = uart_rx_rate_bps;
-    stats.uart_baud = UART_BAUD;  // From config.h
+    stats.uart_baud = UART_BAUD;
     
-    // Peak rates
     stats.tx_peak_bps = uart_tx_peak_bps;
     stats.rx_peak_bps = uart_rx_peak_bps;
     
-    // Attached device info from KMBox
     stats.device_vid = attached_vid;
     stats.device_pid = attached_pid;
     strncpy(stats.device_product, attached_product, sizeof(stats.device_product) - 1);
     
-    // Humanization settings from KMBox
     stats.humanization_mode = kmbox_humanization_mode;
     stats.humanization_valid = kmbox_humanization_valid;
+    stats.inject_mode = kmbox_inject_mode;
+    stats.max_per_frame = kmbox_max_per_frame;
+    stats.queue_depth = kmbox_queue_depth;
+    stats.queue_capacity = kmbox_queue_capacity;
+    stats.jitter_enabled = kmbox_jitter_enabled;
+    stats.velocity_matching = kmbox_velocity_matching;
+    stats.total_injected = kmbox_total_injected;
+    stats.queue_overflows = kmbox_queue_overflows;
     
-    // Mouse activity and other counters
     stats.mouse_moves = tft_mouse_activity_count;
     stats.button_presses = button_press_count;
     stats.commands_per_sec = commands_per_sec;
     
-    // Error counters
     stats.uart_errors = uart_error_count;
     stats.frame_errors = frame_error_count;
     
-    // System info
     stats.cpu_freq_mhz = clock_get_hz(clk_sys) / 1000000;
-    
-    // Uptime
     stats.uptime_sec = (now_ms - boot_time_ms) / 1000;
     
-    // Latency statistics
     latency_stats_t lat_stats;
     latency_get_stats(&lat_stats);
     stats.latency_min_us = lat_stats.min_us;
@@ -1276,8 +1331,8 @@ static void tft_update_task(void) {
     stats.bridge_temperature_c = cached_temp;
     stats.kmbox_temperature_c = kmbox_temperature_c;
     
-    // Call TFT update (internally rate-limited to 100ms)
-    tft_display_update(&stats);
+    // Hand stats to display module (just a memcpy — timer ISR renders later)
+    tft_display_submit_stats(&stats);
 }
 
 // ============================================================================
@@ -1347,7 +1402,24 @@ int main(void) {
         
         kmbox_connection_task();
         button_task();
-        tft_display_handle_touch();  // Handle touch screen input (view switching)
+        tft_display_handle_touch();  // Handle touch screen input (zone-based: view/API/humanization)
+        
+        // Send humanization cycle command if requested by touch (bottom zone)
+        if (humanization_cycle_requested) {
+            humanization_cycle_requested = false;
+            uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(cycle_pkt, 8);
+            printf("[Bridge] Touch: sent humanization cycle command\n");
+        }
+        
+        // Cycle API mode if requested by touch (middle zone)
+        if (api_cycle_requested) {
+            api_cycle_requested = false;
+            current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
+            ferrum_idx = 0;
+            ferrum_line[0] = '\0';
+            printf("[Bridge] Touch: API mode -> %d\n", (int)current_api_mode);
+        }
         
         // Periodic UART echo test (every 2 seconds while not connected)
         static uint32_t last_echo_test = 0;
@@ -1423,7 +1495,8 @@ int main(void) {
         heartbeat_task();
         update_status_neopixel();
         uart_debug_task();
-        tft_update_task();  // Update TFT display (non-blocking, rate-limited)
+        tft_submit_stats_task();   // Gather stats for display (lightweight memcpy)
+        tft_display_flush();       // Push rendered frame via SPI DMA (if ready)
         
         tight_loop_contents();
     }
