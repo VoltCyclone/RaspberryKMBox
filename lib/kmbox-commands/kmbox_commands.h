@@ -55,6 +55,7 @@ typedef struct {
     int32_t mouse_x_accumulator;  // Accumulated X movement (int32 to prevent overflow)
     int32_t mouse_y_accumulator;  // Accumulated Y movement (int32 to prevent overflow)
     int16_t wheel_accumulator;     // Accumulated wheel movement
+    int16_t pan_accumulator;       // Accumulated pan movement
     
     // Axis lock states
     bool lock_mx;  // Lock X axis (left/right movement)
@@ -108,8 +109,13 @@ void kmbox_update_states(uint32_t current_time_ms);
 // Get the current mouse report based on button states
 void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* wheel, int8_t* pan);
 
+// Get the current mouse report with 16-bit precision for high-resolution mice
+void kmbox_get_mouse_report_16(uint8_t* buttons, int16_t* x, int16_t* y, int8_t* wheel, int8_t* pan);
+
 // Add mouse movement
 void kmbox_add_mouse_movement(int16_t x, int16_t y);
+void kmbox_add_wheel_movement(int8_t wheel);
+void kmbox_add_pan_movement(int8_t pan);
 
 // Apply mouse transform to physical movement (called internally)
 // Returns transformed X,Y values based on current scale settings

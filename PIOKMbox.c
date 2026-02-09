@@ -333,7 +333,7 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
             }
             
             neopixel_set_color(mode_color);
-            neopixel_trigger_mode_flash(mode_color, 500);
+            neopixel_trigger_mode_flash(mode_color, 1500);
         }
     }
 
@@ -444,15 +444,15 @@ static void main_application_loop(void) {
             state->last_watchdog_time = current_time;
         }
         
+        if (task_flags & BUTTON_FLAG) {
+            process_button_input(state, current_time);
+            state->last_button_time = current_time;
+        }
+        
         if (task_flags & VISUAL_FLAG) {
             led_blinking_task();
             neopixel_status_task();
             state->last_visual_time = current_time;
-        }
-        
-        if (task_flags & BUTTON_FLAG) {
-            process_button_input(state, current_time);
-            state->last_button_time = current_time;
         }
         
         if (task_flags & STATUS_FLAG) {

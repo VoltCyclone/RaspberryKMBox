@@ -69,6 +69,10 @@ void neopixel_set_color_with_brightness_u8(uint32_t color, uint8_t brightness);
 void neopixel_update_status(void);
 void neopixel_status_task(void);
 void neopixel_trigger_activity_flash_color(uint32_t color);
+// Ultra-lightweight activity signal for hot paths.
+// Writes a single volatile store (~1-3 cycles). The DMA refresh timer
+// pushes it to the PIO at ~30 Hz — zero CPU cost in the command path.
+void neopixel_signal_activity(uint32_t color);
 void neopixel_trigger_caps_lock_flash(void);
 void neopixel_trigger_usb_reset_pending(void);
 void neopixel_trigger_usb_reset_success(void);

@@ -28,7 +28,7 @@
 // Configuration
 //--------------------------------------------------------------------+
 
-#define UART_RX_BUFFER_SIZE     256
+#define UART_RX_BUFFER_SIZE     512
 #define UART_RX_BUFFER_MASK     (UART_RX_BUFFER_SIZE - 1)
 
 //--------------------------------------------------------------------+
@@ -77,7 +77,7 @@ static int uart_rx_dma_chan = -1;
 // Stages data into a linear buffer, then fires a DMA transfer.
 // Much faster than per-byte IRQ TX at 2 Mbaud.
 //--------------------------------------------------------------------+
-#define DMA_TX_BUFFER_SIZE  256
+#define DMA_TX_BUFFER_SIZE  512
 static uint8_t dma_tx_buffer[DMA_TX_BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile uint16_t dma_tx_len = 0;
 static int uart_tx_dma_chan = -1;
@@ -276,7 +276,6 @@ static bool uart_send_string(const char *str) {
 
 void kmbox_send_response(const char *response) {
     if (!response) return;
-    neopixel_trigger_activity_flash_color(0x0000FF00);
     uart_send_string(response);
     uart_send_string("\r\n");
     // Non-blocking: TX IRQ handles actual transmission
@@ -288,7 +287,6 @@ void kmbox_send_status(const char *message) {
 
 void kmbox_send_ping_to_bridge(void) {
     uint8_t ping[8] = {FAST_CMD_PING, 0, 0, 0, 0, 0, 0, 0};
-    neopixel_trigger_activity_flash_color(0x0000FF00);
     uart_send_bytes(ping, 8);
     // Non-blocking: TX IRQ handles actual transmission
 }
@@ -356,6 +354,7 @@ static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, s
         case BRIDGE_CMD_MOUSE_MOVE:
             if (available < 6) return 0;
             kmbox_add_mouse_movement(read_i16_le(data + 2), read_i16_le(data + 4));
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
             return 6;
             
         case BRIDGE_CMD_MOUSE_WHEEL:
@@ -372,6 +371,7 @@ static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, s
             if (available < 7) return 0;
             kmbox_add_mouse_movement(read_i16_le(data + 2), read_i16_le(data + 4));
             kmbox_add_wheel_movement((int8_t)data[6]);
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
             return 7;
             
         case BRIDGE_CMD_PING:
@@ -397,37 +397,27 @@ extern void process_kbd_report(const hid_keyboard_report_t *report);
 
 static __force_inline bool is_fast_cmd_start(uint8_t byte) {
     if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;  // Exclude line terminators
-    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_INFO_EXT) || byte == FAST_CMD_PING;
+    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) || byte == FAST_CMD_PING;
 }
 
 static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
-    // Hint: mouse move is the most common command by far
+    // Hint: mouse move is the most common command by far (~95% of traffic)
+    // Direct accumulator path bypasses process_mouse_report() overhead:
+    // - Skips transform (bridge moves are pre-transformed)
+    // - Skips smooth_record_physical_movement (only for actual HW mouse)
+    // - Skips neopixel flash (too expensive for high-rate moves)
     if (__builtin_expect(pkt[0] == FAST_CMD_MOUSE_MOVE, 1)) {
         const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
-        hid_mouse_report_t report = {
-            .buttons = m->buttons,
-            .x = kmbox_clamp_movement_i8(m->x),
-            .y = kmbox_clamp_movement_i8(m->y),
-            .wheel = m->wheel
-        };
-        process_mouse_report(&report);
+        if (m->buttons) kmbox_update_physical_buttons(m->buttons & 0x1F);
+        if (m->x || m->y) kmbox_add_mouse_movement(m->x, m->y);
+        if (m->wheel) kmbox_add_wheel_movement(m->wheel);
+        // Passive LED activity — single volatile store, DMA pushes to PIO at ~30 Hz
+        neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
         fast_cmd_count++;
         return true;
     }
     
     switch (pkt[0]) {
-        case FAST_CMD_MOUSE_MOVE: {
-            const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
-            hid_mouse_report_t report = {
-                .buttons = m->buttons,
-                .x = kmbox_clamp_movement_i8(m->x),
-                .y = kmbox_clamp_movement_i8(m->y),
-                .wheel = m->wheel
-            };
-            process_mouse_report(&report);
-            fast_cmd_count++;
-            return true;
-        }
         
         case FAST_CMD_MOUSE_CLICK: {
             const fast_cmd_click_t *c = (const fast_cmd_click_t *)pkt;
@@ -537,7 +527,6 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             uint8_t resp[8] = {FAST_CMD_RESPONSE, 0x01, 0, 0, 0, 0, 0, 0};
             uint32_t ts = (uint32_t)(clock_sync.device_base_us & 0xFFFFFFFF);
             memcpy(resp + 4, &ts, 4);
-            neopixel_trigger_activity_flash_color(0x0000FF00);
             uart_send_bytes(resp, 8);
             fast_cmd_count++;
             return true;
@@ -547,7 +536,6 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             uint8_t resp[8] = {FAST_CMD_RESPONSE, 0x00, 0, 0, 0, 0, 0, 0};
             uint32_t ts = (uint32_t)(time_us_64() & 0xFFFFFFFF);
             memcpy(resp + 4, &ts, 4);
-            neopixel_trigger_activity_flash_color(0x0000FF00);
             uart_send_bytes(resp, 8);
             return true;
         }
@@ -578,7 +566,6 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
                 (uint8_t)((temp >> 8) & 0xFF),
                 flags
             };
-            neopixel_trigger_activity_flash_color(0x0000FF00);
             uart_send_bytes(resp, 8);
             fast_cmd_count++;
             return true;
@@ -602,6 +589,28 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
                 (uint8_t)((queue_overflows >> 8) & 0xFF)
             };
             uart_send_bytes(resp, 8);
+            fast_cmd_count++;
+            return true;
+        }
+        
+        case FAST_CMD_CYCLE_HUMAN: {
+            // Cycle humanization mode (triggered by bridge button/touch)
+            humanization_mode_t new_mode = smooth_cycle_humanization_mode();
+            
+            // Show mode with LED flash (same as local button press)
+            uint32_t mode_color;
+            switch (new_mode) {
+                case HUMANIZATION_OFF:    mode_color = COLOR_HUMANIZATION_OFF;    break;
+                case HUMANIZATION_LOW:    mode_color = COLOR_HUMANIZATION_LOW;    break;
+                case HUMANIZATION_MEDIUM: mode_color = COLOR_HUMANIZATION_MEDIUM; break;
+                case HUMANIZATION_HIGH:   mode_color = COLOR_HUMANIZATION_HIGH;   break;
+                default:                  mode_color = COLOR_ERROR;               break;
+            }
+            neopixel_set_color(mode_color);
+            neopixel_trigger_mode_flash(mode_color, 1500);
+            
+            // Send updated info back to bridge immediately
+            kmbox_send_info_to_bridge();
             fast_cmd_count++;
             return true;
         }
@@ -657,7 +666,6 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         if (p && *p == ',') {
             p = parse_int16(p + 1, &y);
             if (p) {
-                neopixel_trigger_activity_flash_color(0x0000FF00);
                 kmbox_add_mouse_movement(x, y);
                 return true;
             }
@@ -692,7 +700,6 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     
     // Echo: E<data>
     if (len >= 2 && line[0] == 'E') {
-        neopixel_trigger_activity_flash_color(0x00FFFF00);
         uart_send_string("ECHO:");
         uart_send_string(line + 1);
         uart_send_string("\r\n");
@@ -943,7 +950,10 @@ void kmbox_serial_init_dma(void) {
 //--------------------------------------------------------------------+
 
 void kmbox_serial_task(void) {
-    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    // Use cheap microsecond timer — avoid to_ms_since_boot(get_absolute_time())
+    // which has significant overhead.  Convert to ms only when needed.
+    uint32_t now_us = time_us_32();
+    uint32_t now_ms = now_us / 1000;
     
     // Periodic ping to bridge (every 5 seconds)
     if (now_ms - g_last_ping_time_ms > 5000) {
@@ -957,8 +967,13 @@ void kmbox_serial_task(void) {
     // Process pending timed moves
     process_pending_timed_move();
     
-    // Process RX buffer
-    while (rx_available() > 0) {
+    // Process RX buffer — drain up to 16 packets per call to avoid
+    // starving tud_task() while still batch-processing bursts efficiently.
+    // At 2 Mbaud with 8-byte packets, 16 packets = ~640µs of buffer.
+    uint8_t packets_processed = 0;
+    const uint8_t MAX_PACKETS_PER_CALL = 16;
+    
+    while (rx_available() > 0 && packets_processed < MAX_PACKETS_PER_CALL) {
         uint8_t first = rx_peek_at(0);
         
         //--------------------------------------------------------------
@@ -986,6 +1001,7 @@ void kmbox_serial_task(void) {
             if (consumed >= 2) {
                 rx_consume(consumed);
                 mark_activity(now_ms);
+                packets_processed++;
                 continue;
             } else if (consumed == 1) {
                 rx_consume(1);  // Skip bad sync
@@ -995,15 +1011,28 @@ void kmbox_serial_task(void) {
         }
         
         //--------------------------------------------------------------
-        // Fast binary commands (8-byte fixed packets)
+        // Fast binary commands — zero-copy when data is contiguous
         //--------------------------------------------------------------
         if (is_fast_cmd_start(first)) {
             if (rx_available() >= 8) {
-                uint8_t pkt[8];
-                for (int i = 0; i < 8; i++) pkt[i] = rx_peek_at(i);
+                uint16_t tail = (uint16_t)(uart_rx_read_pos & UART_RX_BUFFER_MASK);
+                const uint8_t *pkt;
+                uint8_t pkt_stack[8];
+                
+                // Zero-copy: if all 8 bytes are contiguous in the circular buffer,
+                // pass a pointer directly into the DMA buffer (no memcpy)
+                if (tail + 8 <= UART_RX_BUFFER_SIZE) {
+                    pkt = &uart_rx_buffer[tail];
+                } else {
+                    // Wraps around — must copy to stack (rare at 512-byte buffer)
+                    for (int i = 0; i < 8; i++) pkt_stack[i] = rx_peek_at(i);
+                    pkt = pkt_stack;
+                }
+                
                 rx_consume(8);
                 process_fast_command(pkt);
                 mark_activity(now_ms);
+                packets_processed++;
                 continue;
             }
             break;  // Wait for complete packet

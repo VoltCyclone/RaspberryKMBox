@@ -92,11 +92,15 @@ typedef struct {
     inject_mode_t mode;     // Injection mode
     easing_mode_t easing;   // Easing curve to apply
     bool active;            // Is this entry in use?
+    uint8_t onset_delay;    // Frames to wait before starting delivery (onset jitter)
     
     // Overshoot simulation
     bool will_overshoot;    // Will this movement overshoot?
     int32_t overshoot_x_fp; // Overshoot amount X
     int32_t overshoot_y_fp; // Overshoot amount Y
+    
+    // O(1) queue free: cached index into g_active_nodes[]
+    int8_t active_node_idx; // -1 = not linked
 } smooth_queue_entry_t;
 
 //--------------------------------------------------------------------+
@@ -150,6 +154,10 @@ typedef struct {
         int32_t overshoot_max_fp;      // Max overshoot distance (fixed-point)
         int32_t vel_slow_threshold_fp; // Velocity threshold for "slow" movement
         int32_t vel_fast_threshold_fp; // Velocity threshold for "fast" movement
+        int32_t delivery_error_fp;     // Per-frame delivery error magnitude (sensor noise sim)
+        int32_t accum_clamp_fp;        // Max accumulator magnitude (mode-dependent)
+        uint8_t onset_jitter_min;      // Min onset delay frames
+        uint8_t onset_jitter_max;      // Max onset delay frames
     } humanization;
 } smooth_injection_state_t;
 

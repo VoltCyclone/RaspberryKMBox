@@ -15,14 +15,15 @@
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
+#include "hardware/i2c.h"
 #include "hardware/timer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#if (TFT_RAW_WIDTH >= 240)
-// Touch screen support for ILI9341
-#include "xpt2046_touch.h"
+#if (TFT_RAW_WIDTH >= 240) && defined(BRIDGE_TOUCH_SDA_PIN)
+// Capacitive touch via FT6206 over I2C (Adafruit ILI9341 shield)
+#include "ft6206_touch.h"
 #define TOUCH_ENABLED 1
 #else
 #define TOUCH_ENABLED 0
@@ -54,16 +55,18 @@ extern void picotft_init(void);
 #define SECTION_GAP         2
 #endif
 
-// RGB332 palette colors
-#define COL_BG              0x00
-#define COL_WHITE           0xFF
-#define COL_GREEN           0x1C
-#define COL_YELLOW          0xFC
-#define COL_RED             0xE0
-#define COL_CYAN            0x1F
-#define COL_GRAY            0x92
-#define COL_DARK            0x6D
-#define COL_DIM_LINE        0x49
+// Palette indices into tft_palette[256]
+// Indices 0x00-0x0F = grayscale ramp (black→white)
+// Indices 0xF0-0xFF = saturated colors
+#define COL_BG              0x00        // Black
+#define COL_WHITE           0x0F        // Pure white  (255,255,255)
+#define COL_GREEN           0xF4        // Bright green (32,255,0)
+#define COL_YELLOW          0xF1        // Bright yellow-orange (255,186,0)
+#define COL_RED             0xFF        // Pure red (255,0,0)
+#define COL_CYAN            0xF7        // Bright cyan (0,255,255)
+#define COL_GRAY            0x0A        // Medium-bright gray (172,170,172) - labels
+#define COL_DARK            0x06        // Medium gray (98,101,98) - secondary text
+#define COL_DIM_LINE        0x04        // Dim gray (65,68,65) - separator lines & zone hints
 
 // ============================================================================
 // Fast integer-to-string helpers (avoid snprintf overhead)
@@ -155,8 +158,18 @@ static uint32_t last_tx_bytes = 0;
 static uint32_t last_rx_bytes = 0;
 static tft_view_mode_t current_view = TFT_VIEW_DETAILED;
 
-// Touch handling - interrupt driven
-static volatile bool touch_toggle_requested = false;
+// Touch handling - zone-based tap detection
+// Screen is divided into 3 horizontal zones:
+//   Top    (y 0..106):   Cycle display view
+//   Middle (y 107..213): Cycle API protocol
+//   Bottom (y 214..319): Cycle humanization mode
+static volatile bool touch_view_requested = false;
+static volatile bool touch_api_requested = false;
+static volatile bool touch_human_requested = false;
+
+// Touch zone boundaries (240x320 display split into thirds)
+#define TOUCH_ZONE_TOP_END     106
+#define TOUCH_ZONE_MID_END     213
 
 // Double-buffered stats: main loop writes, timer ISR reads
 static tft_stats_t shared_stats;           // Latest stats from main loop
@@ -253,9 +266,16 @@ static inline uint8_t hmode_color(uint8_t m) {
 // ============================================================================
 
 #if TOUCH_ENABLED
-static void touch_event_callback(void) {
-    // Called from ISR - just set flag, don't do heavy work
-    touch_toggle_requested = true;
+static void touch_event_callback(uint16_t x, uint16_t y) {
+    // Route tap to the correct zone flag based on Y coordinate
+    // The display is 240x320, divided into 3 horizontal bands
+    if (y <= TOUCH_ZONE_TOP_END) {
+        touch_view_requested = true;       // Top: cycle view
+    } else if (y <= TOUCH_ZONE_MID_END) {
+        touch_api_requested = true;        // Middle: cycle API protocol
+    } else {
+        touch_human_requested = true;      // Bottom: cycle humanization
+    }
 }
 #endif
 
@@ -674,6 +694,23 @@ static void draw_stats(const tft_stats_t *stats) {
             }
         }
     }
+    
+#if TOUCH_ENABLED
+    // === TOUCH ZONE HINTS (right edge, centered in each zone) ===
+    // No hlines — they overlap content rows. Small right-edge labels only.
+    {
+        int zone_x = TFT_WIDTH - MARGIN - FONT_W;  // Single-char width from right edge
+        // Zone 1 (top):    y 0 .. TOUCH_ZONE_TOP_END  → center vertically
+        int z1_y = (TOUCH_ZONE_TOP_END) / 2 - FONT_H / 2;
+        // Zone 2 (middle): y TOUCH_ZONE_TOP_END+1 .. TOUCH_ZONE_MID_END
+        int z2_y = (TOUCH_ZONE_TOP_END + 1 + TOUCH_ZONE_MID_END) / 2 - FONT_H / 2;
+        // Zone 3 (bottom): y TOUCH_ZONE_MID_END+1 .. TFT_HEIGHT-1
+        int z3_y = (TOUCH_ZONE_MID_END + 1 + TFT_HEIGHT) / 2 - FONT_H / 2;
+        tft_draw_string(zone_x, z1_y, COL_DIM_LINE, "V");
+        tft_draw_string(zone_x, z2_y, COL_DIM_LINE, "A");
+        tft_draw_string(zone_x, z3_y, COL_DIM_LINE, "H");
+    }
+#endif
 }
 
 // ============================================================================
@@ -856,6 +893,19 @@ static void draw_gauge_view(const tft_stats_t *stats) {
     draw_bar_gauge(MARGIN, y, bar_width, bar_height, stats->rx_rate_bps / 1000.0f, 50.0f,
                   "RX (KB/s)", COL_CYAN);
 #endif
+
+#if TOUCH_ENABLED
+    // Touch zone hints (right edge, centered in each zone — no hlines)
+    {
+        int zone_x = TFT_WIDTH - MARGIN - FONT_W;
+        int z1_y = (TOUCH_ZONE_TOP_END) / 2 - FONT_H / 2;
+        int z2_y = (TOUCH_ZONE_TOP_END + 1 + TOUCH_ZONE_MID_END) / 2 - FONT_H / 2;
+        int z3_y = (TOUCH_ZONE_MID_END + 1 + TFT_HEIGHT) / 2 - FONT_H / 2;
+        tft_draw_string(zone_x, z1_y, COL_DIM_LINE, "V");
+        tft_draw_string(zone_x, z2_y, COL_DIM_LINE, "A");
+        tft_draw_string(zone_x, z3_y, COL_DIM_LINE, "H");
+    }
+#endif
 }
 
 // ============================================================================
@@ -880,32 +930,15 @@ bool tft_display_init(void) {
     pwm_set_enabled(slice, true);
     
 #if TOUCH_ENABLED
-    // Initialize touch controller on same SPI as display
-    // Touch CS is typically on a different pin (check your hardware)
-    // For ILI9341 Arduino shields, touch CS is usually pin 4
-    #ifdef BRIDGE_TOUCH_CS_PIN
-    int8_t touch_irq = -1;
-    #ifdef BRIDGE_TOUCH_IRQ_PIN
-    touch_irq = BRIDGE_TOUCH_IRQ_PIN;
-    #endif
-    
-    xpt2046_init(TFT_SPI_DEV, BRIDGE_TOUCH_CS_PIN, touch_irq);
-    
-    // Register interrupt callback for touch events
-    xpt2046_set_callback(touch_event_callback);
-    #endif
-    
-    // Set calibration for ILI9341 (may need adjustment)
-    touch_calibration_t cal = {
-        .x_min = 300,
-        .x_max = 3800,
-        .y_min = 300,
-        .y_max = 3800,
-        .swap_xy = true,
-        .invert_x = false,
-        .invert_y = true
-    };
-    xpt2046_set_calibration(&cal);
+    // Initialize FT6206 capacitive touch controller over I2C
+    // SDA = Arduino A4 (GPIO20), SCL = Arduino A5 (GPIO21)
+    if (ft6206_init(i2c0, BRIDGE_TOUCH_SDA_PIN, BRIDGE_TOUCH_SCL_PIN)) {
+        ft6206_set_callback(touch_event_callback);
+        printf("[TFT] FT6206 capacitive touch initialized (SDA=%d SCL=%d)\n",
+               BRIDGE_TOUCH_SDA_PIN, BRIDGE_TOUCH_SCL_PIN);
+    } else {
+        printf("[TFT] FT6206 touch controller not detected\n");
+    }
 #endif
     
     initialized = true;
@@ -1059,10 +1092,27 @@ void tft_display_toggle_view(void) {
 
 void tft_display_handle_touch(void) {
 #if TOUCH_ENABLED
-    // Check flag set by interrupt callback
-    if (touch_toggle_requested) {
-        touch_toggle_requested = false;
+    // Poll FT6206 for touch events (handles debouncing internally)
+    ft6206_poll();
+    
+    // Process zone-based touch flags
+    if (touch_view_requested) {
+        touch_view_requested = false;
         tft_display_toggle_view();
+    }
+    
+    if (touch_api_requested) {
+        touch_api_requested = false;
+        // Signal API mode cycle request (checked by bridge main loop)
+        extern volatile bool api_cycle_requested;
+        api_cycle_requested = true;
+    }
+    
+    if (touch_human_requested) {
+        touch_human_requested = false;
+        // Signal humanization cycle request (checked by bridge main loop)
+        extern volatile bool humanization_cycle_requested;
+        humanization_cycle_requested = true;
     }
 #endif
 }

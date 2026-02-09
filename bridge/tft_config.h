@@ -68,6 +68,11 @@
 #define TFT_MOSI_PIN    PICO_DEFAULT_SPI_TX_PIN     // SPI TX
 #endif
 
+// MISO pin (required for touch controller SPI reads)
+#ifdef BRIDGE_TFT_MISO_PIN
+#define TFT_MISO_PIN    BRIDGE_TFT_MISO_PIN
+#endif
+
 // ============================================================================
 // Control Pins (from CMake or defaults for Feather)
 // ============================================================================

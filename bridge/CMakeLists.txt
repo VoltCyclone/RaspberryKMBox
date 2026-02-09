@@ -37,10 +37,11 @@ if(PICO_BOARD STREQUAL "adafruit_metro_rp2350")
     set(BRIDGE_TFT_DC    9)    # D9
     set(BRIDGE_TFT_RST   8)    # D8
     set(BRIDGE_TFT_BL    3)    # D3 (D7 is MODE_BUTTON)
-    set(BRIDGE_TOUCH_CS  4)    # D4 (typical for ILI9341 Arduino shields)
-    set(BRIDGE_TOUCH_IRQ 2)    # D2 (IRQ pin for touch interrupt)
+    # FT6206 capacitive touch over I2C (Arduino A4=SDA, A5=SCL)
+    set(BRIDGE_TOUCH_SDA 20)   # I2C0 SDA (Arduino A4)
+    set(BRIDGE_TOUCH_SCL 21)   # I2C0 SCL (Arduino A5)
     set(BRIDGE_MODE_BTN  7)    # D7
-    message(STATUS "Bridge: Metro RP2350 + ILI9341 240x320 TFT")
+    message(STATUS "Bridge: Metro RP2350 + ILI9341 240x320 TFT + FT6206 touch")
 else()
     set(TFT_DRIVER_NAME "ST7735")
     set(BRIDGE_TFT_DRIVER 1)   # TFT_DRIVER_ST7735
@@ -71,7 +72,7 @@ add_executable(kmbox_bridge
     st7735.c
     ili9341.c
     font.c
-    xpt2046_touch.c
+    ft6206_touch.c
 )
 
 # Generate PIO header for WS2812 NeoPixel from SDK
@@ -90,6 +91,7 @@ target_link_libraries(kmbox_bridge
     hardware_dma
     hardware_uart
     hardware_spi
+    hardware_i2c
     hardware_pwm
     hardware_adc
     pico_multicore
@@ -112,16 +114,12 @@ target_compile_definitions(kmbox_bridge PRIVATE
     BRIDGE_MODE_BTN_PIN=${BRIDGE_MODE_BTN}
 )
 
-# Add touch CS pin for ILI9341 displays
-if(DEFINED BRIDGE_TOUCH_CS)
+# Add FT6206 I2C touch pin definitions for ILI9341 displays
+if(DEFINED BRIDGE_TOUCH_SDA)
     target_compile_definitions(kmbox_bridge PRIVATE
-        BRIDGE_TOUCH_CS_PIN=${BRIDGE_TOUCH_CS}
+        BRIDGE_TOUCH_SDA_PIN=${BRIDGE_TOUCH_SDA}
+        BRIDGE_TOUCH_SCL_PIN=${BRIDGE_TOUCH_SCL}
     )
-    if(DEFINED BRIDGE_TOUCH_IRQ)
-        target_compile_definitions(kmbox_bridge PRIVATE
-            BRIDGE_TOUCH_IRQ_PIN=${BRIDGE_TOUCH_IRQ}
-        )
-    endif()
 endif()
 
 # Enable USB CDC output (this is our PC interface)

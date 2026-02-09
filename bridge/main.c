@@ -57,6 +57,12 @@ static bool button_state = false;
 static uint32_t button_press_start = 0;
 static bool button_init_done = false;
 
+// Humanization cycle request flag (set by touch handler in tft_display.c)
+volatile bool humanization_cycle_requested = false;
+
+// API mode cycle request flag (set by touch handler in tft_display.c)
+volatile bool api_cycle_requested = false;
+
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
 static uint8_t ferrum_idx = 0;
@@ -277,6 +283,9 @@ static void button_init(void) {
     button_init_done = true;
 }
 
+// Send packet via Hardware UART (DMA accelerated) - forward declaration
+static inline bool send_uart_packet(const uint8_t* data, size_t len);
+
 static void button_task(void) {
     if (!button_init_done) return;
     
@@ -302,8 +311,12 @@ static void button_task(void) {
             // Reset ferrum line buffer on mode change
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
+        } else {
+            // Long press: cycle humanization mode on KMBox
+            uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(cycle_pkt, 8);
+            printf("[Bridge] Long press: sent humanization cycle command\n");
         }
-        // Long press reserved for future use
     }
 }
 
@@ -1389,7 +1402,24 @@ int main(void) {
         
         kmbox_connection_task();
         button_task();
-        tft_display_handle_touch();  // Handle touch screen input (view switching)
+        tft_display_handle_touch();  // Handle touch screen input (zone-based: view/API/humanization)
+        
+        // Send humanization cycle command if requested by touch (bottom zone)
+        if (humanization_cycle_requested) {
+            humanization_cycle_requested = false;
+            uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(cycle_pkt, 8);
+            printf("[Bridge] Touch: sent humanization cycle command\n");
+        }
+        
+        // Cycle API mode if requested by touch (middle zone)
+        if (api_cycle_requested) {
+            api_cycle_requested = false;
+            current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
+            ferrum_idx = 0;
+            ferrum_line[0] = '\0';
+            printf("[Bridge] Touch: API mode -> %d\n", (int)current_api_mode);
+        }
         
         // Periodic UART echo test (every 2 seconds while not connected)
         static uint32_t last_echo_test = 0;

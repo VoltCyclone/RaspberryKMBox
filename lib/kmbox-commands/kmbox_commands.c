@@ -548,7 +548,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     }
     
     // Check if this is a transform command: km.transform(scale_x, scale_y, enabled)
-    // scale values use fixed-point: 256 = 1.0x, 0 = block axis, -256 = invert
+    // scale values use fixed-point: 256 = 1.0x, 0 = block, -256 = invert
     if (strncmp(cmd + 3, "transform(", 10) == 0) {
         const char* arg_start = cmd + 13; // Skip "km.transform("
         const char* paren_end = strchr(arg_start, ')');
@@ -1197,73 +1197,67 @@ void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* whee
     *wheel = g_kmbox_state.wheel_accumulator;
     g_kmbox_state.wheel_accumulator = 0;
     
-    *pan = 0;  // No pan movement from commands
+    // Pan (horizontal scroll) - new logic
+    // Pan is tricky because standard kmbox protocol doesn't support it well,
+    // but we accumulate it anyway.
+    if (g_kmbox_state.pan_accumulator > 127) {
+        *pan = 127;
+        g_kmbox_state.pan_accumulator -= 127;
+    } else if (g_kmbox_state.pan_accumulator < -128) {
+        *pan = -128;
+        g_kmbox_state.pan_accumulator -= -128;
+    } else {
+        *pan = (int8_t)g_kmbox_state.pan_accumulator;
+        g_kmbox_state.pan_accumulator = 0;
+    }
 }
 
-bool kmbox_has_forced_buttons(void)
+void kmbox_get_mouse_report_16(uint8_t* buttons, int16_t* x, int16_t* y, int8_t* wheel, int8_t* pan)
 {
-    // Check all buttons for forced state - UNROLLED for performance
-    // Direct access eliminates loop overhead
-    return g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_forced ||
-           g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_forced ||
-           g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_forced ||
-           g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_forced ||
-           g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_forced;
-}
-
-const char* kmbox_get_button_name(kmbox_button_t button)
-{
-    if (button < KMBOX_BUTTON_COUNT) {
-        return button_names[button];
-    }
-    return "unknown";
-}
-
-void kmbox_update_physical_buttons(uint8_t physical_buttons)
-{
-    g_kmbox_state.physical_buttons = physical_buttons;
-    
-    // Update button states for non-forced, non-locked buttons - UNROLLED for performance
-    // Direct bit testing eliminates loop overhead and array indexing
-    
-    // Button 0 (LEFT)
-    {
-        button_state_t* btn = &g_kmbox_state.buttons[KMBOX_BUTTON_LEFT];
-        if (!btn->is_forced && !btn->is_locked) {
-            btn->is_pressed = (physical_buttons & 0x01) != 0;
-        }
+    if (!buttons || !x || !y || !wheel || !pan) {
+        return;
     }
     
-    // Button 1 (RIGHT)
-    {
-        button_state_t* btn = &g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT];
-        if (!btn->is_forced && !btn->is_locked) {
-            btn->is_pressed = (physical_buttons & 0x02) != 0;
-        }
+    // Build button byte
+    uint8_t button_byte = 
+        (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
+    
+    *buttons = button_byte;
+    
+    // Get movement values - drain full 16-bit accumulator
+    // The accumulator is clamped to +/- 4096 so it fits safely in int16_t
+    *x = g_kmbox_state.mouse_x_accumulator;
+    g_kmbox_state.mouse_x_accumulator = 0;
+    
+    *y = g_kmbox_state.mouse_y_accumulator;
+    g_kmbox_state.mouse_y_accumulator = 0;
+    
+    // Wheel
+    if (g_kmbox_state.wheel_accumulator > 127) {
+        *wheel = 127;
+        g_kmbox_state.wheel_accumulator -= 127;
+    } else if (g_kmbox_state.wheel_accumulator < -128) {
+        *wheel = -128;
+        g_kmbox_state.wheel_accumulator -= -128;
+    } else {
+        *wheel = (int8_t)g_kmbox_state.wheel_accumulator;
+        g_kmbox_state.wheel_accumulator = 0;
     }
     
-    // Button 2 (MIDDLE)
-    {
-        button_state_t* btn = &g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE];
-        if (!btn->is_forced && !btn->is_locked) {
-            btn->is_pressed = (physical_buttons & 0x04) != 0;
-        }
-    }
-    
-    // Button 3 (SIDE1)
-    {
-        button_state_t* btn = &g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1];
-        if (!btn->is_forced && !btn->is_locked) {
-            btn->is_pressed = (physical_buttons & 0x08) != 0;
-        }
-    }
-    
-    // Button 4 (SIDE2)
-    {
-        button_state_t* btn = &g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2];
-        if (!btn->is_forced && !btn->is_locked) {
-            btn->is_pressed = (physical_buttons & 0x10) != 0;
-        }
+    // Pan
+    if (g_kmbox_state.pan_accumulator > 127) {
+        *pan = 127;
+        g_kmbox_state.pan_accumulator -= 127;
+    } else if (g_kmbox_state.pan_accumulator < -128) {
+        *pan = -128;
+        g_kmbox_state.pan_accumulator -= -128;
+    } else {
+        *pan = (int8_t)g_kmbox_state.pan_accumulator;
+        g_kmbox_state.pan_accumulator = 0;
     }
 }
 
@@ -1298,13 +1292,17 @@ void kmbox_add_mouse_movement(int16_t x, int16_t y)
 void kmbox_add_wheel_movement(int8_t wheel)
 {
     g_kmbox_state.wheel_accumulator += wheel;
-    
-    // Clamp to int8_t range
-    if (g_kmbox_state.wheel_accumulator > 127) {
-        g_kmbox_state.wheel_accumulator = 127;
-    } else if (g_kmbox_state.wheel_accumulator < -128) {
-        g_kmbox_state.wheel_accumulator = -128;
-    }
+    // Clamp to prevent overflow (though very unlikely with 8-bit inputs)
+    if (g_kmbox_state.wheel_accumulator > 1000) g_kmbox_state.wheel_accumulator = 1000;
+    else if (g_kmbox_state.wheel_accumulator < -1000) g_kmbox_state.wheel_accumulator = -1000;
+}
+
+void kmbox_add_pan_movement(int8_t pan)
+{
+    g_kmbox_state.pan_accumulator += pan;
+    // Clamp to prevent overflow
+    if (g_kmbox_state.pan_accumulator > 1000) g_kmbox_state.pan_accumulator = 1000;
+    else if (g_kmbox_state.pan_accumulator < -1000) g_kmbox_state.pan_accumulator = -1000;
 }
 
 bool kmbox_has_pending_movement(void)
@@ -1488,4 +1486,9 @@ void kmbox_transform_movement(int16_t in_x, int16_t in_y, int16_t *out_x, int16_
     
     if (out_x) *out_x = (int16_t)scaled_x;
     if (out_y) *out_y = (int16_t)scaled_y;
+}
+
+void kmbox_update_physical_buttons(uint8_t physical_buttons)
+{
+    g_kmbox_state.physical_buttons = physical_buttons;
 }

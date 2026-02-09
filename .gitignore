@@ -10,4 +10,6 @@ lib/pio_usb
 .vscode/settings.json
 .vscode/*
 tools/__pycache__/generate_lut.cpython-313.pyc
-HUMANIZATION.md
+tools/logitech_hid_dump.py
+tools/out.txt
+out2.txt

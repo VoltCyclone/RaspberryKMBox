@@ -15,9 +15,9 @@
 // Main loop time sampling frequency
 // Lower = more frequent time checks (more overhead, better responsiveness)
 // Higher = less frequent time checks (less overhead, slightly delayed task execution)
-// Valid values: 16, 32, 64, 128
+// Valid values: 8, 16, 32, 64, 128
 #ifndef MAIN_LOOP_TIME_SAMPLE_INTERVAL
-#define MAIN_LOOP_TIME_SAMPLE_INTERVAL  32
+#define MAIN_LOOP_TIME_SAMPLE_INTERVAL  16
 #endif
 
 // RP2350 DSP instructions for fixed-point math (Cortex-M33 SMULL)
@@ -113,6 +113,7 @@
 #define FAST_CMD_INFO           0x0C    // Request info (humanization, inject mode, etc)
                                         // Response byte 7 bitfield: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit [5:7]=reserved
 #define FAST_CMD_INFO_EXT       0x0E    // Extended stats: [0x0E][queue_count][queue_cap][overshoot%][total_inj_lo][total_inj_hi][overflows_lo][overflows_hi]
+#define FAST_CMD_CYCLE_HUMAN    0x0F    // Cycle humanization mode (bridge button/touch -> KMBox)
 #define FAST_CMD_PING           0xFE    // Fast ping (response: 0xFF)
 #define FAST_CMD_RESPONSE       0xFF    // Response/ACK
 
@@ -308,15 +309,14 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 #define USB_RESET_COOLDOWN_MS           2000    // Post-reset cooldown
 
 // Main loop task timing
-#define HID_DEVICE_TASK_INTERVAL_MS     8       // 8ms = ~125 FPS for ultra-smooth operation
+#define HID_DEVICE_TASK_INTERVAL_MS     1       // 1ms = 1000Hz to match gaming mouse poll rates at 240MHz
 #define WATCHDOG_TASK_INTERVAL_MS       100     // Watchdog update frequency
 #define WATCHDOG_INIT_DELAY_MS          8       // HID device task frequency
 #define VISUAL_TASK_INTERVAL_MS         50      // LED/neopixel update frequency
 #define ERROR_CHECK_INTERVAL_MS         1000    // USB error check frequency
 #define CORE1_HEARTBEAT_CHECK_LOOPS     10000   // Core1 heartbeat check frequency
 
-// Performance tuning constants
-#define MAIN_LOOP_TIME_SAMPLE_INTERVAL  32      // Sample time every N loops for performance
+// Performance tuning constants (MAIN_LOOP_TIME_SAMPLE_INTERVAL defined at top of file with #ifndef guard)
 #define CORE1_HEARTBEAT_MULTIPLIER      4       // Reduce Core1 heartbeat frequency by this factor
 
 // LED timing
@@ -333,6 +333,7 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 #define BREATHING_HALF_CYCLE_MS         (BREATHING_CYCLE_MS / 2)
 #define POWER_STABILIZATION_DELAY_MS    10      // Power stabilization delay
 #define ACTIVITY_FLASH_DURATION_MS      150     // Activity flash duration
+#define ACTIVITY_FLASH_BRIGHTNESS       200     // Brightness for passive activity flash (0-255)
 
 // Reporting intervals
 #define DEBUG_INTERVAL                  10000   // Print debug every 10000 reports
