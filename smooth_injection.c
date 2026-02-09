@@ -20,6 +20,8 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
+#include "pico/flash.h"
+#include "pico/rand.h"
 
 // Persist state
 #define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
@@ -108,16 +110,16 @@ static inline int32_t __not_in_flash_func(fp_mul)(int32_t a, int32_t b) {
     return (int32_t)((uint32_t)(hi << SMOOTH_FP_SHIFT) | (lo >> SMOOTH_FP_SHIFT));
 }
 
-static inline int32_t fp_div(int32_t a, int32_t b) {
+static __force_inline int32_t fp_div(int32_t a, int32_t b) {
     if (b == 0) return 0;
     return (int32_t)(((int64_t)a << SMOOTH_FP_SHIFT) / b);
 }
 
-static inline int32_t int_to_fp(int16_t val) {
+static __force_inline int32_t int_to_fp(int16_t val) {
     return (int32_t)val << SMOOTH_FP_SHIFT;
 }
 
-static inline int16_t fp_to_int(int32_t fp_val) {
+static __force_inline int16_t fp_to_int(int32_t fp_val) {
     // Round to nearest integer
     if (fp_val >= 0) {
         return (int16_t)((fp_val + SMOOTH_FP_HALF) >> SMOOTH_FP_SHIFT);
@@ -126,7 +128,7 @@ static inline int16_t fp_to_int(int32_t fp_val) {
     }
 }
 
-static inline int8_t clamp_i8(int32_t val) {
+static __force_inline int8_t clamp_i8(int32_t val) {
     if (val > 127) return 127;
     if (val < -128) return -128;
     return (int8_t)val;
@@ -270,9 +272,10 @@ void smooth_injection_init(void) {
     g_active_head = NULL;
     g_active_node_bitmap = 0;  // All nodes free
     
-    // Seed RNG with hardware time for per-session variation
-    uint64_t time_us = time_us_64();
-    rng_seed((uint32_t)(time_us ^ (time_us >> 32)));
+    // Seed RNG with hardware TRNG for true entropy (RP2350 has hardware TRNG)
+    // Falls back to ROSC + time entropy on RP2040
+    uint32_t hw_entropy = get_rand_32();
+    rng_seed(hw_entropy);
     
     // Load saved humanization mode, or use default if none saved
     smooth_load_humanization_mode();
@@ -282,27 +285,12 @@ bool smooth_inject_movement(int16_t x, int16_t y, inject_mode_t mode) {
     return smooth_inject_movement_fp(int_to_fp(x), int_to_fp(y), mode);
 }
 
-bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
-    // Track injection mode for stats
-    g_last_inject_mode = mode;
-    
-    // For immediate mode, just add to accumulator
-    if (mode == INJECT_MODE_IMMEDIATE) {
-        g_smooth.x_accumulator_fp += x_fp;
-        g_smooth.y_accumulator_fp += y_fp;
-        g_smooth.total_injected++;
-        return true;
-    }
-    
-    // For micro mode, add directly to sub-pixel accumulator (no rate limiting)
-    if (mode == INJECT_MODE_MICRO) {
-        g_smooth.x_accumulator_fp += x_fp;
-        g_smooth.y_accumulator_fp += y_fp;
-        g_smooth.total_injected++;
-        return true;
-    }
-    
-    // For smooth and velocity-matched modes, queue the movement
+//--------------------------------------------------------------------+
+// Internal: Queue a single sub-step movement entry
+// This is the core queuing logic, separated from subdivision.
+//--------------------------------------------------------------------+
+static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
+                                  uint8_t delay_frames) {
     smooth_queue_entry_t *entry = queue_alloc();
     if (!entry) {
         // Queue full - fall back to immediate injection
@@ -311,22 +299,19 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
         return false;
     }
     
-    // Calculate how many frames this movement should span
+    // Calculate how many frames this sub-step should span
     int32_t abs_x = x_fp >= 0 ? x_fp : -x_fp;
     int32_t abs_y = y_fp >= 0 ? y_fp : -y_fp;
     int32_t max_component = abs_x > abs_y ? abs_x : abs_y;
     
-    // Variable max_per_frame with ±1 pixel variation per injection
+    // Variable max_per_frame with ±1 pixel variation per sub-step
     int32_t max_per_frame_fp = int_to_fp(g_smooth.max_per_frame) + 
                                rng_range_fp(-SMOOTH_FP_ONE, SMOOTH_FP_ONE);
     
     uint8_t frames = 1;
     if (max_component > max_per_frame_fp) {
-        // Calculate frames needed (round up) with slight randomization
         frames = (uint8_t)((max_component + max_per_frame_fp - 1) / max_per_frame_fp);
         
-        // Apply movement-aware frame spread from LUT
-        // Small movements get more frames (careful), large movements get fewer (fast)
         int32_t movement_px = fp_to_int(max_component);
         int32_t frame_multiplier = lut_get_frame_spread_for_movement(movement_px);
         frames = (uint8_t)((frames * frame_multiplier) >> SMOOTH_FP_SHIFT);
@@ -334,74 +319,47 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
         if (frames < 1) frames = 1;
     }
     
-    // Add 1-2ms delay to simulate natural mouse latency (125Hz-1000Hz polling)
-    // This makes synthetic movement timing match physical mouse behavior
+    // Add natural latency jitter (0-1 frame)
     if (mode != INJECT_MODE_IMMEDIATE) {
-        frames = frames + (uint8_t)rng_range(0, 1); // Add 0-1 frame (~1-2ms at 1000Hz)
+        frames = frames + (uint8_t)rng_range(0, 1);
     }
     
-    // Choose easing curve based on movement size and mode
+    // Add inter-substep delay to stagger execution (sequential, not parallel)
+    frames = frames + delay_frames;
+    
+    // Choose easing curve with per-substep variety
     easing_mode_t easing = EASING_LINEAR;
-    if (max_component > int_to_fp(20)) {
-        // Large movements: use smooth ease-in-out
+    if (max_component > int_to_fp(10)) {
+        // Larger sub-steps: smooth easing
         easing = EASING_EASE_IN_OUT;
-    } else if (mode == INJECT_MODE_MICRO) {
-        // Micro adjustments: quick ease-out
+    } else if (rng_next() % 3 == 0) {
+        // 33% chance of ease-out for variety within sub-steps
         easing = EASING_EASE_OUT;
     } else if (rng_next() % 4 == 0) {
-        // 25% chance of easing for variety
         easing = EASING_EASE_IN_OUT;
     }
     
     // For velocity-matched mode, adjust based on current velocity
     if (mode == INJECT_MODE_VELOCITY_MATCHED && g_smooth.velocity_matching_enabled) {
-        // Get magnitude of current velocity
         int32_t vel_mag = g_smooth.velocity.avg_velocity_x_fp;
         if (vel_mag < 0) vel_mag = -vel_mag;
         int32_t vel_y_abs = g_smooth.velocity.avg_velocity_y_fp;
         if (vel_y_abs < 0) vel_y_abs = -vel_y_abs;
         if (vel_y_abs > vel_mag) vel_mag = vel_y_abs;
         
-        // Use variable thresholds instead of fixed values
         int32_t slow_thresh = g_smooth.humanization.vel_slow_threshold_fp;
         int32_t fast_thresh = g_smooth.humanization.vel_fast_threshold_fp;
         
-        // If mouse is moving fast, allow faster injection
-        // If mouse is slow/stopped, spread movement over more frames
         if (vel_mag < slow_thresh) {
-            // Mouse nearly stationary - be extra smooth
-            // Random multiplier: 1.5x to 2.5x
             uint16_t temp = (frames * (uint8_t)rng_range(3, 5)) / 2;
             frames = (temp > 255) ? 255 : (uint8_t)temp;
         } else if (vel_mag > fast_thresh) {
-            // Mouse moving fast - can inject faster
             frames = (frames + (uint8_t)rng_range(1, 2)) / 2;
             if (frames < 1) frames = 1;
         }
     }
     
-    // Overshoot simulation for realism (occasional overshoot then correction)
-    // Only apply to medium movements where hand control naturally overshoots
-    // Not on small (too precise) or very large (ballistic, no overshoot)
-    bool will_overshoot = false;
-    int32_t overshoot_x_fp = 0, overshoot_y_fp = 0;
-    int32_t movement_px = fp_to_int(max_component);
-    if (g_smooth.humanization.jitter_enabled && 
-        movement_px >= 30 && movement_px <= 120 && 
-        (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
-        will_overshoot = true;
-        // Get overshoot magnitude from LUT based on movement size (faster than rng_range)
-        int32_t overshoot_base = lut_get_overshoot(movement_px);
-        // Scale by humanization setting (overshoot_max_fp acts as multiplier)
-        int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
-        // Clamp to max
-        if (overshoot_mag > g_smooth.humanization.overshoot_max_fp) {
-            overshoot_mag = g_smooth.humanization.overshoot_max_fp;
-        }
-        overshoot_x_fp = (x_fp > 0) ? overshoot_mag : ((x_fp < 0) ? -overshoot_mag : 0);
-        overshoot_y_fp = (y_fp > 0) ? overshoot_mag : ((y_fp < 0) ? -overshoot_mag : 0);
-    }
-    
+    // Overshoot only on the final sub-step (handled by caller)
     entry->x_fp = x_fp;
     entry->y_fp = y_fp;
     entry->x_remaining_fp = x_fp;
@@ -411,14 +369,231 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     entry->mode = mode;
     entry->easing = easing;
     entry->active = true;
+    entry->will_overshoot = false;
+    entry->overshoot_x_fp = 0;
+    entry->overshoot_y_fp = 0;
     
-    // Store overshoot for later injection
-    entry->will_overshoot = will_overshoot;
-    entry->overshoot_x_fp = overshoot_x_fp;
-    entry->overshoot_y_fp = overshoot_y_fp;
+    return true;
+}
+
+//--------------------------------------------------------------------+
+// Movement Subdivision for Humanization
+//
+// Instead of queuing a single large movement, break it into 4-8
+// smaller sub-movements with randomized split ratios and independent
+// timing/easing per step. This creates a more organic movement
+// signature that's much harder to fingerprint.
+//
+// Subdivision strategy:
+// - Movements >= 3px: subdivide into 4-6 sub-steps
+// - Each sub-step gets a random fraction (~25% ± jitter) of the total
+// - Sub-steps are staggered with small frame delays between them
+// - The final sub-step gets the exact remainder (no drift)
+// - Overshoot is only applied to the final sub-step
+//--------------------------------------------------------------------+
+
+// Minimum movement magnitude (in pixels) to trigger subdivision
+#define SUBSTEP_MIN_MOVEMENT_PX     3
+
+// Number of sub-steps to split into (base value, randomized)
+#define SUBSTEP_COUNT_BASE          4
+#define SUBSTEP_COUNT_EXTRA_MAX     4   // Up to +4 extra = 4-8 total
+
+// Frame delay between consecutive sub-steps (randomized)
+#define SUBSTEP_DELAY_MIN           1
+#define SUBSTEP_DELAY_MAX           3
+
+bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
+    // Track injection mode for stats
+    g_last_inject_mode = mode;
+    
+    // For immediate mode, just add to accumulator (no subdivision)
+    if (mode == INJECT_MODE_IMMEDIATE) {
+        g_smooth.x_accumulator_fp += x_fp;
+        g_smooth.y_accumulator_fp += y_fp;
+        g_smooth.total_injected++;
+        return true;
+    }
+    
+    // For micro mode, add directly (no subdivision - sub-pixel precision needed)
+    if (mode == INJECT_MODE_MICRO) {
+        g_smooth.x_accumulator_fp += x_fp;
+        g_smooth.y_accumulator_fp += y_fp;
+        g_smooth.total_injected++;
+        return true;
+    }
+    
+    // Determine if we should subdivide this movement
+    int32_t abs_x = x_fp >= 0 ? x_fp : -x_fp;
+    int32_t abs_y = y_fp >= 0 ? y_fp : -y_fp;
+    int32_t max_component = abs_x > abs_y ? abs_x : abs_y;
+    int32_t movement_px = fp_to_int(max_component);
+    
+    // Only subdivide when:
+    // 1) Humanization is enabled (not OFF)
+    // 2) Movement is large enough to split meaningfully
+    // 3) We have enough queue space for the sub-steps
+    bool should_subdivide = (g_smooth.humanization.mode != HUMANIZATION_OFF) &&
+                            (movement_px >= SUBSTEP_MIN_MOVEMENT_PX) &&
+                            (g_smooth.queue_count + SUBSTEP_COUNT_BASE <= SMOOTH_QUEUE_SIZE);
+    
+    if (!should_subdivide) {
+        // Fall back to single-entry path (legacy behavior)
+        // Calculate overshoot for the single entry
+        bool will_overshoot = false;
+        int32_t overshoot_x_fp = 0, overshoot_y_fp = 0;
+        if (g_smooth.humanization.jitter_enabled && 
+            movement_px >= 30 && movement_px <= 120 && 
+            (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
+            will_overshoot = true;
+            int32_t overshoot_base = lut_get_overshoot(movement_px);
+            int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
+            if (overshoot_mag > g_smooth.humanization.overshoot_max_fp) {
+                overshoot_mag = g_smooth.humanization.overshoot_max_fp;
+            }
+            overshoot_x_fp = (x_fp > 0) ? overshoot_mag : ((x_fp < 0) ? -overshoot_mag : 0);
+            overshoot_y_fp = (y_fp > 0) ? overshoot_mag : ((y_fp < 0) ? -overshoot_mag : 0);
+        }
+        
+        bool ok = queue_single_substep(x_fp, y_fp, mode, 0);
+        if (ok && will_overshoot) {
+            // Patch overshoot onto the entry we just created (it's the most recent)
+            // Find it via the active list head (queue_single_substep adds to head)
+            if (g_active_head) {
+                smooth_queue_entry_t *last = &g_smooth.queue[g_active_head->index];
+                last->will_overshoot = true;
+                last->overshoot_x_fp = overshoot_x_fp;
+                last->overshoot_y_fp = overshoot_y_fp;
+            }
+        }
+        g_smooth.total_injected++;
+        return ok;
+    }
+    
+    //--------------------------------------------------------------------+
+    // Subdivided injection path
+    //--------------------------------------------------------------------+
+    
+    // Determine number of sub-steps based on humanization level
+    uint8_t num_substeps = SUBSTEP_COUNT_BASE;
+    switch (g_smooth.humanization.mode) {
+        case HUMANIZATION_LOW:
+            num_substeps += (uint8_t)rng_range(0, 1);  // 4-5 sub-steps
+            break;
+        case HUMANIZATION_MEDIUM:
+            num_substeps += (uint8_t)rng_range(0, 2);  // 4-6 sub-steps
+            break;
+        case HUMANIZATION_HIGH:
+            num_substeps += (uint8_t)rng_range(1, SUBSTEP_COUNT_EXTRA_MAX);  // 5-8 sub-steps
+            break;
+        default:
+            break;
+    }
+    
+    // Clamp to available queue space
+    uint8_t available = SMOOTH_QUEUE_SIZE - g_smooth.queue_count;
+    if (num_substeps > available) {
+        num_substeps = available;
+    }
+    if (num_substeps < 2) {
+        // Not enough space, fall back to single entry
+        bool ok = queue_single_substep(x_fp, y_fp, mode, 0);
+        g_smooth.total_injected++;
+        return ok;
+    }
+    
+    // Generate randomized split ratios that sum to SMOOTH_FP_ONE
+    // Each sub-step gets roughly 1/N of the total, ±30% jitter
+    int32_t ratios[8];  // Max 8 sub-steps
+    int32_t base_ratio = SMOOTH_FP_ONE / num_substeps;
+    int32_t jitter_range = base_ratio * 3 / 10;  // ±30% of base
+    int32_t ratio_sum = 0;
+    
+    for (uint8_t i = 0; i < num_substeps - 1; i++) {
+        int32_t r = base_ratio + rng_range_fp(-jitter_range, jitter_range);
+        if (r < SMOOTH_FP_ONE / (num_substeps * 4)) {
+            r = SMOOTH_FP_ONE / (num_substeps * 4);  // Floor: at least 25% of equal share
+        }
+        ratios[i] = r;
+        ratio_sum += r;
+    }
+    // Final sub-step gets the exact remainder (prevents drift)
+    ratios[num_substeps - 1] = SMOOTH_FP_ONE - ratio_sum;
+    if (ratios[num_substeps - 1] < 0) {
+        // Safety: redistribute if jitter pushed us over
+        ratios[num_substeps - 1] = SMOOTH_FP_ONE / num_substeps;
+    }
+    
+    // Calculate overshoot (apply only to the final sub-step)
+    bool will_overshoot = false;
+    int32_t overshoot_x_fp = 0, overshoot_y_fp = 0;
+    if (g_smooth.humanization.jitter_enabled && 
+        movement_px >= 30 && movement_px <= 120 && 
+        (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
+        will_overshoot = true;
+        int32_t overshoot_base = lut_get_overshoot(movement_px);
+        int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
+        if (overshoot_mag > g_smooth.humanization.overshoot_max_fp) {
+            overshoot_mag = g_smooth.humanization.overshoot_max_fp;
+        }
+        overshoot_x_fp = (x_fp > 0) ? overshoot_mag : ((x_fp < 0) ? -overshoot_mag : 0);
+        overshoot_y_fp = (y_fp > 0) ? overshoot_mag : ((y_fp < 0) ? -overshoot_mag : 0);
+    }
+    
+    // Queue each sub-step with staggered delays
+    int32_t x_remaining = x_fp;
+    int32_t y_remaining = y_fp;
+    uint8_t cumulative_delay = 0;
+    bool all_ok = true;
+    
+    for (uint8_t i = 0; i < num_substeps; i++) {
+        int32_t step_x, step_y;
+        
+        if (i == num_substeps - 1) {
+            // Final sub-step: use exact remainder to prevent any drift
+            step_x = x_remaining;
+            step_y = y_remaining;
+        } else {
+            step_x = fp_mul(x_fp, ratios[i]);
+            step_y = fp_mul(y_fp, ratios[i]);
+            x_remaining -= step_x;
+            y_remaining -= step_y;
+        }
+        
+        // Skip sub-steps that are essentially zero
+        if (step_x == 0 && step_y == 0) continue;
+        
+        // Stagger: each sub-step gets a small random delay on top of cumulative
+        uint8_t inter_delay = (i == 0) ? 0 : (uint8_t)rng_range(SUBSTEP_DELAY_MIN, SUBSTEP_DELAY_MAX);
+        cumulative_delay += inter_delay;
+        
+        bool ok = queue_single_substep(step_x, step_y, mode, cumulative_delay);
+        
+        if (ok && i == num_substeps - 1 && will_overshoot) {
+            // Attach overshoot to the final sub-step
+            if (g_active_head) {
+                smooth_queue_entry_t *last = &g_smooth.queue[g_active_head->index];
+                last->will_overshoot = true;
+                last->overshoot_x_fp = overshoot_x_fp;
+                last->overshoot_y_fp = overshoot_y_fp;
+            }
+        }
+        
+        if (!ok) {
+            all_ok = false;
+            // Remaining movement was added to accumulator by queue_single_substep
+            // Don't try to queue more sub-steps
+            // But add the rest of the unqueued movement to the accumulator
+            if (i < num_substeps - 1) {
+                g_smooth.x_accumulator_fp += x_remaining;
+                g_smooth.y_accumulator_fp += y_remaining;
+            }
+            break;
+        }
+    }
     
     g_smooth.total_injected++;
-    return true;
+    return all_ok;
 }
 
 void smooth_record_physical_movement(int16_t x, int16_t y) {
@@ -736,31 +911,47 @@ humanization_mode_t smooth_cycle_humanization_mode(void) {
 }
 
 // save smooth state to flash
-// WARNING: Flash operations on RP2040 with multicore require careful coordination
-// We use a lockout flag to coordinate with Core1
+// Uses pico_flash's flash_safe_execute() for safe multicore flash operations.
+// This handles Core1 lockout automatically via multicore_lockout.
 extern volatile bool g_flash_operation_in_progress;
 
-// Internal flash save - called from smooth_process_deferred_save when safe
-static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
-    humanization_persist_t data = {
-        .magic = HUMANIZATION_MAGIC,
-        .mode = g_smooth.humanization.mode,
-        .checksum = HUMANIZATION_MAGIC ^ g_smooth.humanization.mode
-    };
-    
-    // Ensure data structure is properly aligned and sized for flash
-    static_assert(sizeof(humanization_persist_t) <= FLASH_SECTOR_SIZE, "Data too large for flash sector");
-    static_assert((sizeof(humanization_persist_t) % 4) == 0, "Data must be 4-byte aligned for flash");
-    
-    uint32_t ints = save_and_disable_interrupts();
+// Callback parameter for flash_safe_execute
+typedef struct {
+    humanization_persist_t data;
+} flash_save_param_t;
+
+// Flash write callback — called by flash_safe_execute with IRQs disabled
+// and Core1 safely paused. Runs from RAM.
+static void __not_in_flash_func(flash_write_callback)(void *param) {
+    flash_save_param_t *p = (flash_save_param_t *)param;
     
     // Erase the sector (required before programming)
     flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
     
     // Program the data
-    flash_range_program(FLASH_TARGET_OFFSET, (uint8_t*)&data, sizeof(data));
+    flash_range_program(FLASH_TARGET_OFFSET, (uint8_t*)&p->data, sizeof(p->data));
+}
+
+// Internal flash save - uses flash_safe_execute for automatic multicore safety
+static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
+    // Ensure data structure is properly aligned and sized for flash
+    static_assert(sizeof(humanization_persist_t) <= FLASH_SECTOR_SIZE, "Data too large for flash sector");
+    static_assert((sizeof(humanization_persist_t) % 4) == 0, "Data must be 4-byte aligned for flash");
     
-    restore_interrupts(ints);
+    flash_save_param_t param = {
+        .data = {
+            .magic = HUMANIZATION_MAGIC,
+            .mode = g_smooth.humanization.mode,
+            .checksum = HUMANIZATION_MAGIC ^ g_smooth.humanization.mode
+        }
+    };
+    
+    int result = flash_safe_execute(flash_write_callback, &param, 500);
+    if (result != PICO_OK) {
+        // flash_safe_execute handles all the multicore coordination;
+        // if it fails, increment our failure counter
+        g_flash_save_failures++;
+    }
 }
 
 void smooth_save_humanization_mode(void) {
@@ -769,10 +960,12 @@ void smooth_save_humanization_mode(void) {
     g_save_request_time = to_ms_since_boot(get_absolute_time());
 }
 
-// Core1 acknowledgment flag for safe flash operations
+// Core1 acknowledgment flag — kept for backward compat but flash_safe_execute
+// handles multicore coordination automatically now.
 extern volatile bool g_core1_flash_acknowledged;
 
-// Call this periodically from main loop when Core1 is in a safe state
+// Call this periodically from main loop.
+// flash_safe_execute() handles Core1 lockout automatically via multicore_lockout.
 void smooth_process_deferred_save(void) {
     if (!g_save_pending) return;
     
@@ -788,60 +981,21 @@ void smooth_process_deferred_save(void) {
     // Wait for the defer period to allow rapid button presses
     if ((current_time - g_save_request_time) < SAVE_DEFER_MS) return;
     
-    // CRITICAL: Ensure Core1 acknowledgment flag is cleared before we start
-    g_core1_flash_acknowledged = false;
-    
-    // Signal Core1 to pause - it checks this flag in its tight loop
-    g_flash_operation_in_progress = true;
-    
-    // Send multiple events to ensure Core1 wakes up if in WFI
-    for (int i = 0; i < 5; i++) {
-        __sev();
-        tight_loop_contents();
-    }
-    
-    // Wait for Core1 to acknowledge with generous timeout
-    // Core1 might be busy with USB enumeration or HID processing
-    uint32_t timeout = time_us_32() + 100000;  // 100ms timeout (10x longer)
-    bool acknowledged = false;
-    
-    while (time_us_32() < timeout) {
-        if (g_core1_flash_acknowledged) {
-            acknowledged = true;
-            break;
-        }
-        tight_loop_contents();
-    }
-    
-    if (!acknowledged) {
-        // ABORT - Core1 didn't acknowledge, DO NOT write to flash!
-        printf("ERROR: Core1 flash sync timeout - ABORTING save (failure %d/%d)\n", 
-               g_flash_save_failures + 1, MAX_FLASH_FAILURES);
-        
-        // Release flag and count failure
-        g_flash_operation_in_progress = false;
-        g_core1_flash_acknowledged = false;
-        g_flash_save_failures++;
-        
-        // Retry later if not at max failures
-        if (g_flash_save_failures < MAX_FLASH_FAILURES) {
-            g_save_request_time = current_time;  // Reset timer to retry in 2s
-        } else {
-            g_save_pending = false;  // Give up
-        }
-        return;
-    }
-    
-    // Core1 acknowledged - safe to write flash
+    // flash_safe_execute handles all multicore coordination:
+    // - Pauses Core1 via multicore_lockout
+    // - Disables interrupts
+    // - Calls our callback
+    // - Resumes Core1 and restores interrupts
     smooth_save_humanization_mode_internal();
     
-    // Allow Core1 to resume
-    g_flash_operation_in_progress = false;
-    g_core1_flash_acknowledged = false;  // Reset for next time
-    
-    g_save_pending = false;
-    g_flash_save_failures = 0;  // Reset failure counter on success
-    printf("Humanization mode saved to flash successfully\n");
+    if (g_flash_save_failures == 0 || g_flash_save_failures < MAX_FLASH_FAILURES) {
+        g_save_pending = false;
+        g_flash_save_failures = 0;  // Reset failure counter on success
+        printf("Humanization mode saved to flash successfully\n");
+    } else {
+        // Retry later
+        g_save_request_time = current_time;
+    }
 }
 
 void smooth_load_humanization_mode(void) {

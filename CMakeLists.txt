@@ -101,6 +101,9 @@ target_link_libraries(PIOKMbox
         pico_unique_id
         pico_multicore
         hardware_dcp
+        pico_flash
+        pico_rand
+        pico_time
         m)
 
 # Add PIO USB library

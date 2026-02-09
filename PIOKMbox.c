@@ -31,6 +31,7 @@
 #include "hardware/clocks.h"
 #include "hardware/pll.h"
 #include "pico/multicore.h"
+#include "pico/flash.h"
 #include "tusb.h"
 #endif
 
@@ -116,6 +117,11 @@ static void core1_main(void) {
     // Small delay to let core0 stabilize
     sleep_ms(10);
     
+    // Initialize flash_safe_execute support on Core1.
+    // This allows Core0's flash_safe_execute() to safely pause Core1
+    // during flash operations (replaces manual g_flash_operation_in_progress polling).
+    flash_safe_execute_core_init();
+    
     // CRITICAL: Configure PIO USB BEFORE tuh_init() - this is the key!
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
     pio_cfg.pin_dp = PIN_USB_HOST_DP;
@@ -149,22 +155,9 @@ static void core1_task_loop(void) {
     const uint32_t heartbeat_check_threshold = CORE1_HEARTBEAT_CHECK_LOOPS * 4; // 4x less frequent
     
     while (true) {
-        // CRITICAL: Check flash flag FIRST before any other operations
-        // This runs from RAM so it's safe even while flash is being written
-        if (g_flash_operation_in_progress) {
-            // Acknowledge IMMEDIATELY that we've paused - Core0 waits for this
-            g_core1_flash_acknowledged = true;
-            
-            // Spin until flash operation completes (~5-10ms)
-            // DO NOT call any functions here that might be in flash
-            while (g_flash_operation_in_progress) {
-                tight_loop_contents();
-            }
-            
-            // Clear acknowledge flag after operation (helps Core0 detect completion)
-            // Note: Core0 also clears this, but belt-and-suspenders approach
-            g_core1_flash_acknowledged = false;
-        }
+        // NOTE: Flash safety is handled automatically by flash_safe_execute_core_init().
+        // The SDK's multicore_lockout mechanism pauses this core via SIO FIFO IRQ
+        // when Core0 calls flash_safe_execute(), so no manual polling needed.
         
         tuh_task();
         
@@ -365,7 +358,7 @@ static void report_watchdog_status(uint32_t current_time, uint32_t* watchdog_sta
 // Utility Functions
 //--------------------------------------------------------------------+
 
-static inline bool is_time_elapsed(uint32_t current_time, uint32_t last_time, uint32_t interval) {
+static __force_inline bool is_time_elapsed(uint32_t current_time, uint32_t last_time, uint32_t interval) {
     return (current_time - last_time) >= interval;
 }
 

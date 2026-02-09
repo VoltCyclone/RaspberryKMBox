@@ -111,6 +111,8 @@
 #define FAST_CMD_TIMED_MOVE     0x0A    // Movement with timestamp for sync
 #define FAST_CMD_SYNC           0x0B    // Clock synchronization packet
 #define FAST_CMD_INFO           0x0C    // Request info (humanization, inject mode, etc)
+                                        // Response byte 7 bitfield: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit [5:7]=reserved
+#define FAST_CMD_INFO_EXT       0x0E    // Extended stats: [0x0E][queue_count][queue_cap][overshoot%][total_inj_lo][total_inj_hi][overflows_lo][overflows_hi]
 #define FAST_CMD_PING           0xFE    // Fast ping (response: 0xFF)
 #define FAST_CMD_RESPONSE       0xFF    // Response/ACK
 

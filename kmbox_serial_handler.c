@@ -20,6 +20,7 @@
 #include "hardware/clocks.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "pico/time.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -58,7 +59,7 @@ static inline int16_t get_cached_temperature(uint32_t now_ms) {
 // Helper Functions
 //--------------------------------------------------------------------+
 
-static inline int16_t read_i16_le(const uint8_t *p) {
+static __force_inline int16_t read_i16_le(const uint8_t *p) {
     return (int16_t)(p[0] | (p[1] << 8));
 }
 
@@ -71,22 +72,34 @@ static uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE] __attribute__((aligned(UART_R
 static volatile uint32_t uart_rx_read_pos = 0;
 static int uart_rx_dma_chan = -1;
 
+//--------------------------------------------------------------------+
+// TX DMA (zero-CPU transmission)
+// Stages data into a linear buffer, then fires a DMA transfer.
+// Much faster than per-byte IRQ TX at 2 Mbaud.
+//--------------------------------------------------------------------+
+#define DMA_TX_BUFFER_SIZE  256
+static uint8_t dma_tx_buffer[DMA_TX_BUFFER_SIZE] __attribute__((aligned(4)));
+static volatile uint16_t dma_tx_len = 0;
+static int uart_tx_dma_chan = -1;
+static volatile bool dma_tx_busy = false;
+
 // DMA-based RX: get current write position from DMA write address
-static inline uint32_t rx_get_write_pos(void) {
+// __force_inline guarantees inlining even at -Os (Pico SDK macro)
+static __force_inline uint32_t rx_get_write_pos(void) {
     if (uart_rx_dma_chan < 0) return 0;
     uintptr_t write_addr = (uintptr_t)dma_channel_hw_addr(uart_rx_dma_chan)->write_addr;
     return (uint32_t)((write_addr - (uintptr_t)uart_rx_buffer) & UART_RX_BUFFER_MASK);
 }
 
-static inline uint16_t rx_available(void) {
+static __force_inline uint16_t rx_available(void) {
     return (uint16_t)((rx_get_write_pos() - uart_rx_read_pos) & UART_RX_BUFFER_MASK);
 }
 
-static inline uint8_t rx_peek_at(uint16_t offset) {
+static __force_inline uint8_t rx_peek_at(uint16_t offset) {
     return uart_rx_buffer[(uart_rx_read_pos + offset) & UART_RX_BUFFER_MASK];
 }
 
-static inline void rx_consume(uint16_t count) {
+static __force_inline void rx_consume(uint16_t count) {
     uart_rx_read_pos = (uart_rx_read_pos + count) & UART_RX_BUFFER_MASK;
 }
 
@@ -97,8 +110,8 @@ static inline void rx_consume(uint16_t count) {
 static uart_tx_buffer_t g_uart_tx_buffer;
 static volatile uint32_t g_uart_tx_dropped = 0;
 
-// Forward declaration for TX IRQ handler
-static void __not_in_flash_func(on_uart_tx)(void);
+// Forward declaration for DMA TX completion handler
+static void __not_in_flash_func(on_dma_tx_complete)(void);
 
 //--------------------------------------------------------------------+
 // Connection State
@@ -121,22 +134,38 @@ static struct {
 } clock_sync = {0};
 
 //--------------------------------------------------------------------+
-// Timed Move (non-blocking scheduled execution)
+// Timed Move (hardware alarm — microsecond-accurate, zero polling)
 //--------------------------------------------------------------------+
 
-static struct {
-    uint64_t target_time_us;
+// Volatile struct for alarm callback to inject movement at exact time
+static volatile struct {
     int16_t x, y;
     uint8_t mode;
-    bool pending;
+    volatile bool pending;  // Set by alarm callback, cleared by main loop check
+    volatile bool fired;    // Alarm fired, needs injection in main context
 } pending_timed_move = {0};
 
+static alarm_id_t g_timed_move_alarm_id = -1;
+
+// Hardware alarm callback — fires at exact microsecond target time.
+// Runs in IRQ context, so we just flag it for main loop injection.
+// Returns 0 = don't reschedule.
+static int64_t timed_move_alarm_callback(alarm_id_t id, void *user_data) {
+    (void)id;
+    (void)user_data;
+    pending_timed_move.fired = true;
+    g_timed_move_alarm_id = -1;
+    return 0;  // Don't reschedule
+}
+
+// Process fired timed move in main loop context (safe for smooth_inject_movement)
 static inline void process_pending_timed_move(void) {
-    if (pending_timed_move.pending && time_us_64() >= pending_timed_move.target_time_us) {
+    if (pending_timed_move.fired) {
+        pending_timed_move.fired = false;
+        pending_timed_move.pending = false;
         inject_mode_t mode = (pending_timed_move.mode <= 3) 
             ? (inject_mode_t)pending_timed_move.mode : INJECT_MODE_SMOOTH;
         smooth_inject_movement(pending_timed_move.x, pending_timed_move.y, mode);
-        pending_timed_move.pending = false;
     }
 }
 
@@ -148,62 +177,91 @@ static uint32_t fast_cmd_count = 0;
 static uint32_t fast_cmd_errors = 0;
 
 //--------------------------------------------------------------------+
-// UART TX IRQ Handler (RX now uses DMA)
+// DMA TX Completion IRQ Handler
 //--------------------------------------------------------------------+
 
-// Combined UART IRQ handler - TX only (RX via DMA circular buffer)
-static void __not_in_flash_func(on_uart_irq)(void) {
-    // Handle TX
-    if (uart_is_writable(KMBOX_UART) && g_uart_tx_buffer.tx_active) {
-        on_uart_tx();
+static void __not_in_flash_func(on_dma_tx_complete)(void) {
+    // Clear the interrupt
+    if (uart_tx_dma_chan >= 0) {
+        dma_hw->ints0 = (1u << uart_tx_dma_chan);
     }
+    dma_tx_busy = false;
 }
 
 //--------------------------------------------------------------------+
-// UART TX IRQ Handler - sends next byte from ring buffer
+// UART TX IRQ Handler (fallback before DMA TX is initialized)
 //--------------------------------------------------------------------+
 
-static void __not_in_flash_func(on_uart_tx)(void) {
-    while (uart_is_writable(KMBOX_UART) && tx_buffer_has_data(&g_uart_tx_buffer)) {
-        int byte = tx_buffer_get(&g_uart_tx_buffer);
-        if (byte >= 0) {
-            uart_putc_raw(KMBOX_UART, (uint8_t)byte);
-        } else {
-            break;
+static void __not_in_flash_func(on_uart_irq)(void) {
+    // Handle TX (only used before DMA TX is initialized)
+    if (uart_is_writable(KMBOX_UART) && g_uart_tx_buffer.tx_active) {
+        while (uart_is_writable(KMBOX_UART) && tx_buffer_has_data(&g_uart_tx_buffer)) {
+            int byte = tx_buffer_get(&g_uart_tx_buffer);
+            if (byte >= 0) {
+                uart_putc_raw(KMBOX_UART, (uint8_t)byte);
+            } else {
+                break;
+            }
+        }
+        if (!tx_buffer_has_data(&g_uart_tx_buffer)) {
+            uart_set_irq_enables(KMBOX_UART, false, false);
+            g_uart_tx_buffer.tx_active = false;
         }
     }
-    
-    // Disable TX IRQ if buffer empty (RX handled by DMA, not IRQ)
-    if (!tx_buffer_has_data(&g_uart_tx_buffer)) {
-        uart_set_irq_enables(KMBOX_UART, false, false);  // Both disabled, RX via DMA
-        g_uart_tx_buffer.tx_active = false;
-    }
 }
 
-// Non-blocking TX: Add bytes to ring buffer and enable TX IRQ
+// Non-blocking TX: Use DMA if available, fall back to IRQ ring buffer
 static bool uart_send_bytes(const uint8_t *data, size_t len) {
     if (!data || len == 0) return true;
     
-    // Only disable the UART IRQ, not all interrupts (allows USB to continue)
+    // DMA TX path: zero-CPU transmission
+    if (uart_tx_dma_chan >= 0) {
+        // Wait for previous DMA transfer to complete (should be very fast at 2Mbaud)
+        // Spin briefly — at 2Mbaud, 256 bytes takes ~1.3ms max
+        uint32_t timeout = time_us_32() + 2000;  // 2ms safety timeout
+        while (dma_tx_busy && time_us_32() < timeout) {
+            tight_loop_contents();
+        }
+        if (dma_tx_busy) {
+            // DMA still busy after timeout — drop the data
+            g_uart_tx_dropped += len;
+            return false;
+        }
+        
+        // Copy data to DMA TX staging buffer
+        size_t to_send = (len > DMA_TX_BUFFER_SIZE) ? DMA_TX_BUFFER_SIZE : len;
+        memcpy(dma_tx_buffer, data, to_send);
+        dma_tx_len = to_send;
+        dma_tx_busy = true;
+        
+        // Fire DMA transfer
+        dma_channel_set_read_addr(uart_tx_dma_chan, dma_tx_buffer, false);
+        dma_channel_set_trans_count(uart_tx_dma_chan, to_send, true);
+        
+        if (to_send < len) {
+            g_uart_tx_dropped += (len - to_send);
+            return false;
+        }
+        return true;
+    }
+    
+    // Fallback: IRQ-based ring buffer TX (before DMA is initialized)
     int uart_irq = (KMBOX_UART == uart0) ? UART0_IRQ : UART1_IRQ;
     irq_set_enabled(uart_irq, false);
     
     uint16_t written = tx_buffer_write(&g_uart_tx_buffer, data, len);
     
-    // Enable TX IRQ to start transmission
     if (written > 0 && !g_uart_tx_buffer.tx_active) {
         g_uart_tx_buffer.tx_active = true;
-        uart_set_irq_enables(KMBOX_UART, false, true);  // RX disabled (DMA), TX enabled
+        uart_set_irq_enables(KMBOX_UART, false, true);
     }
     
     irq_set_enabled(uart_irq, true);
     
-    // Track dropped bytes
     if (written < len) {
         g_uart_tx_dropped += (len - written);
         return false;
     }
-    
     return true;
 }
 
@@ -280,10 +338,10 @@ static void check_connection_timeout(uint32_t now_ms) {
     }
 }
 
-static inline void mark_activity(uint32_t now_ms) {
+static __force_inline void mark_activity(uint32_t now_ms) {
     g_last_data_time_ms = now_ms;
-    if (!kmbox_is_connected()) set_connection_state(BRIDGE_STATE_CONNECTED);
-    if (g_connection_state == BRIDGE_STATE_CONNECTED) set_connection_state(BRIDGE_STATE_ACTIVE);
+    if (__builtin_expect(!kmbox_is_connected(), 0)) set_connection_state(BRIDGE_STATE_CONNECTED);
+    if (__builtin_expect(g_connection_state == BRIDGE_STATE_CONNECTED, 0)) set_connection_state(BRIDGE_STATE_ACTIVE);
 }
 
 //--------------------------------------------------------------------+
@@ -337,12 +395,26 @@ static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, s
 extern void process_mouse_report(const hid_mouse_report_t *report);
 extern void process_kbd_report(const hid_keyboard_report_t *report);
 
-static inline bool is_fast_cmd_start(uint8_t byte) {
-    if (byte == 0x0A || byte == 0x0D) return false;  // Exclude line terminators
-    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_INFO) || byte == FAST_CMD_PING;
+static __force_inline bool is_fast_cmd_start(uint8_t byte) {
+    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;  // Exclude line terminators
+    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_INFO_EXT) || byte == FAST_CMD_PING;
 }
 
 static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
+    // Hint: mouse move is the most common command by far
+    if (__builtin_expect(pkt[0] == FAST_CMD_MOUSE_MOVE, 1)) {
+        const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
+        hid_mouse_report_t report = {
+            .buttons = m->buttons,
+            .x = kmbox_clamp_movement_i8(m->x),
+            .y = kmbox_clamp_movement_i8(m->y),
+            .wheel = m->wheel
+        };
+        process_mouse_report(&report);
+        fast_cmd_count++;
+        return true;
+    }
+    
     switch (pkt[0]) {
         case FAST_CMD_MOUSE_MOVE: {
             const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
@@ -431,11 +503,20 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
                 uint64_t target = clock_sync.device_base_us + t->time_us;
                 uint64_t now = time_us_64();
                 if (target > now && (target - now) < 100000) {
-                    pending_timed_move.target_time_us = target;
+                    // Cancel any previous pending alarm
+                    if (g_timed_move_alarm_id >= 0) {
+                        cancel_alarm(g_timed_move_alarm_id);
+                        g_timed_move_alarm_id = -1;
+                    }
+                    // Store movement params for alarm callback
                     pending_timed_move.x = t->x;
                     pending_timed_move.y = t->y;
                     pending_timed_move.mode = t->mode;
                     pending_timed_move.pending = true;
+                    pending_timed_move.fired = false;
+                    // Schedule hardware alarm at exact target time (µs precision)
+                    uint64_t delay_us = target - now;
+                    g_timed_move_alarm_id = add_alarm_in_us(delay_us, timed_move_alarm_callback, NULL, true);
                     fast_cmd_count++;
                     return true;
                 }
@@ -474,17 +555,52 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
         case FAST_CMD_INFO: {
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
             int16_t temp = get_cached_temperature(now_ms);
+            // Pack extra flags into byte 7 bitfield:
+            // [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit [5:7]=reserved
+            uint8_t queue_count = 0;
+            smooth_get_stats(NULL, NULL, NULL, &queue_count);
+            uint8_t flags = 0;
+            humanization_mode_t hm = smooth_get_humanization_mode();
+            // Jitter is enabled for LOW/MEDIUM/HIGH modes
+            if (hm >= HUMANIZATION_LOW) flags |= 0x01;
+            if (smooth_get_velocity_matching()) flags |= 0x02;
+            // Queue depth as 3-bit value (0-7, clamped from 0-32)
+            uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
+            flags |= (q3 & 0x07) << 2;
+            
             uint8_t resp[8] = {
                 FAST_CMD_INFO,
-                (uint8_t)smooth_get_humanization_mode(),
+                (uint8_t)hm,
                 (uint8_t)smooth_get_inject_mode(),
                 (uint8_t)smooth_get_max_per_frame(),
-                (uint8_t)smooth_get_velocity_matching(),
+                queue_count,
                 (uint8_t)(temp & 0xFF),
                 (uint8_t)((temp >> 8) & 0xFF),
-                0
+                flags
             };
             neopixel_trigger_activity_flash_color(0x0000FF00);
+            uart_send_bytes(resp, 8);
+            fast_cmd_count++;
+            return true;
+        }
+        
+        case FAST_CMD_INFO_EXT: {
+            // Extended stats packet:
+            // [0x0E][queue_count][queue_cap][overshoot%][total_inj_lo][total_inj_hi][overflows_lo][overflows_hi]
+            uint32_t total_injected = 0, frames_processed = 0, queue_overflows = 0;
+            uint8_t queue_count = 0;
+            smooth_get_stats(&total_injected, &frames_processed, &queue_overflows, &queue_count);
+            
+            uint8_t resp[8] = {
+                FAST_CMD_INFO_EXT,
+                queue_count,
+                SMOOTH_QUEUE_SIZE,  // queue capacity (compile-time constant)
+                (uint8_t)smooth_get_humanization_mode(),  // redundant but useful standalone
+                (uint8_t)(total_injected & 0xFF),
+                (uint8_t)((total_injected >> 8) & 0xFF),
+                (uint8_t)(queue_overflows & 0xFF),
+                (uint8_t)((queue_overflows >> 8) & 0xFF)
+            };
             uart_send_bytes(resp, 8);
             fast_cmd_count++;
             return true;
@@ -635,6 +751,21 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         kmbox_send_response(resp);
         snprintf(resp, sizeof(resp), "KMBOX_PROD:%s", get_attached_product()[0] ? get_attached_product() : "Unknown");
         kmbox_send_response(resp);
+        
+        // Also send extended humanization info as text
+        uint32_t total_inj = 0, frames_proc = 0, q_overflows = 0;
+        uint8_t q_count = 0;
+        smooth_get_stats(&total_inj, &frames_proc, &q_overflows, &q_count);
+        snprintf(resp, sizeof(resp), "KMBOX_INFO:hmode=%d,imode=%d,max=%d,vel=%d,qd=%d,qc=%d,inj=%lu,ovf=%lu",
+                 (int)smooth_get_humanization_mode(),
+                 (int)smooth_get_inject_mode(),
+                 (int)smooth_get_max_per_frame(),
+                 (int)smooth_get_velocity_matching(),
+                 (int)q_count,
+                 (int)SMOOTH_QUEUE_SIZE,
+                 (unsigned long)total_inj,
+                 (unsigned long)q_overflows);
+        kmbox_send_response(resp);
         return true;
     }
     
@@ -767,6 +898,44 @@ void kmbox_serial_init_dma(void) {
     );
     
     printf("[KMBOX] DMA RX initialized: ch=%d, buf=%u bytes\n", uart_rx_dma_chan, UART_RX_BUFFER_SIZE);
+    
+    //--------------------------------------------------------------------+
+    // DMA TX: Zero-CPU UART transmission
+    //--------------------------------------------------------------------+
+    uart_tx_dma_chan = dma_claim_unused_channel(false);
+    if (uart_tx_dma_chan < 0) {
+        printf("[KMBOX] WARNING: Failed to claim TX DMA channel, using IRQ fallback\n");
+        return;
+    }
+    
+    dma_channel_config tx_cfg = dma_channel_get_default_config(uart_tx_dma_chan);
+    channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&tx_cfg, true);     // Increment through TX buffer
+    channel_config_set_write_increment(&tx_cfg, false);    // Always write to UART DR
+    channel_config_set_dreq(&tx_cfg, uart_get_dreq(KMBOX_UART, true));  // TX DREQ
+    channel_config_set_high_priority(&tx_cfg, true);       // High priority for low latency
+    
+    // Configure channel but don't start yet (will be triggered per-transfer)
+    dma_channel_configure(
+        uart_tx_dma_chan,
+        &tx_cfg,
+        &uart_get_hw(KMBOX_UART)->dr,   // Write to UART data register
+        dma_tx_buffer,                   // Read from TX staging buffer (updated per-transfer)
+        0,                               // Transfer count set per-transfer
+        false                            // Don't start yet
+    );
+    
+    // Set up DMA TX completion interrupt
+    dma_channel_set_irq0_enabled(uart_tx_dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, on_dma_tx_complete);
+    irq_set_priority(DMA_IRQ_0, 1);  // High priority (just below UART)
+    irq_set_enabled(DMA_IRQ_0, true);
+    
+    // Disable UART TX IRQ since DMA handles TX now
+    uart_set_irq_enables(KMBOX_UART, false, false);
+    g_uart_tx_buffer.tx_active = false;
+    
+    printf("[KMBOX] DMA TX initialized: ch=%d, buf=%u bytes\n", uart_tx_dma_chan, DMA_TX_BUFFER_SIZE);
 }
 
 //--------------------------------------------------------------------+
@@ -908,15 +1077,26 @@ void kmbox_process_bridge_injections(void) {
 
 void kmbox_send_info_to_bridge(void) {
     int16_t temp = read_temperature_decidegrees();
+    uint8_t queue_count = 0;
+    smooth_get_stats(NULL, NULL, NULL, &queue_count);
+    
+    // Pack flags byte: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
+    humanization_mode_t hm = smooth_get_humanization_mode();
+    uint8_t flags = 0;
+    if (hm >= HUMANIZATION_LOW) flags |= 0x01;
+    if (smooth_get_velocity_matching()) flags |= 0x02;
+    uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
+    flags |= (q3 & 0x07) << 2;
+    
     uint8_t info_pkt[8] = {
         FAST_CMD_INFO,
-        (uint8_t)smooth_get_humanization_mode(),
+        (uint8_t)hm,
         (uint8_t)smooth_get_inject_mode(),
         (uint8_t)smooth_get_max_per_frame(),
-        (uint8_t)smooth_get_velocity_matching(),
+        queue_count,
         (uint8_t)(temp & 0xFF),
         (uint8_t)((temp >> 8) & 0xFF),
-        0
+        flags
     };
     uart_send_bytes(info_pkt, 8);
 }
