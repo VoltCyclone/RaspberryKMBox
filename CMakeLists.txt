@@ -85,6 +85,10 @@ pico_set_program_version(PIOKMbox "0.1")
 pico_enable_stdio_uart(PIOKMbox 1)
 pico_enable_stdio_usb(PIOKMbox 0)
 
+# Optimization flags for release performance
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
 # Add the standard library to the build
 target_link_libraries(PIOKMbox
         pico_stdlib

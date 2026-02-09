@@ -379,16 +379,20 @@ typedef struct {
     uint8_t  buttons_bits;     // typically 5 or 8
 
     // X axis
-    uint8_t  x_offset;         // byte offset from start of report data
-    bool     x_is_16bit;       // true for gaming mice, false for boot mice
-    uint16_t x_bit_offset;     // exact bit offset from start of report data
-    uint8_t  x_bits;           // field width in bits (8, 12, 16, etc.)
+    uint8_t  x_offset;
+    bool     x_is_16bit;
+    uint16_t x_bit_offset;
+    uint8_t  x_bits;
+    uint8_t  x_start_byte;
+    uint8_t  x_bit_in_byte;
 
     // Y axis
     uint8_t  y_offset;
     bool     y_is_16bit;
-    uint16_t y_bit_offset;     // exact bit offset from start of report data
-    uint8_t  y_bits;           // field width in bits (8, 12, 16, etc.)
+    uint16_t y_bit_offset;
+    uint8_t  y_bits;
+    uint8_t  y_start_byte;
+    uint8_t  y_bit_in_byte;
 
     // Wheel (vertical scroll)
     uint8_t  wheel_offset;
@@ -407,19 +411,22 @@ typedef struct {
 
 static mouse_report_layout_t host_mouse_layout = { .valid = false };
 
-// Output layout for when we override to 16-bit descriptor (matches desc_hid_mouse_16bit)
 static mouse_report_layout_t output_mouse_layout_16bit = {
-    .report_size = 8,          // 2 bytes buttons + 2 bytes X + 2 bytes Y + 1 byte wheel + 1 byte pan
+    .report_size = 8,
     .buttons_offset = 0,
     .buttons_bits = 16,
     .x_offset = 2,
     .x_is_16bit = true,
-    .x_bit_offset = 16,        // After 16-bit button field
+    .x_bit_offset = 16,
     .x_bits = 16,
+    .x_start_byte = 2,
+    .x_bit_in_byte = 0,
     .y_offset = 4,
     .y_is_16bit = true,
-    .y_bit_offset = 32,        // After buttons (16) + X (16)
+    .y_bit_offset = 32,
     .y_bits = 16,
+    .y_start_byte = 4,
+    .y_bit_in_byte = 0,
     .wheel_offset = 6,
     .has_wheel = true,
     .pan_offset = 7,
@@ -591,28 +598,36 @@ static void parse_mouse_report_layout(const uint8_t *desc, size_t len,
                                     layout->x_is_16bit = (report_size_bits >= 16);
                                     layout->x_bit_offset = (uint16_t)field_bit_offset;
                                     layout->x_bits = report_size_bits;
+                                    layout->x_start_byte = byte_off;
+                                    layout->x_bit_in_byte = field_bit_offset % 8;
                                 } else if (cur_usage == HID_USAGE_DESKTOP_Y) {
                                     layout->y_offset = byte_off;
                                     layout->y_is_16bit = (report_size_bits >= 16);
                                     layout->y_bit_offset = (uint16_t)field_bit_offset;
                                     layout->y_bits = report_size_bits;
+                                    layout->y_start_byte = byte_off;
+                                    layout->y_bit_in_byte = field_bit_offset % 8;
                                 } else if (cur_usage == HID_USAGE_DESKTOP_WHEEL) {
                                     layout->wheel_offset = byte_off;
                                     layout->has_wheel = true;
                                 }
                             }
                             
-                            // Also handle X,Y packed in a single INPUT with report_count=2
-                            // (Only if not using range, using explicit usage that applies to all)
                             if (!has_usage_range && usage_stack_count <= 1 && usage == HID_USAGE_DESKTOP_X && report_count >= 2) {
-                                layout->x_offset = bit_offset / 8;
+                                uint8_t x_byte_off = bit_offset / 8;
+                                uint8_t y_byte_off = (bit_offset + report_size_bits) / 8;
+                                layout->x_offset = x_byte_off;
                                 layout->x_is_16bit = (report_size_bits >= 16);
                                 layout->x_bit_offset = (uint16_t)bit_offset;
                                 layout->x_bits = report_size_bits;
-                                layout->y_offset = (bit_offset + report_size_bits) / 8;
+                                layout->x_start_byte = x_byte_off;
+                                layout->x_bit_in_byte = bit_offset % 8;
+                                layout->y_offset = y_byte_off;
                                 layout->y_is_16bit = (report_size_bits >= 16);
                                 layout->y_bit_offset = (uint16_t)(bit_offset + report_size_bits);
                                 layout->y_bits = report_size_bits;
+                                layout->y_start_byte = y_byte_off;
+                                layout->y_bit_in_byte = (bit_offset + report_size_bits) % 8;
                             }
                         } else if (usage_page == HID_USAGE_PAGE_CONSUMER) {
                             // AC Pan (horizontal scroll)
@@ -675,18 +690,6 @@ static void parse_mouse_report_layout(const uint8_t *desc, size_t len,
         return;
     }
     layout->valid = true;
-
-    // Debug output
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Layout: sz=%u rid=%u btn@%u x@%u.%u(%ub) y@%u.%u(%ub) whl@%u pan@%u",
-             layout->report_size,
-             layout->mouse_report_id,
-             layout->buttons_offset,
-             layout->x_offset, layout->x_bit_offset % 8, layout->x_bits,
-             layout->y_offset, layout->y_bit_offset % 8, layout->y_bits,
-             layout->has_wheel ? layout->wheel_offset : 0xFF,
-             layout->has_pan ? layout->pan_offset : 0xFF);
-    kmbox_send_status(msg);
 }
 
 // Per-instance HID usage tracking for non-boot-protocol devices (e.g. Logitech receivers)
@@ -1186,13 +1189,11 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
 // bit offset and bit width.  Handles 8, 12, 16, and any other width correctly,
 // including packed layouts where X and Y share a byte (e.g. 12-bit Logitech).
 static inline void __not_in_flash_func(write_axis_bits)(uint8_t *buf, uint8_t buf_len,
-                                                         uint16_t bit_offset, uint8_t nbits,
-                                                         bool is_16bit, uint8_t byte_offset,
+                                                         uint8_t start_byte, uint8_t bit_in_byte,
+                                                         uint8_t nbits, bool is_16bit,
                                                          int16_t value)
 {
     if (nbits > 0 && nbits != 8 && nbits != 16) {
-        uint8_t start_byte = bit_offset / 8;
-        uint8_t bit_in_byte = bit_offset % 8;
         int32_t max_val = (1 << (nbits - 1)) - 1;
         int32_t min_val = -(1 << (nbits - 1));
         int32_t cv = value;
@@ -1210,14 +1211,14 @@ static inline void __not_in_flash_func(write_axis_bits)(uint8_t *buf, uint8_t bu
             buf[start_byte + 2] = (uint8_t)((raw32 >> 16) & 0xFF);
         }
     } else if (is_16bit) {
-        if (byte_offset + 1 < buf_len) {
-            buf[byte_offset]     = (uint8_t)(value & 0xFF);
-            buf[byte_offset + 1] = (uint8_t)((value >> 8) & 0xFF);
+        if (start_byte + 1 < buf_len) {
+            buf[start_byte]     = (uint8_t)(value & 0xFF);
+            buf[start_byte + 1] = (uint8_t)((value >> 8) & 0xFF);
         }
     } else {
         int8_t cv = (value > 127) ? 127 : ((value < -128) ? -128 : (int8_t)value);
-        if (byte_offset < buf_len)
-            buf[byte_offset] = (uint8_t)cv;
+        if (start_byte < buf_len)
+            buf[start_byte] = (uint8_t)cv;
     }
 }
 
@@ -1241,19 +1242,13 @@ static inline void build_raw_mouse_report(uint8_t *buf, uint8_t sz,
         }
     }
     
-    write_axis_bits(buf, sz, L->x_bit_offset, L->x_bits, L->x_is_16bit, L->x_offset, x);
-    write_axis_bits(buf, sz, L->y_bit_offset, L->y_bits, L->y_is_16bit, L->y_offset, y);
+    write_axis_bits(buf, sz, L->x_start_byte, L->x_bit_in_byte, L->x_bits, L->x_is_16bit, x);
+    write_axis_bits(buf, sz, L->y_start_byte, L->y_bit_in_byte, L->y_bits, L->y_is_16bit, y);
     if (L->has_wheel && L->wheel_offset < sz)
         buf[L->wheel_offset] = (uint8_t)wheel;
     if (L->has_pan && L->pan_offset < sz)
         buf[L->pan_offset] = (uint8_t)pan;
 }
-
-// Helper: forward a raw mouse report with kmbox/smooth deltas injected.
-// When we have parsed the host mouse's HID descriptor layout we can
-// modify the raw bytes in-place so the downstream PC gets a report that
-// exactly matches the cloned descriptor.  Falls back to the legacy
-// hid_mouse_report_t path when the layout is unknown.
 
 static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, uint16_t raw_len)
 {
@@ -1283,18 +1278,11 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         }
     }
 
-    // --- Bit-level extraction for X (handles 8, 12, 16-bit fields) ---
-    // Prefer strict bit extraction unless standard 8/16-bit aligned
     if ((L->x_bits > 0 && L->x_bits != 8 && L->x_bits != 16) || (L->x_is_16bit && (L->x_bit_offset % 8 != 0))) {
-        // Non-standard width or unaligned 16-bit: extract from bit offset
-        uint16_t boff = L->x_bit_offset;
-        uint8_t  nbits = L->x_bits;
-        uint8_t  start_byte = boff / 8;
-        uint8_t  bit_in_byte = boff % 8;
-        
-        // Calculate the last byte index we need to read
-        // (boff + nbits - 1) is the index of the last bit
-        uint8_t end_byte = (boff + nbits - 1) / 8;
+        uint8_t nbits = L->x_bits;
+        uint8_t start_byte = L->x_start_byte;
+        uint8_t bit_in_byte = L->x_bit_in_byte;
+        uint8_t end_byte = (L->x_bit_offset + nbits - 1) / 8;
         
         if (end_byte < raw_len) {
             // Read up to 3 bytes to cover the field
@@ -1317,13 +1305,11 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
             phys_x = (int8_t)buf[L->x_offset];
     }
 
-    // --- Bit-level extraction for Y (handles 8, 12, 16-bit fields) ---
     if ((L->y_bits > 0 && L->y_bits != 8 && L->y_bits != 16) || (L->y_is_16bit && (L->y_bit_offset % 8 != 0))) {
-        uint16_t boff = L->y_bit_offset;
-        uint8_t  nbits = L->y_bits;
-        uint8_t  start_byte = boff / 8;
-        uint8_t  bit_in_byte = boff % 8;
-        uint8_t  end_byte = (boff + nbits - 1) / 8;
+        uint8_t nbits = L->y_bits;
+        uint8_t start_byte = L->y_start_byte;
+        uint8_t bit_in_byte = L->y_bit_in_byte;
+        uint8_t end_byte = (L->y_bit_offset + nbits - 1) / 8;
 
         if (end_byte < raw_len) {
             uint32_t raw32 = (uint32_t)buf[start_byte];
@@ -1416,11 +1402,9 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
 
     // X axis
     if (L->x_bits > 0 && L->x_bits != 8 && L->x_bits != 16) {
-        // Non-standard width (e.g. 12-bit Logitech): inject at bit offset
-        uint16_t boff = L->x_bit_offset;
-        uint8_t  nbits = L->x_bits;
-        uint8_t  start_byte = boff / 8;
-        uint8_t  bit_in_byte = boff % 8;
+        uint8_t nbits = L->x_bits;
+        uint8_t start_byte = L->x_start_byte;
+        uint8_t bit_in_byte = L->x_bit_in_byte;
         int32_t max_val = (1 << (nbits - 1)) - 1;
         int32_t min_val = -(1 << (nbits - 1));
         int32_t cx = mx;
@@ -1456,11 +1440,9 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
 
     // Y axis
     if (L->y_bits > 0 && L->y_bits != 8 && L->y_bits != 16) {
-        // Non-standard width (e.g. 12-bit Logitech): inject at bit offset
-        uint16_t boff = L->y_bit_offset;
-        uint8_t  nbits = L->y_bits;
-        uint8_t  start_byte = boff / 8;
-        uint8_t  bit_in_byte = boff % 8;
+        uint8_t nbits = L->y_bits;
+        uint8_t start_byte = L->y_start_byte;
+        uint8_t bit_in_byte = L->y_bit_in_byte;
         int32_t max_val = (1 << (nbits - 1)) - 1;
         int32_t min_val = -(1 << (nbits - 1));
         int32_t cy = my;
@@ -2025,11 +2007,16 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
         // Parse the mouse report layout to discover field offsets for raw forwarding
         parse_mouse_report_layout(host_mouse_desc, host_mouse_desc_len, &host_mouse_layout);
         
-        // CRITICAL FIX: Logitech Lightspeed mice (G703, etc.) - macOS exposes 8-bit
-        // descriptors but the actual mouse sends 16-bit reports. Detect and override.
-        bool is_logitech_lightspeed = (vid == 0x046D && (pid >= 0xC539 && pid <= 0xC547));
-        if (is_logitech_lightspeed && host_mouse_layout.valid) {
-            // Force 16-bit layout for Lightspeed mice regardless of what descriptor says
+        // CRITICAL FIX: Detect OS descriptor mismatches (macOS/Windows sometimes expose
+        // 8-bit descriptors for 16-bit mice). Check if descriptor claims 8-bit X/Y but
+        // report is large enough for 16-bit data (8+ bytes = 2 btn + 2 X + 2 Y + wheel + pan).
+        if (host_mouse_layout.valid && 
+            host_mouse_layout.x_bits == 8 && 
+            host_mouse_layout.y_bits == 8 &&
+            host_mouse_layout.report_size >= 8 &&
+            host_mouse_layout.buttons_bits >= 8) {
+            // Descriptor says 8-bit but structure suggests 16-bit
+            // Override to 16-bit layout (common with Logitech Lightspeed, etc.)
             host_mouse_layout.x_bits = 16;
             host_mouse_layout.y_bits = 16;
             host_mouse_layout.x_is_16bit = true;
@@ -2037,8 +2024,8 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             host_mouse_layout.report_size = 8;
             
             snprintf(status_msg, sizeof(status_msg), 
-                     "Logitech Lightspeed override: forcing 16-bit X/Y (VID=%04X PID=%04X)",
-                     vid, pid);
+                     "OS descriptor mismatch detected: forcing 16-bit X/Y (report_size=%u)",
+                     host_mouse_layout.report_size);
             kmbox_send_status(status_msg);
         }
         
