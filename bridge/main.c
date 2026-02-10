@@ -224,7 +224,7 @@ static uint32_t uart_tx_bytes_total = 0;
 static uint32_t uart_rx_overflows = 0;
 
 // KMBox temperature (from 0x0C info packet)
-static float kmbox_temperature_c = 0.0f;
+static float kmbox_temperature_c = -999.0f;
 
 // Sync stats from hw_uart module (called periodically)
 static void sync_uart_stats(void) {
@@ -1323,7 +1323,7 @@ static void tft_submit_stats_task(void) {
     
     // Temperature: read only every 500ms (ADC is slow), cache result
     static uint32_t last_temp_read_ms = 0;
-    static float cached_temp = 0.0f;
+    static float cached_temp = -999.0f;
     if (now_ms - last_temp_read_ms >= 500) {
         cached_temp = read_temperature_c();
         last_temp_read_ms = now_ms;

@@ -308,4 +308,12 @@ bool smooth_get_velocity_matching(void);
  */
 inject_mode_t smooth_get_inject_mode(void);
 
+/**
+ * Get humanization parameters for output-stage tremor application
+ * 
+ * @param jitter_amount_fp Output pointer for jitter amount (16.16 fixed-point)
+ * @param jitter_enabled Output pointer for jitter enabled flag
+ */
+void smooth_get_humanization_params(int32_t *jitter_amount_fp, bool *jitter_enabled);
+
 #endif // SMOOTH_INJECTION_H

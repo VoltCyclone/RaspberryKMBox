@@ -68,7 +68,7 @@ add_executable(PIOKMbox
     state_management.c
     kmbox_serial_handler.c
     smooth_injection.c
-    humanization_lut.c
+    humanization_fpu.c
     dcp_helpers.S
 )
 

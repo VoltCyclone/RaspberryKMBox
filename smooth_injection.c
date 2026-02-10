@@ -6,17 +6,19 @@
  * physical mouse passthrough.
  * 
  * Humanization features:
- * - Bezier easing curves for natural acceleration/deceleration
- * - Micro-jitter injection to simulate hand tremor
+ * - FPU-optimized runtime tremor generation (no LUTs, no periodicity)
+ * - Layered sine oscillators at physiological tremor frequencies (8-25Hz)
+ * - Perpendicular jitter for realistic path scatter
  * - Variable thresholds and timing to avoid fingerprinting
  * - Overshoot/correction patterns for realism
  */
 
 #include "smooth_injection.h"
-#include "humanization_lut.h"
+#include "humanization_fpu.h"
 #include "pico/stdlib.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
@@ -135,12 +137,11 @@ static __force_inline int8_t clamp_i8(int32_t val) {
 }
 
 //--------------------------------------------------------------------+
-// Easing Curves - Now using precomputed LUT for performance
+// Easing Curves - FPU direct computation (no LUTs on M33)
 //--------------------------------------------------------------------+
 
-// apply_easing now uses lut_apply_easing() from humanization_lut.h
-// This provides ~10x speedup and smoother interpolation
-#define apply_easing(t, mode) lut_apply_easing((t), (mode))
+// Easing is now computed directly using apply_easing_fpu() inline
+// M33 FPU makes direct computation faster than LUT lookups
 
 //--------------------------------------------------------------------+
 // Velocity Tracking
@@ -281,9 +282,11 @@ void smooth_injection_init(void) {
     g_active_node_bitmap = 0;  // All nodes free
     
     // Seed RNG with hardware TRNG for true entropy (RP2350 has hardware TRNG)
-    // Falls back to ROSC + time entropy on RP2040
     uint32_t hw_entropy = get_rand_32();
     rng_seed(hw_entropy);
+    
+    // Initialize FPU-based humanization
+    humanization_fpu_init(hw_entropy);
     
     // Load saved humanization mode, or use default if none saved
     smooth_load_humanization_mode();
@@ -329,10 +332,21 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
     if (max_component > max_per_frame_fp) {
         frames = (uint8_t)((max_component + max_per_frame_fp - 1) / max_per_frame_fp);
         
-        int32_t movement_px = fp_to_int(max_component);
-        int32_t frame_multiplier = lut_get_frame_spread_for_movement(movement_px);
-        frames = (uint8_t)((frames * frame_multiplier) >> SMOOTH_FP_SHIFT);
+        // FPU inline frame spread calculation (no LUT)
+        float movement_px = (float)max_component / SMOOTH_FP_ONE;
+        float multiplier;
+        if (movement_px < 20.0f)
+            multiplier = 1.3f - (movement_px / 20.0f) * 0.1f;
+        else if (movement_px < 60.0f)
+            multiplier = 1.2f - ((movement_px - 20.0f) / 40.0f) * 0.2f;
+        else if (movement_px < 100.0f)
+            multiplier = 1.0f - ((movement_px - 60.0f) / 40.0f) * 0.2f;
+        else if (movement_px < 140.0f)
+            multiplier = 0.8f - ((movement_px - 100.0f) / 40.0f) * 0.1f;
+        else
+            multiplier = 0.7f;
         
+        frames = (uint8_t)(frames * multiplier);
         if (frames < 1) frames = 1;
     }
     
@@ -482,7 +496,11 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
             movement_px >= 15 && movement_px <= 120 && 
             (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
             will_overshoot = true;
-            int32_t overshoot_base = lut_get_overshoot(movement_px);
+            // FPU inline overshoot calculation: 2-5% of movement magnitude (human range)
+            float magnitude_flt = (float)movement_px;
+            float overshoot_pct = 0.02f + (magnitude_flt / 300.0f) * 0.03f;  // 2-5%
+            float overshoot_px = fmaxf(0.5f, magnitude_flt * overshoot_pct);  // Floor 0.5px
+            int32_t overshoot_base = (int32_t)(overshoot_px * SMOOTH_FP_ONE);
             int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
             if (overshoot_mag > g_smooth.humanization.overshoot_max_fp) {
                 overshoot_mag = g_smooth.humanization.overshoot_max_fp;
@@ -581,7 +599,11 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
         movement_px >= 15 && movement_px <= 120 && 
         (rng_next() % 100) < g_smooth.humanization.overshoot_chance) {
         will_overshoot = true;
-        int32_t overshoot_base = lut_get_overshoot(movement_px);
+        // FPU inline overshoot calculation: 2-5% of movement magnitude (human range)
+        float magnitude_flt = (float)movement_px;
+        float overshoot_pct = 0.02f + (magnitude_flt / 300.0f) * 0.03f;  // 2-5%
+        float overshoot_px = fmaxf(0.5f, magnitude_flt * overshoot_pct);  // Floor 0.5px
+        int32_t overshoot_base = (int32_t)(overshoot_px * SMOOTH_FP_ONE);
         int32_t overshoot_mag = fp_mul(overshoot_base, g_smooth.humanization.overshoot_max_fp);
         if (overshoot_mag > g_smooth.humanization.overshoot_max_fp) {
             overshoot_mag = g_smooth.humanization.overshoot_max_fp;
@@ -696,68 +718,95 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
         }
         
         if (entry->frames_left > 0) {
-            // Calculate progress using LUT (eliminates division in hot path)
+            // Calculate progress using FPU (faster than LUT on M33)
             uint8_t frames_elapsed = entry->total_frames - entry->frames_left;
-            int32_t progress = lut_get_progress(entry->total_frames, frames_elapsed);
+            float progress_flt = (float)frames_elapsed / (float)entry->total_frames;
+            float prev_progress = (frames_elapsed > 0) ? (float)(frames_elapsed - 1) / (float)entry->total_frames : 0.0f;
             
-            // Apply easing curve using LUT with interpolation
-            int32_t eased_progress = apply_easing(progress, entry->easing);
-            int32_t prev_eased = (frames_elapsed > 0) ? 
-                apply_easing(lut_get_progress(entry->total_frames, frames_elapsed - 1), entry->easing) : 0;
+            // Apply easing curve using FPU (3 cycles for multiply on M33)
+            float eased_progress = apply_easing_fpu(progress_flt, entry->easing);
+            float prev_eased = apply_easing_fpu(prev_progress, entry->easing);
+            float progress_delta_flt = eased_progress - prev_eased;
             
-            // Calculate movement for this frame based on easing curve delta
-            int32_t progress_delta = eased_progress - prev_eased;
-            int32_t dx_fp = fp_mul(entry->x_fp, progress_delta);
-            int32_t dy_fp = fp_mul(entry->y_fp, progress_delta);
+            // Convert to fixed-point for accumulator
+            int32_t progress_delta = (int32_t)(progress_delta_flt * SMOOTH_FP_ONE);
             
-            // Add micro-jitter for human tremor simulation (except for MICRO mode)
-            // Use movement-aware jitter scaling from LUT:
-            // - Small movements (0-20px): More jitter (stationary hand, precise)
-            // - Medium movements (20-100px): Moderate jitter
-            // - Large movements (100+px): Less jitter (intentional, tremor suppressed)
+            // === MOVEMENT DELTA (tracked - affects remaining) ===
+            int32_t movement_dx_fp = fp_mul(entry->x_fp, progress_delta);
+            int32_t movement_dy_fp = fp_mul(entry->y_fp, progress_delta);
+            
+            // === NOISE DELTA (untracked - does NOT affect remaining) ===
+            // This is the critical fix: tremor and noise are additive and must
+            // not be compensated by the remaining dump on the final frame.
+            int32_t noise_dx_fp = 0;
+            int32_t noise_dy_fp = 0;
+            
+            // Add runtime tremor for human hand simulation (FPU-optimized, non-periodic)
+            // Real human aim has 0.5-1.5px perpendicular wobble from physiological tremor
             if (g_smooth.humanization.jitter_enabled && entry->mode != INJECT_MODE_MICRO) {
-                // Calculate movement magnitude once
+                // Calculate movement magnitude
                 int32_t move_mag = (entry->x_fp < 0 ? -entry->x_fp : entry->x_fp);
                 int32_t y_mag = (entry->y_fp < 0 ? -entry->y_fp : entry->y_fp);
                 if (y_mag > move_mag) move_mag = y_mag;
-                int32_t move_px = fp_to_int(move_mag);
+                float move_px = (float)move_mag / SMOOTH_FP_ONE;
                 
-                // Get current velocity magnitude for suppression
-                int32_t vel_mag = g_smooth.velocity.avg_velocity_x_fp;
-                if (vel_mag < 0) vel_mag = -vel_mag;
-                int32_t vel_y_abs = g_smooth.velocity.avg_velocity_y_fp;
-                if (vel_y_abs < 0) vel_y_abs = -vel_y_abs;
-                if (vel_y_abs > vel_mag) vel_mag = vel_y_abs;
+                // Scale tremor based on injection activity, not physical mouse
+                float activity_scale;
                 
-                // Suppress jitter when velocity is very low (movement has ended)
-                // Rapid decay: if velocity < 1px/frame, reduce jitter dramatically
-                int32_t velocity_scale = SMOOTH_FP_ONE;
-                if (vel_mag < int_to_fp(1)) {
-                    // Scale from 1.0x down to 0.1x as velocity approaches 0
-                    velocity_scale = (vel_mag * 9) / int_to_fp(1) + (SMOOTH_FP_ONE / 10);
+                if (move_px > 20.0f) {
+                    activity_scale = 0.15f;
+                } else if (move_px > 5.0f) {
+                    float t = (move_px - 5.0f) / 15.0f;
+                    activity_scale = 0.5f - t * 0.35f;
+                } else {
+                    activity_scale = 0.8f;
                 }
                 
-                // Get movement-aware jitter scale from LUT
-                int32_t movement_jitter_scale = lut_get_jitter_scale_for_movement(move_px);
-                int32_t jitter_scale = fp_mul(g_smooth.humanization.jitter_amount_fp, movement_jitter_scale);
+                // Get movement-dependent jitter scale (FPU inline, no LUT)
+                float movement_scale = humanization_jitter_scale(move_px);
+                float base_jitter = (float)g_smooth.humanization.jitter_amount_fp / SMOOTH_FP_ONE;
+                float tremor_scale = base_jitter * movement_scale * activity_scale;
                 
-                // Apply velocity-based suppression (stops jitter when movement ends)
-                jitter_scale = fp_mul(jitter_scale, velocity_scale);
+                // Get runtime tremor (layered incommensurate oscillators + noise)
+                float tremor_x, tremor_y;
+                humanization_get_tremor(tremor_scale, &tremor_x, &tremor_y);
                 
-                // Get jitter from precomputed LUT
-                int32_t jitter_x, jitter_y;
-                lut_get_jitter(g_smooth.frames_processed, jitter_scale, &jitter_x, &jitter_y);
-                dx_fp += jitter_x;
-                dy_fp += jitter_y;
+                // Apply tremor to NOISE (untracked) accumulator
+                if (move_px > 5.0f) {
+                    // Normalize movement vector
+                    float norm_x = (float)entry->x_fp / (float)move_mag;
+                    float norm_y = (float)entry->y_fp / (float)move_mag;
+                    
+                    // Perpendicular scatter (tremor_y) - the critical anti-cheat signal
+                    noise_dx_fp += (int32_t)(-norm_y * tremor_y * SMOOTH_FP_ONE);
+                    noise_dy_fp += (int32_t)( norm_x * tremor_y * SMOOTH_FP_ONE);
+                    
+                    // Parallel variation (tremor_x) - smaller, for speed fluctuation
+                    noise_dx_fp += (int32_t)(norm_x * tremor_x * 0.3f * SMOOTH_FP_ONE);
+                    noise_dy_fp += (int32_t)(norm_y * tremor_x * 0.3f * SMOOTH_FP_ONE);
+                } else {
+                    // Small movements: apply as raw X/Y tremor
+                    noise_dx_fp += (int32_t)(tremor_x * SMOOTH_FP_ONE);
+                    noise_dy_fp += (int32_t)(tremor_y * SMOOTH_FP_ONE);
+                }
             }
             
-            // Add to frame total
-            frame_x_fp += dx_fp;
-            frame_y_fp += dy_fp;
+            // Break up delta repeats with ±1px randomization (25% chance)
+            // Also untracked — this is noise, not intentional movement
+            if (g_smooth.humanization.jitter_enabled && (rng_next() & 0x3) == 0) {
+                noise_dx_fp += rng_range(-SMOOTH_FP_ONE, SMOOTH_FP_ONE);
+                noise_dy_fp += rng_range(-SMOOTH_FP_ONE, SMOOTH_FP_ONE);
+            }
             
-            // Update remaining (for fractional tracking)
-            entry->x_remaining_fp -= dx_fp;
-            entry->y_remaining_fp -= dy_fp;
+            // Add BOTH movement and noise to frame output
+            frame_x_fp += movement_dx_fp + noise_dx_fp;
+            frame_y_fp += movement_dy_fp + noise_dy_fp;
+            
+            // Update remaining based on MOVEMENT ONLY (not noise!)
+            // This is the critical fix: remaining tracks only intentional movement,
+            // so the final-frame dump doesn't cancel out tremor/noise.
+            entry->x_remaining_fp -= movement_dx_fp;
+            entry->y_remaining_fp -= movement_dy_fp;
             entry->frames_left--;
             
             // Check if done
@@ -918,7 +967,7 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.max_per_frame = (int16_t)rng_range(15, 17);        // Fix #2: per-session variation
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 16; // Fix #5: ±0.0625px (sensor noise floor)
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 2;  // 0.5px base jitter
             g_smooth.humanization.overshoot_chance = 0;                 // Fix #6: off at LOW
             g_smooth.humanization.overshoot_max_fp = 0;
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(2, 3));   // Fix #7: keep
@@ -934,9 +983,9 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.max_per_frame = (int16_t)rng_range(13, 19);        // Fix #2: wider variation
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 6;  // Fix #5: ±0.17px (sensor noise range)
-            g_smooth.humanization.overshoot_chance = 5;                 // Fix #6: 5% on 15-120px moves
-            g_smooth.humanization.overshoot_max_fp = SMOOTH_FP_ONE / 2; // Fix #6: max 0.5px
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base jitter (realistic tremor)
+            g_smooth.humanization.overshoot_chance = 8;                 // 8% chance
+            g_smooth.humanization.overshoot_max_fp = int_to_fp(2);      // max 2px overshoot
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));   // Fix #7: wider
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(8, 14));
             g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 50;               // Fix #3: ±2%
@@ -950,9 +999,9 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.max_per_frame = (int16_t)rng_range(10, 22);        // Fix #2: widest variation
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 3;  // Fix #5: ±0.33px (upper sensor noise)
-            g_smooth.humanization.overshoot_chance = 10;                // Fix #6: 10% on 15-120px moves
-            g_smooth.humanization.overshoot_max_fp = SMOOTH_FP_ONE;     // Fix #6: max 1px
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(3) / 2;  // 1.5px base jitter (maximum realistic tremor)
+            g_smooth.humanization.overshoot_chance = 12;                // 12% chance
+            g_smooth.humanization.overshoot_max_fp = int_to_fp(3);      // max 3px overshoot
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 5));   // Fix #7: widest
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(6, 18));
             g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 33;               // Fix #3: ±3%
@@ -1049,7 +1098,6 @@ void smooth_process_deferred_save(void) {
     
     // Safety check - disable flash saves if we've had too many failures
     if (g_flash_save_failures >= MAX_FLASH_FAILURES) {
-        printf("Flash saves disabled after %d failures - mode changes are temporary\n", g_flash_save_failures);
         g_save_pending = false;
         return;
     }
@@ -1073,7 +1121,6 @@ void smooth_process_deferred_save(void) {
         // No new failures — save succeeded
         g_save_pending = false;
         g_flash_save_failures = 0;  // Reset failure counter on success
-        printf("Humanization mode saved to flash successfully\n");
     } else {
         // New failure detected — retry later
         g_save_request_time = current_time;
@@ -1110,4 +1157,13 @@ bool smooth_get_velocity_matching(void) {
 
 inject_mode_t smooth_get_inject_mode(void) {
     return g_last_inject_mode;
+}
+
+void smooth_get_humanization_params(int32_t *jitter_amount_fp, bool *jitter_enabled) {
+    if (jitter_amount_fp) {
+        *jitter_amount_fp = g_smooth.humanization.jitter_amount_fp;
+    }
+    if (jitter_enabled) {
+        *jitter_enabled = g_smooth.humanization.jitter_enabled;
+    }
 }

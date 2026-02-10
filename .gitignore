@@ -13,3 +13,5 @@ tools/__pycache__/generate_lut.cpython-313.pyc
 tools/logitech_hid_dump.py
 tools/out.txt
 out2.txt
+tools/mouse_counteract
+tools/tmp/*.html

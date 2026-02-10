@@ -715,9 +715,7 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     
     // Protocol: KMBOX_PING
     if (len >= 10 && strncmp(line, "KMBOX_PING", 10) == 0) {
-        char resp[64];
-        snprintf(resp, sizeof(resp), "KMBOX_PONG:v%s", KMBOX_PROTOCOL_VERSION);
-        kmbox_send_response(resp);
+        kmbox_send_response("KMBOX_PONG:v" KMBOX_PROTOCOL_VERSION);
         if (g_connection_state == BRIDGE_STATE_WAITING || g_connection_state == BRIDGE_STATE_DISCONNECTED) {
             set_connection_state(BRIDGE_STATE_CONNECTING);
         }
@@ -740,26 +738,53 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     
     // Protocol: KMBOX_STATUS
     if (len >= 12 && strncmp(line, "KMBOX_STATUS", 12) == 0) {
-        const char *names[] = {"WAITING", "CONNECTING", "CONNECTED", "ACTIVE", "DISCONNECTED"};
-        char resp[64];
-        snprintf(resp, sizeof(resp), "KMBOX_STATE:%s", names[g_connection_state]);
-        kmbox_send_response(resp);
+        static const char *responses[] = {
+            "KMBOX_STATE:WAITING",
+            "KMBOX_STATE:CONNECTING",
+            "KMBOX_STATE:CONNECTED",
+            "KMBOX_STATE:ACTIVE",
+            "KMBOX_STATE:DISCONNECTED"
+        };
+        if (g_connection_state < 5) {
+            kmbox_send_response(responses[g_connection_state]);
+        }
         return true;
     }
     
     // Protocol: KMBOX_INFO
+    // Note: This is a diagnostic command, not hot path, but we still optimize it
     if (len >= 10 && strncmp(line, "KMBOX_INFO", 10) == 0) {
         char resp[128];
-        snprintf(resp, sizeof(resp), "KMBOX_VID:%04X", get_attached_vid());
-        kmbox_send_response(resp);
-        snprintf(resp, sizeof(resp), "KMBOX_PID:%04X", get_attached_pid());
-        kmbox_send_response(resp);
-        snprintf(resp, sizeof(resp), "KMBOX_MFR:%s", get_attached_manufacturer()[0] ? get_attached_manufacturer() : "Unknown");
-        kmbox_send_response(resp);
-        snprintf(resp, sizeof(resp), "KMBOX_PROD:%s", get_attached_product()[0] ? get_attached_product() : "Unknown");
+        uint16_t vid = get_attached_vid();
+        uint16_t pid = get_attached_pid();
+        const char *mfr = get_attached_manufacturer();
+        const char *prod = get_attached_product();
+        
+        // Format hex values manually (faster than snprintf for simple hex)
+        static const char hex[] = "0123456789ABCDEF";
+        resp[0] = 'K'; resp[1] = 'M'; resp[2] = 'B'; resp[3] = 'O'; resp[4] = 'X'; resp[5] = '_';
+        resp[6] = 'V'; resp[7] = 'I'; resp[8] = 'D'; resp[9] = ':';
+        resp[10] = hex[(vid >> 12) & 0xF];
+        resp[11] = hex[(vid >> 8) & 0xF];
+        resp[12] = hex[(vid >> 4) & 0xF];
+        resp[13] = hex[vid & 0xF];
+        resp[14] = '\0';
         kmbox_send_response(resp);
         
-        // Also send extended humanization info as text
+        resp[6] = 'P'; resp[7] = 'I'; resp[8] = 'D';
+        resp[10] = hex[(pid >> 12) & 0xF];
+        resp[11] = hex[(pid >> 8) & 0xF];
+        resp[12] = hex[(pid >> 4) & 0xF];
+        resp[13] = hex[pid & 0xF];
+        kmbox_send_response(resp);
+        
+        // Manufacturer and product need snprintf for string concatenation
+        snprintf(resp, sizeof(resp), "KMBOX_MFR:%s", mfr[0] ? mfr : "Unknown");
+        kmbox_send_response(resp);
+        snprintf(resp, sizeof(resp), "KMBOX_PROD:%s", prod[0] ? prod : "Unknown");
+        kmbox_send_response(resp);
+        
+        // Humanization info - still needs snprintf for multiple integers
         uint32_t total_inj = 0, frames_proc = 0, q_overflows = 0;
         uint8_t q_count = 0;
         smooth_get_stats(&total_inj, &frames_proc, &q_overflows, &q_count);

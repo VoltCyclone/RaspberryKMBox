@@ -13,7 +13,9 @@
 #include "state_management.h"   // Include the header for state management
 #include "watchdog.h"           // Include the header for watchdog management
 #include "smooth_injection.h"   // Include the header for smooth mouse injection
+#include "humanization_fpu.h"   // Include for tremor generation
 #include <string.h>             // For strcpy, strlen, memset
+#include <math.h>                // For sqrtf
 
 uint16_t attached_vid = 0;
 uint16_t attached_pid = 0;
@@ -286,6 +288,10 @@ static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol)
 static bool process_keyboard_report_internal(const hid_keyboard_report_t *report);
 static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 
+// Humanization helpers
+static void apply_output_humanization(int16_t *x, int16_t *y);
+static inline int8_t clamp_i8(int32_t val);
+
 // --- Runtime HID descriptor mirroring storage & helpers ---
 // Gaming mice (Razer, Logitech, SteelSeries) can have very large HID
 // report descriptors — 500-1000+ bytes with multiple collections for
@@ -469,6 +475,99 @@ static void reset_device_string_descriptors(void) {
     // Rebuild config descriptor with defaults
     build_runtime_hid_report_with_mouse(NULL, 0);
     rebuild_configuration_descriptor();
+}
+
+//--------------------------------------------------------------------+
+// Inline Helper Functions
+//--------------------------------------------------------------------+
+
+static __force_inline int8_t clamp_i8(int32_t val) {
+    if (val > 127) return 127;
+    if (val < -128) return -128;
+    return (int8_t)val;
+}
+
+//--------------------------------------------------------------------+
+// Final Stage Humanization (Applied to ALL movement sources)
+//--------------------------------------------------------------------+
+
+/**
+ * Apply humanization tremor to final HID output movement.
+ * This is called AFTER all movement sources are combined (physical mouse,
+ * kmbox accumulator, smooth queue) to ensure consistent humanization
+ * regardless of input pathway.
+ * 
+ * @param x Pointer to X movement (modified in place)
+ * @param y Pointer to Y movement (modified in place)
+ */
+static void apply_output_humanization(int16_t *x, int16_t *y) {
+    // Skip if humanization disabled or no movement
+    humanization_mode_t mode = smooth_get_humanization_mode();
+    if (mode == HUMANIZATION_OFF || (*x == 0 && *y == 0)) {
+        return;
+    }
+    
+    // Calculate movement magnitude for scale calculation
+    float fx = (float)(*x);
+    float fy = (float)(*y);
+    float magnitude = sqrtf(fx * fx + fy * fy);
+    
+    // Don't humanize very small movements (< 2 pixels) - likely already jittered
+    if (magnitude < 2.0f) {
+        return;
+    }
+    
+    // Get humanization parameters from smooth injection state
+    int32_t jitter_amount_fp;
+    bool jitter_enabled;
+    smooth_get_humanization_params(&jitter_amount_fp, &jitter_enabled);
+    
+    if (!jitter_enabled) {
+        return;
+    }
+    
+    // Calculate tremor scale based on movement magnitude and humanization level
+    float movement_scale = humanization_jitter_scale(magnitude);
+    float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
+    
+    // Mode-dependent intensity scaling
+    float mode_scale = 1.0f;
+    switch (mode) {
+        case HUMANIZATION_LOW:
+            mode_scale = 0.5f;
+            break;
+        case HUMANIZATION_MEDIUM:
+            mode_scale = 1.0f;
+            break;
+        case HUMANIZATION_HIGH:
+            mode_scale = 1.5f;
+            break;
+        default:
+            break;
+    }
+    
+    float tremor_scale = base_jitter * movement_scale * mode_scale;
+    
+    // Get runtime tremor (layered oscillators + noise)
+    float tremor_x, tremor_y;
+    humanization_get_tremor(tremor_scale, &tremor_x, &tremor_y);
+    
+    // Apply perpendicular scatter (the critical anti-cheat signal)
+    // Normalize movement vector
+    float norm_x = fx / magnitude;
+    float norm_y = fy / magnitude;
+    
+    // Perpendicular component (tremor_y) - primary humanization signal
+    float perp_dx = -norm_y * tremor_y;
+    float perp_dy = norm_x * tremor_y;
+    
+    // Parallel component (tremor_x) - speed variation (smaller)
+    float para_dx = norm_x * tremor_x * 0.3f;
+    float para_dy = norm_y * tremor_x * 0.3f;
+    
+    // Apply tremor to output (with rounding)
+    *x = (int16_t)(*x + (int16_t)(perp_dx + para_dx + 0.5f));
+    *y = (int16_t)(*y + (int16_t)(perp_dy + para_dy + 0.5f));
 }
 
 // Minimal HID descriptor parser — extracts report field layout for the mouse
@@ -765,9 +864,7 @@ static uint8_t detect_usage_from_report_descriptor(const uint8_t *desc_report, u
                     info->has_report_id = (report_info[i].report_id != 0);
                     info->mouse_report_id = report_info[i].report_id;
                 }
-                char msg[64];
-                snprintf(msg, sizeof(msg), "Detected MOUSE usage (report_id=%u)", report_info[i].report_id);
-                kmbox_send_status(msg);
+                // Mouse usage detected
                 break;  // Mouse takes priority
             } else if (report_info[i].usage == HID_USAGE_DESKTOP_KEYBOARD) {
                 detected_protocol = HID_ITF_PROTOCOL_KEYBOARD;
@@ -775,9 +872,7 @@ static uint8_t detect_usage_from_report_descriptor(const uint8_t *desc_report, u
                     info->has_report_id = (report_info[i].report_id != 0);
                     info->keyboard_report_id = report_info[i].report_id;
                 }
-                char msg[64];
-                snprintf(msg, sizeof(msg), "Detected KEYBOARD usage (report_id=%u)", report_info[i].report_id);
-                kmbox_send_status(msg);
+                // Keyboard usage detected
                 // Don't break - keep looking for mouse
             }
         }
@@ -908,11 +1003,6 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
             mouse_desc_final = mouse_desc_patched;
             mouse_len_final = mouse_len_patched;
             used_ids[REPORT_ID_MOUSE] = true;
-            
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Injected Report ID %u into mouse desc (%zu->%zu bytes)",
-                     REPORT_ID_MOUSE, mouse_len, mouse_len_patched);
-            kmbox_send_status(msg);
         }
     }
     
@@ -982,11 +1072,6 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
             memcpy(&desc_hid_report_runtime[pos], desc_hid_mouse_16bit, dlen);
             pos += dlen;
             using_16bit_output_override = true;
-            
-            char msg[80];
-            snprintf(msg, sizeof(msg), "Override: Using 16-bit output descriptor (input: %u-bit X/Y)",
-                     host_mouse_layout.x_bits);
-            kmbox_send_status(msg);
         } else {
             // Use the cloned descriptor from the host mouse
             if (pos + mouse_len_final >= HID_DESC_BUF_SIZE)
@@ -1026,19 +1111,6 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
     // Store the runtime IDs for use by all report-sending paths
     runtime_kbd_report_id = kbd_report_id;
     runtime_consumer_report_id = consumer_report_id;
-    
-    char msg[96];
-    snprintf(msg, sizeof(msg), "HID desc: %zu bytes, kbd_id=%u mouse_rid=%s consumer_id=%u",
-             pos, kbd_report_id,
-             mouse_has_report_ids ? "native" : "injected",
-             consumer_report_id);
-    kmbox_send_status(msg);
-    
-    if (kbd_report_id != REPORT_ID_KEYBOARD || consumer_report_id != REPORT_ID_CONSUMER_CONTROL) {
-        snprintf(msg, sizeof(msg), "Remapped IDs: kbd=%u consumer=%u (was %u/%u)",
-                 kbd_report_id, consumer_report_id, REPORT_ID_KEYBOARD, REPORT_ID_CONSUMER_CONTROL);
-        kmbox_send_status(msg);
-    }
 }
 
 bool usb_hid_init(void)
@@ -1558,6 +1630,14 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         x = (total_x > 127) ? 127 : ((total_x < -128) ? -128 : (int8_t)total_x);
         y = (total_y > 127) ? 127 : ((total_y < -128) ? -128 : (int8_t)total_y);
     }
+    
+    // *** CRITICAL FIX: Apply humanization to physical mouse path too ***
+    // Convert to int16_t for humanization (avoid overflow)
+    int16_t x16 = x;
+    int16_t y16 = y;
+    apply_output_humanization(&x16, &y16);
+    x = (int8_t)clamp_i8(x16);
+    y = (int8_t)clamp_i8(y16);
 
     // Save pre-smooth values for re-accumulation if endpoint is busy
     int8_t raw_x = x - smooth_x;
@@ -1706,6 +1786,10 @@ void hid_device_task(void)
                 y += smooth_y;
             }
             
+            // *** CRITICAL FIX: Apply humanization to FINAL output ***
+            // This ensures ALL movements (kmbox, smooth, physical) get tremor
+            apply_output_humanization(&x, &y);
+            
             if (x != 0 || y != 0 || wheel != 0 || buttons != 0) {
                 // When we have a cloned gaming mouse layout, build a raw report
                 // that matches the descriptor format.  Otherwise use the standard API.
@@ -1731,19 +1815,27 @@ void hid_device_task(void)
             // Do NOT drain kmbox accumulators (Core1 owns those).
             int8_t smooth_x = 0, smooth_y = 0;
             smooth_process_frame(&smooth_x, &smooth_y);
-            if (smooth_x != 0 || smooth_y != 0) {
+            
+            // Convert to int16_t for humanization
+            int16_t x16 = smooth_x;
+            int16_t y16 = smooth_y;
+            
+            // *** CRITICAL FIX: Apply humanization to smooth injection too ***
+            apply_output_humanization(&x16, &y16);
+            
+            if (x16 != 0 || y16 != 0) {
                 if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
                     uint8_t raw[64];
                     uint8_t sz = host_mouse_layout.report_size;
                     if (sz > sizeof(raw)) sz = sizeof(raw);
 
                     build_raw_mouse_report(raw, sz, &host_mouse_layout,
-                                           0, smooth_x, smooth_y, 0, 0);
+                                           0, x16, y16, 0, 0);
 
                     uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
                     tud_hid_report(rid, raw, sz);
                 } else {
-                    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, smooth_x, smooth_y, 0, 0);
+                    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, (int8_t)x16, (int8_t)y16, 0, 0);
                 }
                 return;
             }
@@ -1917,12 +2009,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
 {
     uint16_t vid, pid;
     tuh_vid_pid_get(dev_addr, &vid, &pid);
-    
-    // Send status to bridge
-    char status_msg[128];
-    snprintf(status_msg, sizeof(status_msg), "HID Mount: VID=%04X PID=%04X inst=%u desc=%u",
-             vid, pid, instance, desc_len);
-    kmbox_send_status(status_msg);
 
     // === DEVICE-LEVEL CLONING (once per physical device) ===
     // Composite devices (e.g. Razer Basilisk V3 = 4 HID interfaces) trigger
@@ -1946,10 +2032,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             host_device_info.bMaxPacketSize0 = host_dev_desc.bMaxPacketSize0;
             host_device_info.bcdDevice       = host_dev_desc.bcdDevice;
             host_device_info.valid           = true;
-            
-            snprintf(status_msg, sizeof(status_msg), "Clone DEV: USB%04X bcd=%04X ep0=%u",
-                     host_dev_desc.bcdUSB, host_dev_desc.bcdDevice, host_dev_desc.bMaxPacketSize0);
-            kmbox_send_status(status_msg);
         }
         
         // Capture configuration descriptor (contains all interfaces + endpoints)
@@ -1967,10 +2049,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
     if (itf_protocol == HID_ITF_PROTOCOL_NONE && desc_report != NULL && desc_len > 0) {
         // Non-boot protocol device — detect usage from report descriptor
         effective_protocol = detect_usage_from_report_descriptor(desc_report, desc_len, inst_info);
-        
-        snprintf(status_msg, sizeof(status_msg), "Protocol: itf=%u effective=%u inst=%u",
-                 itf_protocol, effective_protocol, instance);
-        kmbox_send_status(status_msg);
     }
     
     if (inst_info) {
@@ -2000,10 +2078,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
         host_mouse_desc_len = strip_vendor_collections(desc_report, copy_len,
                                                         host_mouse_desc, sizeof(host_mouse_desc));
 
-        snprintf(status_msg, sizeof(status_msg), "Desc: %u raw -> %zu stripped",
-                 desc_len, host_mouse_desc_len);
-        kmbox_send_status(status_msg);
-
         // Parse the mouse report layout to discover field offsets for raw forwarding
         parse_mouse_report_layout(host_mouse_desc, host_mouse_desc_len, &host_mouse_layout);
         
@@ -2022,11 +2096,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             host_mouse_layout.x_is_16bit = true;
             host_mouse_layout.y_is_16bit = true;
             host_mouse_layout.report_size = 8;
-            
-            snprintf(status_msg, sizeof(status_msg), 
-                     "OS descriptor mismatch detected: forcing 16-bit X/Y (report_size=%u)",
-                     host_mouse_layout.report_size);
-            kmbox_send_status(status_msg);
         }
         
         // Use the layout-parsed report ID (extracted from the mouse collection context)
@@ -2053,12 +2122,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             inst_info->mouse_report_id = host_mouse_report_id;
         }
 
-        snprintf(status_msg, sizeof(status_msg), "Mouse desc: %zuB rid=%u layout=%s X=%ub Y=%ub",
-                 host_mouse_desc_len, host_mouse_report_id,
-                 host_mouse_layout.valid ? "OK" : "FAIL",
-                 host_mouse_layout.x_bits, host_mouse_layout.y_bits);
-        kmbox_send_status(status_msg);
-        
         // Build runtime HID report descriptor (keyboard + mouse + consumer)
         build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
         rebuild_configuration_descriptor();
@@ -2120,10 +2183,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             neopixel_update_status();
         }
     } else {
-        char skip_msg[64];
-        snprintf(skip_msg, sizeof(skip_msg), "Skip recv inst=%u proto=%u (composite non-mouse)",
-                 instance, effective_protocol);
-        kmbox_send_status(skip_msg);
+        // Skip receiving from non-mouse interfaces on the same device
     }
     neopixel_update_status();
 }
@@ -2624,11 +2684,6 @@ static void parse_host_config_descriptor(const uint8_t *cfg_desc, uint16_t cfg_l
                 host_config_info.wMaxPacketSize = cfg_desc[offset + 4] | (cfg_desc[offset + 5] << 8);
                 host_config_info.bInterval = cfg_desc[offset + 6];
                 host_config_info.valid = true;
-                
-                char msg[96];
-                snprintf(msg, sizeof(msg), "Clone EP: pkt=%u interval=%ums power=%umA",
-                         host_config_info.wMaxPacketSize, host_config_info.bInterval, host_config_info.bMaxPower * 2);
-                kmbox_send_status(msg);
                 break; // Found what we need
             }
         }

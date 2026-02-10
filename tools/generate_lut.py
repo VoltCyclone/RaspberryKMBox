@@ -91,20 +91,20 @@ def generate_jitter_table():
     """Generate pseudo-random jitter patterns that sum to ~0."""
     random.seed(42)  # Reproducible
     
-    # Generate X jitter - DRASTICALLY REDUCED to ±0.05 pixels (was ±0.5)
-    # This gets scaled by humanization settings and movement LUT, so needs to be tiny
+    # Generate X jitter - Base amplitude 1.0px for realistic hand tremor
+    # Anti-cheat expects 0.5-1.5px perpendicular wobble
     jitter_x = []
     for i in range(JITTER_LUT_SIZE):
         # Use deterministic pattern based on index
         angle = (i * 7 + 3) * 2 * math.pi / JITTER_LUT_SIZE
-        value = math.sin(angle) * 0.05  # Range [-0.05, 0.05] pixels
+        value = math.sin(angle) * 1.0  # Range [-1.0, 1.0] pixels
         jitter_x.append(int(round(value * FP_ONE)))
     
-    # Generate Y jitter - phase shifted, also ±0.05 pixels
+    # Generate Y jitter - different phase for 2D realism
     jitter_y = []
     for i in range(JITTER_LUT_SIZE):
         angle = (i * 11 + 7) * 2 * math.pi / JITTER_LUT_SIZE
-        value = math.sin(angle) * 0.05  # Range [-0.05, 0.05] pixels
+        value = math.sin(angle) * 1.0  # Range [-1.0, 1.0] pixels
         jitter_y.append(int(round(value * FP_ONE)))
     
     return jitter_x, jitter_y
@@ -204,23 +204,23 @@ def generate_jitter_scale_by_movement():
         movement_px = i * 10
         
         if movement_px < 20:
-            # 0-20px: 0.8x to 0.7x
-            scale = 0.8 - (movement_px / 20) * 0.1
+            # 0-20px: 1.5x to 1.2x (precise movements have more visible tremor)
+            scale = 1.5 - (movement_px / 20) * 0.3
         elif movement_px < 40:
-            # 20-40px: 0.7x to 0.5x
-            scale = 0.7 - ((movement_px - 20) / 20) * 0.2
+            # 20-40px: 1.2x to 0.9x
+            scale = 1.2 - ((movement_px - 20) / 20) * 0.3
         elif movement_px < 60:
-            # 40-60px: 0.5x to 0.3x
-            scale = 0.5 - ((movement_px - 40) / 20) * 0.2
+            # 40-60px: 0.9x to 0.6x
+            scale = 0.9 - ((movement_px - 40) / 20) * 0.3
         elif movement_px < 100:
-            # 60-100px: 0.3x to 0.1x
-            scale = 0.3 - ((movement_px - 60) / 40) * 0.2
+            # 60-100px: 0.6x to 0.3x
+            scale = 0.6 - ((movement_px - 60) / 40) * 0.3
         elif movement_px < 140:
-            # 100-140px: 0.1x to 0.05x
-            scale = 0.1 - ((movement_px - 100) / 40) * 0.05
+            # 100-140px: 0.3x to 0.15x (fast flicks suppress tremor)
+            scale = 0.3 - ((movement_px - 100) / 40) * 0.15
         else:
-            # 140+px: 0.05x (minimal)
-            scale = 0.05
+            # 140+px: 0.15x (minimal but non-zero)
+            scale = 0.15
         
         values.append(int(round(scale * FP_ONE)))
     
