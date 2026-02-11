@@ -17,7 +17,8 @@
 // Hardware Configuration
 #define UART_TX_PIN          PICO_DEFAULT_UART_TX_PIN 
 #define UART_RX_PIN          PICO_DEFAULT_UART_RX_PIN 
-#define UART_BAUD            2000000  // Baud rate for RP2350<->RP2040 communication (2 Mbaud)
+#define UART_BAUD            3000000  // Baud rate for RP2350<->RP2350 communication (3 Mbaud)
+                                      // At 48MHz clk_peri: 48M/3M = 16 (exact, 0 ppm error)
 #define LED_PIN              PICO_DEFAULT_LED_PIN
 #define WS2812_PIN           PICO_DEFAULT_WS2812_PIN
 
@@ -58,6 +59,11 @@
 #define LED_COLOR_DISABLED      255, 255, 0    // Yellow - Tracking disabled
 #define LED_COLOR_ACTIVITY      0, 0, 255      // Blue - Brief activity pulse
 #define LED_COLOR_ERROR         255, 0, 0      // Red - Error state
+
+// API Mode Change Flash Colors (RGB format) — brief NeoPixel pulse on mode switch
+#define LED_COLOR_API_KMBOX     255, 255, 255  // White  - KMBox native protocol
+#define LED_COLOR_API_MAKCU     255, 0, 255    // Magenta - Makcu protocol
+#define LED_COLOR_API_FERRUM    255, 128, 0    // Orange  - Ferrum protocol
 
 // Protocol Commands (PC -> Bridge via USB CDC)
 #define CMD_CONFIG           'C'      // Update configuration

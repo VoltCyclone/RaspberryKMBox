@@ -41,6 +41,7 @@
 #include "ferrum_translator.h"
 #include "protocol_luts.h"
 #include "core1_translator.h"
+#include "neopixel_dma.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
 
 // Hardware UART is now used instead of PIO UART
@@ -184,33 +185,13 @@ typedef struct __attribute__((packed)) {
 static frame_header_t pending_header;
 static uint8_t header_bytes_received = 0;
 
-// WS2812 NeoPixel state (using SDK PIO program)
-static PIO ws2812_pio = pio0;
-static uint ws2812_sm = 0;
-static uint ws2812_offset = 0;
+// WS2812 NeoPixel — now handled entirely by neopixel_dma module
+// (DMA + 30 Hz timer; zero CPU on the hot path)
 
-// ============================================================================
-// WS2812 NeoPixel Control (using SDK ws2812.pio)
-// ============================================================================
-
-static void ws2812_init(void) {
-    // Add the SDK ws2812 program to PIO
-    ws2812_offset = pio_add_program(ws2812_pio, &ws2812_program);
-    
-    // Claim a state machine
-    ws2812_sm = pio_claim_unused_sm(ws2812_pio, true);
-    
-    // Initialize using SDK helper function (800kHz, RGB not RGBW)
-    ws2812_program_init(ws2812_pio, ws2812_sm, ws2812_offset, WS2812_PIN, 800000, false);
-}
-
-void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
-    // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
-    uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
-    // Non-blocking: skip update if PIO FIFO is full (LED is cosmetic, not critical)
-    if (!pio_sm_is_tx_fifo_full(ws2812_pio, ws2812_sm)) {
-        pio_sm_put(ws2812_pio, ws2812_sm, grb << 8);
-    }
+// Legacy compatibility shim — delegates to the DMA-backed module.
+// Existing call sites can use this until fully migrated.
+static inline void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    neopixel_dma_set_rgb(r, g, b);
 }
 
 // ============================================================================
@@ -233,6 +214,7 @@ static void sync_uart_stats(void) {
 
 // Read internal temperature sensor (RP2040/RP2350)
 // Returns temperature in Celsius
+// Optimized: pre-computed constants use FPU multiply instead of divide
 static float read_temperature_c(void) {
     // Select ADC input 4 (internal temperature sensor)
     adc_select_input(4);
@@ -241,12 +223,16 @@ static float read_temperature_c(void) {
     uint16_t raw = adc_read();
     
     // Convert to voltage (ADC reference is 3.3V)
-    const float conversion_factor = 3.3f / (1 << 12);
-    float voltage = raw * conversion_factor;
+    // Pre-computed: 3.3 / 4096 = 0.000806640625
+    static const float ADC_TO_VOLTAGE = 3.3f / 4096.0f;
+    float voltage = (float)raw * ADC_TO_VOLTAGE;
     
     // Convert voltage to temperature (formula from RP2040 datasheet)
-    // T = 27 - (ADC_voltage - 0.706) / 0.001721
-    float temperature = 27.0f - (voltage - 0.706f) / 0.001721f;
+    // T = 27 - (V - 0.706) / 0.001721
+    // Rewritten as: T = 27 - (V - 0.706) * (1/0.001721)
+    // Pre-computed: 1/0.001721 = 581.057...
+    static const float INV_SLOPE = 1.0f / 0.001721f;
+    float temperature = 27.0f - (voltage - 0.706f) * INV_SLOPE;
     
     return temperature;
 }
@@ -311,6 +297,12 @@ static void button_task(void) {
             // Reset ferrum line buffer on mode change
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
+            // Flash NeoPixel with API-mode color (zero CPU — handled by DMA ISR)
+            switch (current_api_mode) {
+                case API_MODE_KMBOX: neopixel_dma_activity_flash_ms(LED_COLOR_API_KMBOX, 400);  break;
+                case API_MODE_MAKCU: neopixel_dma_activity_flash_ms(LED_COLOR_API_MAKCU, 400);  break;
+                case API_MODE_FERRUM: neopixel_dma_activity_flash_ms(LED_COLOR_API_FERRUM, 400); break;
+            }
         } else {
             // Long press: cycle humanization mode on KMBox
             uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
@@ -452,8 +444,9 @@ static void uart_rx_task(void) {
     // Cache timestamp ONCE at start, not per-byte (saves ~50 cycles per byte)
     const uint32_t now = to_ms_since_boot(get_absolute_time());
     
-    // Batch read up to 64 bytes at once from DMA ring buffer (single memcpy)
-    uint8_t rx_batch[64];
+    // Batch read up to 128 bytes at once from DMA ring buffer (single memcpy)
+    // At 3 Mbaud / 240MHz, larger batches reduce per-byte overhead
+    uint8_t rx_batch[128];
     size_t batch_count = hw_uart_read(rx_batch, sizeof(rx_batch));
     if (batch_count == 0) return;
     
@@ -1161,80 +1154,36 @@ static void set_status(bridge_status_t new_status) {
     }
 }
 
+/**
+ * @brief Update NeoPixel status — zero CPU cost.
+ *
+ * This only writes a volatile enum.  All color math, breathing, and DMA
+ * transfers happen inside the neopixel_dma 30 Hz timer ISR.
+ */
 static void update_status_neopixel(void) {
-    static uint32_t last_update = 0;
-    static uint8_t activity_countdown = 0;
-    static uint8_t brightness = 255;
-    static int8_t brightness_dir = -2;
-    uint32_t now = time_us_32();
-    
-    if (activity_countdown > 0) {
-        ws2812_put_rgb(LED_COLOR_ACTIVITY);
-        activity_countdown--;
-        return;
-    }
-    
-    if (now - last_update < 50000) return;
-    last_update = now;
-    
+    // Determine the logical status (same logic as before)
     if (!tracker_is_enabled()) {
         set_status(STATUS_DISABLED);
     } else if (frame_ready) {
         set_status(STATUS_TRACKING);
-        activity_countdown = 2;
+        // Brief activity flash on new frame (handled entirely in ISR)
+        neopixel_dma_activity_flash(LED_COLOR_ACTIVITY);
     } else if (tud_cdc_connected()) {
         set_status(STATUS_CDC_CONNECTED);
     } else {
         set_status(STATUS_IDLE);
     }
-    
-    bool apply_breathing = (current_status == STATUS_BOOTING || 
-                           current_status == STATUS_IDLE ||
-                           current_status == STATUS_ERROR);
-    
-    if (apply_breathing) {
-        brightness += brightness_dir;
-        if (brightness <= 50) {
-            brightness = 50;
-            brightness_dir = 2;
-        } else if (brightness >= 255) {
-            brightness = 255;
-            brightness_dir = -2;
-        }
-    } else {
-        brightness = 255;
-    }
-    
-    uint8_t r, g, b;
-    switch (current_status) {
-        case STATUS_BOOTING:
-            r = 0; g = 0; b = 255;
-            break;
-        case STATUS_IDLE:
-            r = 255; g = 0; b = 0;
-            break;
-        case STATUS_CDC_CONNECTED:
-            r = 0; g = 255; b = 255;
-            break;
-        case STATUS_TRACKING:
-            r = 0; g = 255; b = 0;
-            break;
-        case STATUS_DISABLED:
-            r = 255; g = 255; b = 0;
-            break;
-        case STATUS_ERROR:
-        default:
-            r = 255; g = 0; b = 0;
-            break;
-    }
-    
-    if (apply_breathing) {
-        r = (r * brightness) / 255;
-        g = (g * brightness) / 255;
-        b = (b * brightness) / 255;
-    }
-    
-    ws2812_put_rgb(r, g, b);
+
+    // Map bridge status → neopixel_dma status (single volatile store)
+    static const neo_status_t status_map[] = {
+        [STATUS_BOOTING]       = NEO_STATUS_BOOTING,
+        [STATUS_IDLE]          = NEO_STATUS_IDLE,
+        [STATUS_CDC_CONNECTED] = NEO_STATUS_CDC_CONNECTED,
+        [STATUS_TRACKING]      = NEO_STATUS_TRACKING,
+        [STATUS_DISABLED]      = NEO_STATUS_DISABLED,
+        [STATUS_ERROR]         = NEO_STATUS_ERROR,
+    };
+    neopixel_dma_set_status(status_map[current_status]);
 }
 
 // ============================================================================
@@ -1340,8 +1289,9 @@ static void tft_submit_stats_task(void) {
 // ============================================================================
 
 int main(void) {
-    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.20V
-    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.25V
+    // (matches KMBox voltage for stable 240MHz under load with TFT+DMA+USB)
+    vreg_set_voltage(VREG_VOLTAGE_1_25);
     sleep_ms(10);  // Let voltage stabilize
     set_sys_clock_khz(240000, true);
     
@@ -1358,7 +1308,7 @@ int main(void) {
     adc_set_temp_sensor_enabled(true);
     
     // Initialize peripherals (fast init only)
-    ws2812_init();
+    neopixel_dma_init(pio0, WS2812_PIN);  // DMA-driven NeoPixel (zero CPU in hot path)
     button_init();
     hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
     latency_tracker_init(); // Initialize latency tracking
@@ -1370,9 +1320,9 @@ int main(void) {
     // Initialize tracker
     tracker_init();
     
-    // Initial LED state
-    ws2812_put_rgb(LED_COLOR_BOOTING);
+    // Initial LED state (neopixel_dma_init already shows booting blue)
     set_status(STATUS_BOOTING);
+    neopixel_dma_set_status(NEO_STATUS_BOOTING);
     
     // TinyUSB initialization - MUST happen early for CDC to enumerate
     tusb_init();
@@ -1418,6 +1368,12 @@ int main(void) {
             current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
+            // Flash NeoPixel with API-mode color (zero CPU — handled by DMA ISR)
+            switch (current_api_mode) {
+                case API_MODE_KMBOX: neopixel_dma_activity_flash_ms(LED_COLOR_API_KMBOX, 400);  break;
+                case API_MODE_MAKCU: neopixel_dma_activity_flash_ms(LED_COLOR_API_MAKCU, 400);  break;
+                case API_MODE_FERRUM: neopixel_dma_activity_flash_ms(LED_COLOR_API_FERRUM, 400); break;
+            }
             printf("[Bridge] Touch: API mode -> %d\n", (int)current_api_mode);
         }
         

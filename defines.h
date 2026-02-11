@@ -17,7 +17,7 @@
 // Higher = less frequent time checks (less overhead, slightly delayed task execution)
 // Valid values: 8, 16, 32, 64, 128
 #ifndef MAIN_LOOP_TIME_SAMPLE_INTERVAL
-#define MAIN_LOOP_TIME_SAMPLE_INTERVAL  16
+#define MAIN_LOOP_TIME_SAMPLE_INTERVAL  8   // 8 at 240MHz (overhead is ~4ns/call)
 #endif
 
 // RP2350 DSP instructions for fixed-point math (Cortex-M33 SMULL)
@@ -72,14 +72,15 @@
 #define KMBOX_UART              uart0    // UART0 instance
 #define KMBOX_UART_TX_PIN       PICO_DEFAULT_UART_TX_PIN    // UART0 TX (to Bridge RX)
 #define KMBOX_UART_RX_PIN       PICO_DEFAULT_UART_RX_PIN    // UART0 RX (from Bridge TX)
-#define KMBOX_UART_BAUDRATE     2000000  // Baud rate (must match bridge) - 2 Mbaud for max throughput
+#define KMBOX_UART_BAUDRATE     3000000  // Baud rate (must match bridge) - 3 Mbaud for max throughput
+                                        // At 48MHz clk_peri: 48000000/3000000 = 16 (exact, 0 ppm error)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
 //--------------------------------------------------------------------+
 // FAST BINARY COMMAND PROTOCOL
 //--------------------------------------------------------------------+
 // Ultra-fast binary protocol for minimal latency mouse/keyboard control
-// At 2 Mbps: 8 bytes takes only ~40µs vs ~700µs at 115200
+// At 3 Mbps: 8 bytes takes only ~27µs vs ~700µs at 115200
 //
 // Memory-aligned 8-byte packets enable single-cycle struct access
 // Clock-synchronized processing for deterministic timing
@@ -345,9 +346,9 @@ _Static_assert(sizeof(fast_packet_t) == 8, "fast_packet_t must be 8 bytes");
 //--------------------------------------------------------------------+
 
 #define WATCHDOG_HEARTBEAT_INTERVAL_MS  1000    // Watchdog heartbeat interval
-#define WATCHDOG_HARDWARE_TIMEOUT_MS    90000   // Hardware watchdog timeout
-#define WATCHDOG_CORE_TIMEOUT_MS        30000   // Inter-core heartbeat timeout
-#define WATCHDOG_UPDATE_INTERVAL_MS     5000    // How often to update hardware watchdog
+#define WATCHDOG_HARDWARE_TIMEOUT_MS    16000   // Hardware watchdog timeout (reduced from 90s for faster hang recovery)
+#define WATCHDOG_CORE_TIMEOUT_MS        10000   // Inter-core heartbeat timeout (reduced from 30s for faster hang recovery)
+#define WATCHDOG_UPDATE_INTERVAL_MS     1000    // How often to update hardware watchdog (reduced from 5s for faster hang recovery)
 #define WATCHDOG_ENABLE_HARDWARE        1       // Enable hardware watchdog
 #define WATCHDOG_ENABLE_INTER_CORE      1       // Enable inter-core monitoring
 #define WATCHDOG_ENABLE_DEBUG           0       // Disable debug output for cold boot

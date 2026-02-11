@@ -63,6 +63,16 @@ void humanization_get_tremor(float scale, float *perp_x, float *perp_y) {
     // arguments well within float32 precision.
     float t = (float)(g_tremor_phase % 100000u) * 0.001f;
     
+    // Pre-computed angular frequency constants (2*PI*freq)
+    // Eliminates 6 runtime multiplications per call at 240MHz.
+    // M33 FPU executes fmaf() as single VFMA.F32 instruction.
+    static const float W_X1 = 8.7f  * (2.0f * (float)M_PI);  // ~54.67 rad/s
+    static const float W_X2 = 12.3f * (2.0f * (float)M_PI);  // ~77.28 rad/s
+    static const float W_X3 = 19.1f * (2.0f * (float)M_PI);  // ~120.01 rad/s
+    static const float W_Y1 = 9.4f  * (2.0f * (float)M_PI);  // ~59.06 rad/s
+    static const float W_Y2 = 13.7f * (2.0f * (float)M_PI);  // ~86.08 rad/s
+    static const float W_Y3 = 17.8f * (2.0f * (float)M_PI);  // ~111.84 rad/s
+    
     // FIX: Use fixed offsets for X/Y decorrelation instead of accumulating
     // secondary phases. The old approach doubled the effective frequency
     // because both t and g_tremor_phase_x advanced by 0.001 per call.
@@ -71,21 +81,22 @@ void humanization_get_tremor(float scale, float *perp_x, float *perp_y) {
     // Physiological hand tremor is 8-25Hz, these ratios are irrational
     // so the composite waveform has no clean repeat period
     float tx = t + 0.7f;  // Fixed offset for X channel
-    float tremor_x = sinf(tx * 8.7f  * (2.0f * M_PI)) * 0.40f   // ~8.7Hz primary
-                   + sinf(tx * 12.3f * (2.0f * M_PI)) * 0.25f   // ~12.3Hz secondary  
-                   + sinf(tx * 19.1f * (2.0f * M_PI)) * 0.15f;  // ~19.1Hz tertiary
+    float tremor_x = sinf(tx * W_X1) * 0.40f    // ~8.7Hz primary
+                   + sinf(tx * W_X2) * 0.25f    // ~12.3Hz secondary  
+                   + sinf(tx * W_X3) * 0.15f;   // ~19.1Hz tertiary
     
     // Add LFSR noise component (breaks any remaining periodicity)
-    tremor_x += jitter_next() * 0.3f;
+    // Use fmaf for fused multiply-add -> single VFMA.F32 on M33
+    tremor_x = fmaf(jitter_next(), 0.3f, tremor_x);
     
     // Y-axis tremor: Different fixed offset for decorrelation
     float ty = t + 1.3f;  // Different offset than X
-    float tremor_y = sinf(ty * 9.4f  * (2.0f * M_PI)) * 0.40f   // ~9.4Hz primary
-                   + sinf(ty * 13.7f * (2.0f * M_PI)) * 0.25f   // ~13.7Hz secondary
-                   + sinf(ty * 17.8f * (2.0f * M_PI)) * 0.15f;  // ~17.8Hz tertiary
+    float tremor_y = sinf(ty * W_Y1) * 0.40f    // ~9.4Hz primary
+                   + sinf(ty * W_Y2) * 0.25f    // ~13.7Hz secondary
+                   + sinf(ty * W_Y3) * 0.15f;   // ~17.8Hz tertiary
     
-    // Add independent LFSR noise
-    tremor_y += jitter_next() * 0.3f;
+    // Add independent LFSR noise (fused multiply-add)
+    tremor_y = fmaf(jitter_next(), 0.3f, tremor_y);
     
     // Apply scale and clamp to reasonable range
     *perp_x = tremor_x * scale;

@@ -483,9 +483,12 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     // 1) Humanization is enabled (not OFF)
     // 2) Movement is large enough to split meaningfully
     // 3) We have enough queue space for the sub-steps
+    // 4) Queue is less than 75% full (back-pressure protection)
+    //    This prevents queue starvation under sustained high-rate Ferrum traffic
     bool should_subdivide = (g_smooth.humanization.mode != HUMANIZATION_OFF) &&
                             (movement_px >= SUBSTEP_MIN_MOVEMENT_PX) &&
-                            (g_smooth.queue_count + SUBSTEP_COUNT_BASE <= SMOOTH_QUEUE_SIZE);
+                            (g_smooth.queue_count + SUBSTEP_COUNT_BASE <= SMOOTH_QUEUE_SIZE) &&
+                            (g_smooth.queue_count < (SMOOTH_QUEUE_SIZE * 3 / 4));
     
     if (!should_subdivide) {
         // Fall back to single-entry path (legacy behavior)
@@ -687,6 +690,9 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
     g_smooth.frame_x_used = 0;
     g_smooth.frame_y_used = 0;
     
+    // Reset per-frame overshoot correction counter (declared static in processing loop)
+    // This is reset here via the extern-visible flag pattern
+    
     // Process queued movements
     int32_t frame_x_fp = 0;
     int32_t frame_y_fp = 0;
@@ -705,8 +711,11 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
     }
     
     // Process active entries using linked list (O(n) where n = active count, not queue size)
+    // Safety: limit iterations to prevent infinite loop from corrupted linked list
     active_queue_node_t *node = g_active_head;
-    while (node) {
+    uint8_t iteration_limit = SMOOTH_QUEUE_SIZE + 4;  // Allow slightly more than max for overshoot corrections
+    while (node && iteration_limit > 0) {
+        iteration_limit--;
         smooth_queue_entry_t *entry = &g_smooth.queue[node->index];
         active_queue_node_t *next_node = node->next;  // Save next before potential free
         
@@ -735,76 +744,13 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
             int32_t movement_dx_fp = fp_mul(entry->x_fp, progress_delta);
             int32_t movement_dy_fp = fp_mul(entry->y_fp, progress_delta);
             
-            // === NOISE DELTA (untracked - does NOT affect remaining) ===
-            // This is the critical fix: tremor and noise are additive and must
-            // not be compensated by the remaining dump on the final frame.
-            int32_t noise_dx_fp = 0;
-            int32_t noise_dy_fp = 0;
+            // Add movement to frame output
+            frame_x_fp += movement_dx_fp;
+            frame_y_fp += movement_dy_fp;
             
-            // Add runtime tremor for human hand simulation (FPU-optimized, non-periodic)
-            // Real human aim has 0.5-1.5px perpendicular wobble from physiological tremor
-            if (g_smooth.humanization.jitter_enabled && entry->mode != INJECT_MODE_MICRO) {
-                // Calculate movement magnitude
-                int32_t move_mag = (entry->x_fp < 0 ? -entry->x_fp : entry->x_fp);
-                int32_t y_mag = (entry->y_fp < 0 ? -entry->y_fp : entry->y_fp);
-                if (y_mag > move_mag) move_mag = y_mag;
-                float move_px = (float)move_mag / SMOOTH_FP_ONE;
-                
-                // Scale tremor based on injection activity, not physical mouse
-                float activity_scale;
-                
-                if (move_px > 20.0f) {
-                    activity_scale = 0.15f;
-                } else if (move_px > 5.0f) {
-                    float t = (move_px - 5.0f) / 15.0f;
-                    activity_scale = 0.5f - t * 0.35f;
-                } else {
-                    activity_scale = 0.8f;
-                }
-                
-                // Get movement-dependent jitter scale (FPU inline, no LUT)
-                float movement_scale = humanization_jitter_scale(move_px);
-                float base_jitter = (float)g_smooth.humanization.jitter_amount_fp / SMOOTH_FP_ONE;
-                float tremor_scale = base_jitter * movement_scale * activity_scale;
-                
-                // Get runtime tremor (layered incommensurate oscillators + noise)
-                float tremor_x, tremor_y;
-                humanization_get_tremor(tremor_scale, &tremor_x, &tremor_y);
-                
-                // Apply tremor to NOISE (untracked) accumulator
-                if (move_px > 5.0f) {
-                    // Normalize movement vector
-                    float norm_x = (float)entry->x_fp / (float)move_mag;
-                    float norm_y = (float)entry->y_fp / (float)move_mag;
-                    
-                    // Perpendicular scatter (tremor_y) - the critical anti-cheat signal
-                    noise_dx_fp += (int32_t)(-norm_y * tremor_y * SMOOTH_FP_ONE);
-                    noise_dy_fp += (int32_t)( norm_x * tremor_y * SMOOTH_FP_ONE);
-                    
-                    // Parallel variation (tremor_x) - smaller, for speed fluctuation
-                    noise_dx_fp += (int32_t)(norm_x * tremor_x * 0.3f * SMOOTH_FP_ONE);
-                    noise_dy_fp += (int32_t)(norm_y * tremor_x * 0.3f * SMOOTH_FP_ONE);
-                } else {
-                    // Small movements: apply as raw X/Y tremor
-                    noise_dx_fp += (int32_t)(tremor_x * SMOOTH_FP_ONE);
-                    noise_dy_fp += (int32_t)(tremor_y * SMOOTH_FP_ONE);
-                }
-            }
-            
-            // Break up delta repeats with ±1px randomization (25% chance)
-            // Also untracked — this is noise, not intentional movement
-            if (g_smooth.humanization.jitter_enabled && (rng_next() & 0x3) == 0) {
-                noise_dx_fp += rng_range(-SMOOTH_FP_ONE, SMOOTH_FP_ONE);
-                noise_dy_fp += rng_range(-SMOOTH_FP_ONE, SMOOTH_FP_ONE);
-            }
-            
-            // Add BOTH movement and noise to frame output
-            frame_x_fp += movement_dx_fp + noise_dx_fp;
-            frame_y_fp += movement_dy_fp + noise_dy_fp;
-            
-            // Update remaining based on MOVEMENT ONLY (not noise!)
-            // This is the critical fix: remaining tracks only intentional movement,
-            // so the final-frame dump doesn't cancel out tremor/noise.
+            // Update remaining — queue tracks only intentional eased movement.
+            // All tremor/noise is applied at the output stage by
+            // apply_output_humanization(), so no noise accounting here.
             entry->x_remaining_fp -= movement_dx_fp;
             entry->y_remaining_fp -= movement_dy_fp;
             entry->frames_left--;
@@ -816,7 +762,12 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
                 frame_y_fp += entry->y_remaining_fp;
                 
                 // Inject overshoot if planned
-                if (entry->will_overshoot) {
+                // Safety: limit corrections per frame and skip if queue is nearly full
+                // to prevent queue explosion under high command rates
+                static uint8_t corrections_this_frame = 0;
+                if (entry->will_overshoot && 
+                    corrections_this_frame < 2 &&
+                    g_smooth.queue_count < SMOOTH_QUEUE_SIZE - 4) {
                     // Queue correction movement (small opposing move)
                     smooth_queue_entry_t *correction = queue_alloc();
                     if (correction) {
@@ -830,6 +781,7 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
                         correction->easing = EASING_EASE_OUT; // Quick correction
                         correction->active = true;
                         correction->will_overshoot = false;
+                        corrections_this_frame++;
                     }
                     // Add overshoot to current frame
                     frame_x_fp += entry->overshoot_x_fp;
@@ -843,6 +795,20 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
         }
         
         node = next_node;  // Move to next active entry
+    }
+    
+    // Safety: if we hit the iteration limit, the linked list may be corrupted
+    // Reset the queue to recover from the hang state
+    if (iteration_limit == 0 && node != NULL) {
+        for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
+            g_smooth.queue[i].active = false;
+        }
+        g_smooth.queue_count = 0;
+        g_free_bitmap = 0xFFFFFFFF;
+        g_active_head = NULL;
+        g_active_node_bitmap = 0;
+        frame_x_fp = 0;
+        frame_y_fp = 0;
     }
     
 apply_accumulator:

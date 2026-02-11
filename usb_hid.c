@@ -280,6 +280,16 @@ static usb_error_tracker_t usb_error_tracker = {0};
 static bool usb_device_initialized = false;
 static bool usb_host_initialized = false;
 
+// Track the last button byte sent to the host across ALL report paths
+// (physical mouse forwarding, kmbox injection, smooth injection).
+// Used by hid_device_task() to detect button-only changes that need
+// an immediate report — a real mouse sends button changes on the very
+// next poll.
+static volatile uint8_t last_sent_buttons = 0;
+// Track whether the previous cycle had activity, so we can send one
+// final zero-delta "stop" report on the active→idle edge.
+static volatile bool was_active = false;
+
 // Device management helpers
 static void handle_device_disconnection(uint8_t dev_addr);
 static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol);
@@ -501,19 +511,9 @@ static __force_inline int8_t clamp_i8(int32_t val) {
  * @param y Pointer to Y movement (modified in place)
  */
 static void apply_output_humanization(int16_t *x, int16_t *y) {
-    // Skip if humanization disabled or no movement
+    // Skip only if humanization is completely disabled
     humanization_mode_t mode = smooth_get_humanization_mode();
-    if (mode == HUMANIZATION_OFF || (*x == 0 && *y == 0)) {
-        return;
-    }
-    
-    // Calculate movement magnitude for scale calculation
-    float fx = (float)(*x);
-    float fy = (float)(*y);
-    float magnitude = sqrtf(fx * fx + fy * fy);
-    
-    // Don't humanize very small movements (< 2 pixels) - likely already jittered
-    if (magnitude < 2.0f) {
+    if (mode == HUMANIZATION_OFF) {
         return;
     }
     
@@ -526,9 +526,10 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
         return;
     }
     
-    // Calculate tremor scale based on movement magnitude and humanization level
-    float movement_scale = humanization_jitter_scale(magnitude);
-    float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
+    // Calculate movement magnitude
+    float fx = (float)(*x);
+    float fy = (float)(*y);
+    float magnitude = sqrtf(fx * fx + fy * fy);
     
     // Mode-dependent intensity scaling
     float mode_scale = 1.0f;
@@ -546,28 +547,37 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
             break;
     }
     
+    // Calculate tremor scale — use movement_scale for moving cursor,
+    // idle-level tremor for zero/micro movement (the anti-cheat sweet spot)
+    float movement_scale = humanization_jitter_scale(magnitude);
+    float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
     float tremor_scale = base_jitter * movement_scale * mode_scale;
     
     // Get runtime tremor (layered oscillators + noise)
     float tremor_x, tremor_y;
     humanization_get_tremor(tremor_scale, &tremor_x, &tremor_y);
     
-    // Apply perpendicular scatter (the critical anti-cheat signal)
-    // Normalize movement vector
-    float norm_x = fx / magnitude;
-    float norm_y = fy / magnitude;
-    
-    // Perpendicular component (tremor_y) - primary humanization signal
-    float perp_dx = -norm_y * tremor_y;
-    float perp_dy = norm_x * tremor_y;
-    
-    // Parallel component (tremor_x) - speed variation (smaller)
-    float para_dx = norm_x * tremor_x * 0.3f;
-    float para_dy = norm_y * tremor_x * 0.3f;
-    
-    // Apply tremor to output (with rounding)
-    *x = (int16_t)(*x + (int16_t)(perp_dx + para_dx + 0.5f));
-    *y = (int16_t)(*y + (int16_t)(perp_dy + para_dy + 0.5f));
+    if (magnitude > 2.0f) {
+        // Moving cursor: perpendicular + parallel decomposition
+        float norm_x = fx / magnitude;
+        float norm_y = fy / magnitude;
+        
+        // Perpendicular component (tremor_y) - primary humanization signal
+        float perp_dx = -norm_y * tremor_y;
+        float perp_dy = norm_x * tremor_y;
+        
+        // Parallel component (tremor_x) - speed variation (smaller)
+        float para_dx = norm_x * tremor_x * 0.3f;
+        float para_dy = norm_y * tremor_x * 0.3f;
+        
+        // Apply tremor to output (with rounding)
+        *x = (int16_t)(*x + (int16_t)(perp_dx + para_dx + 0.5f));
+        *y = (int16_t)(*y + (int16_t)(perp_dy + para_dy + 0.5f));
+    } else {
+        // Idle / micro-movement: apply tremor as raw X/Y (no direction to decompose)
+        *x += (int16_t)(tremor_x + 0.5f);
+        *y += (int16_t)(tremor_y + 0.5f);
+    }
 }
 
 // Minimal HID descriptor parser — extracts report field layout for the mouse
@@ -1443,6 +1453,9 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         my += smooth_y;
     }
 
+    // Apply output-stage humanization (tremor) — single point for all paths
+    apply_output_humanization(&mx, &my);
+
     // --- Check endpoint readiness ---
     if (!tud_hid_ready()) {
         // Re-accumulate raw (pre-smooth) movement to avoid losing it
@@ -1573,9 +1586,16 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         uint8_t out_buf[16];  // 16-bit report: 2 bytes buttons + 2 bytes X + 2 bytes Y + 1 byte wheel + 1 byte pan = 8 bytes
         build_raw_mouse_report(out_buf, sizeof(out_buf), &output_mouse_layout_16bit,
                               btn_send, mx, my, mwheel, mpan);
+        // Keep file-scope button/activity state in sync for hid_device_task()
+        last_sent_buttons = btn_send;
+        was_active = true;
         return tud_hid_report(REPORT_ID_MOUSE, out_buf, output_mouse_layout_16bit.report_size);
     }
     
+    // Keep file-scope button/activity state in sync for hid_device_task()
+    last_sent_buttons = btn_send;
+    was_active = true;
+
     uint8_t rid = L->has_report_id ? L->mouse_report_id : REPORT_ID_MOUSE;
     return tud_hid_report(rid, buf, raw_len);
 }
@@ -1664,6 +1684,11 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
 
     // Send the report
     bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons_to_send, final_x, final_y, final_wheel, pan);
+    if (success) {
+        // Keep file-scope button/activity state in sync for hid_device_task()
+        last_sent_buttons = buttons_to_send;
+        was_active = true;
+    }
     return success;
 }
 
@@ -1758,6 +1783,12 @@ void hid_device_task(void)
         return;
     }
 
+    // --- Track last-sent button state for change detection ---
+    // Real mice send a report immediately on button state changes.
+    // A bridge-injected click with no movement must trigger a report
+    // on the very next poll — otherwise the delay is detectably wrong.
+    // (last_sent_buttons / was_active are file-scope for cross-path sync)
+
     // Flush pending bridge/smooth movements from Core0
     // CRITICAL: When a physical mouse IS connected, Core1 handles physical movement
     // via process_mouse_report_internal() which drains kmbox accumulators.
@@ -1768,8 +1799,13 @@ void hid_device_task(void)
     {
         bool has_kmbox = kmbox_has_pending_movement();
         bool has_smooth = smooth_has_pending();
-        
-        if (!has_kmbox && !has_smooth) goto skip_flush;
+        // Cheaply read current button byte without draining accumulators
+        uint8_t current_buttons = kmbox_get_current_buttons();
+        bool buttons_changed = (current_buttons != last_sent_buttons);
+
+        bool has_pending = has_kmbox || has_smooth || buttons_changed;
+
+        if (!has_pending) goto check_idle;
         
         if (!connection_state.mouse_connected)
         {
@@ -1790,7 +1826,9 @@ void hid_device_task(void)
             // This ensures ALL movements (kmbox, smooth, physical) get tremor
             apply_output_humanization(&x, &y);
             
-            if (x != 0 || y != 0 || wheel != 0 || buttons != 0) {
+            // Send if there's any movement, wheel, OR button state to report.
+            // Button-only changes (clicks with no movement) must send immediately.
+            if (x != 0 || y != 0 || wheel != 0 || buttons != 0 || buttons_changed) {
                 // When we have a cloned gaming mouse layout, build a raw report
                 // that matches the descriptor format.  Otherwise use the standard API.
                 if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
@@ -1806,51 +1844,91 @@ void hid_device_task(void)
                 } else {
                     tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
                 }
+                last_sent_buttons = buttons;
+                was_active = true;
                 return;
             }
         }
-        else if (has_smooth)
+        else
         {
-            // Physical mouse IS connected — only send standalone smooth injection.
-            // Do NOT drain kmbox accumulators (Core1 owns those).
+            // Physical mouse IS connected.
+            // Handle smooth injection OR button-only changes from bridge commands.
+            // Do NOT drain kmbox movement accumulators (Core1 owns those via
+            // forward_raw_mouse_report / process_mouse_report_internal).
             int8_t smooth_x = 0, smooth_y = 0;
-            smooth_process_frame(&smooth_x, &smooth_y);
-            
+            if (has_smooth) {
+                smooth_process_frame(&smooth_x, &smooth_y);
+            }
+
             // Convert to int16_t for humanization
             int16_t x16 = smooth_x;
             int16_t y16 = smooth_y;
-            
-            // *** CRITICAL FIX: Apply humanization to smooth injection too ***
-            apply_output_humanization(&x16, &y16);
-            
+
+            // Apply humanization to smooth injection
             if (x16 != 0 || y16 != 0) {
+                apply_output_humanization(&x16, &y16);
+            }
+
+            if (x16 != 0 || y16 != 0 || buttons_changed) {
+                // Use current_buttons so button-only bridge clicks get sent
+                // even when the physical mouse is idle.
                 if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
                     uint8_t raw[64];
                     uint8_t sz = host_mouse_layout.report_size;
                     if (sz > sizeof(raw)) sz = sizeof(raw);
 
                     build_raw_mouse_report(raw, sz, &host_mouse_layout,
-                                           0, x16, y16, 0, 0);
+                                           current_buttons, x16, y16, 0, 0);
 
                     uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
                     tud_hid_report(rid, raw, sz);
                 } else {
-                    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, (int8_t)x16, (int8_t)y16, 0, 0);
+                    tud_hid_mouse_report(REPORT_ID_MOUSE, current_buttons, (int8_t)x16, (int8_t)y16, 0, 0);
                 }
+                last_sent_buttons = current_buttons;
+                was_active = true;
                 return;
             }
         }
     }
-skip_flush:
+check_idle:
 
-    // Only send reports when devices are not connected
+    // --- Active → idle edge: send one final zero-delta stop report ---
+    // Real mice send a last report with zero deltas (confirming the stop)
+    // before they begin NAKing idle polls.  Mirror that behavior here.
+    if (was_active && tud_hid_ready())
+    {
+        uint8_t current_buttons = kmbox_get_current_buttons();
+        if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
+            uint8_t raw[64];
+            uint8_t sz = host_mouse_layout.report_size;
+            if (sz > sizeof(raw)) sz = sizeof(raw);
+
+            build_raw_mouse_report(raw, sz, &host_mouse_layout,
+                                   current_buttons, 0, 0, 0, 0);
+
+            uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
+            tud_hid_report(rid, raw, sz);
+        } else {
+            tud_hid_mouse_report(REPORT_ID_MOUSE, current_buttons, 0, 0, 0, 0);
+        }
+        last_sent_buttons = current_buttons;
+        was_active = false;
+        return;
+    }
+
+    // --- Truly idle: NAK naturally (no report sent) ---
+    // When the mouse is idle, real mice NAK interrupt IN polls.
+    // Sending continuous zero reports when the real device wouldn't is
+    // itself a fingerprint.  So we intentionally do nothing here when
+    // a physical mouse is connected.
+
+    // Only send fallback reports when NO devices are connected at all
+    // (standalone mode without a physical mouse/keyboard attached).
     if (!connection_state.mouse_connected && !connection_state.keyboard_connected)
     {
         send_hid_report(REPORT_ID_MOUSE);
     }
-    // Note: No need to send periodic empty consumer control reports
-    // when devices are connected — HID connections are maintained by
-    // the regular mouse/keyboard reports from the physical devices.
 }
 
 void send_hid_report(uint8_t report_id)

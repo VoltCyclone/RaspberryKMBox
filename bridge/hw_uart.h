@@ -21,7 +21,7 @@
 #include "pico/types.h"
 
 // DMA buffer sizes (must be power of 2 for ring buffer)
-#define HW_UART_TX_BUFFER_SIZE  256
+#define HW_UART_TX_BUFFER_SIZE  512     // 512B for burst TX at 3 Mbaud
 #define HW_UART_RX_BUFFER_SIZE  PICO_STDIO_STACK_BUFFER_SIZE
 
 /**

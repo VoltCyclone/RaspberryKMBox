@@ -85,9 +85,14 @@ pico_set_program_version(PIOKMbox "0.1")
 pico_enable_stdio_uart(PIOKMbox 1)
 pico_enable_stdio_usb(PIOKMbox 0)
 
-# Optimization flags for release performance
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+# Optimization flags for release performance at 240MHz
+# -O3: Aggressive inlining and vectorization
+# -ffast-math: Enable FPU VFMA (fused multiply-add) instructions on Cortex-M33
+# -funroll-loops: Unroll tight inner loops (helps DMA/UART processing)
+# -ffunction-sections -fdata-sections: Enable dead code elimination with --gc-sections
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -ffast-math -funroll-loops -ffunction-sections -fdata-sections")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -funroll-loops -ffunction-sections -fdata-sections")
+target_link_options(PIOKMbox PRIVATE -Wl,--gc-sections)
 
 # Add the standard library to the build
 target_link_libraries(PIOKMbox

@@ -24,6 +24,13 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# Optimization flags for 240MHz Cortex-M33 with hardware FPU
+# -ffast-math: Enable VFMA (fused multiply-add) on M33 FPV5 FPU
+# -funroll-loops: Unroll tight pixel processing loops in tracker
+# -ffunction-sections -fdata-sections: Dead code elimination
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -ffast-math -funroll-loops -ffunction-sections -fdata-sections")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -funroll-loops -ffunction-sections -fdata-sections")
+
 # Detect board and configure TFT driver + pins
 if(PICO_BOARD STREQUAL "adafruit_metro_rp2350")
     set(TFT_DRIVER_NAME "ILI9341")
@@ -67,6 +74,7 @@ add_executable(kmbox_bridge
     makcu_translator.c
     ferrum_translator.c
     protocol_luts.c
+    neopixel_dma.c
     tft_display.c
     tft.c
     st7735.c
@@ -97,6 +105,7 @@ target_link_libraries(kmbox_bridge
     pico_multicore
     kmbox_commands
 )
+target_link_options(kmbox_bridge PRIVATE -Wl,--gc-sections)
 
 # Add custom TinyUSB configuration and board-specific TFT pin definitions
 target_compile_definitions(kmbox_bridge PRIVATE

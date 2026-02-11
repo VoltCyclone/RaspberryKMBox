@@ -136,6 +136,9 @@ static bool led_refresh_timer_callback(struct repeating_timer *t)
 
     // Only DMA-push if there's something in the shadow register and channel is idle
     if (s_led_shadow_grb != 0 && s_led_dma_chan >= 0 && !dma_channel_is_busy(s_led_dma_chan)) {
+        // Re-arm transfer count to 1 before triggering — after the previous
+        // transfer completes, trans_count is 0 and triggering does nothing.
+        dma_channel_set_trans_count(s_led_dma_chan, 1, false);
         dma_channel_set_read_addr(s_led_dma_chan, (const volatile void *)&s_led_shadow_grb, true);
     }
     return true; // keep repeating

@@ -77,7 +77,7 @@ static int uart_rx_dma_chan = -1;
 // Stages data into a linear buffer, then fires a DMA transfer.
 // Much faster than per-byte IRQ TX at 2 Mbaud.
 //--------------------------------------------------------------------+
-#define DMA_TX_BUFFER_SIZE  512
+#define DMA_TX_BUFFER_SIZE  1024
 static uint8_t dma_tx_buffer[DMA_TX_BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile uint16_t dma_tx_len = 0;
 static int uart_tx_dma_chan = -1;
@@ -216,14 +216,15 @@ static bool uart_send_bytes(const uint8_t *data, size_t len) {
     
     // DMA TX path: zero-CPU transmission
     if (uart_tx_dma_chan >= 0) {
-        // Wait for previous DMA transfer to complete (should be very fast at 2Mbaud)
-        // Spin briefly — at 2Mbaud, 256 bytes takes ~1.3ms max
-        uint32_t timeout = time_us_32() + 2000;  // 2ms safety timeout
+        // Wait for previous DMA transfer to complete (should be very fast at 3Mbaud)
+        // Reduced timeout to 500µs to prevent starving tud_task() under burst traffic
+        // At 3Mbaud, 256 bytes takes ~0.85ms max; most packets are 8 bytes (~27µs)
+        uint32_t timeout = time_us_32() + 500;  // 500µs safety timeout
         while (dma_tx_busy && time_us_32() < timeout) {
             tight_loop_contents();
         }
         if (dma_tx_busy) {
-            // DMA still busy after timeout — drop the data
+            // DMA still busy after timeout — drop the data to avoid blocking
             g_uart_tx_dropped += len;
             return false;
         }
@@ -994,7 +995,9 @@ void kmbox_serial_task(void) {
     
     // Process RX buffer — drain up to 16 packets per call to avoid
     // starving tud_task() while still batch-processing bursts efficiently.
-    // At 2 Mbaud with 8-byte packets, 16 packets = ~640µs of buffer.
+    // Reduced from 32 to 16 to prevent core0 starvation under high-rate
+    // Ferrum traffic with full humanization (each move subdivides into 5-8 queue entries).
+    // At 3 Mbaud with 8-byte packets, 16 packets = ~427µs of buffer.
     uint8_t packets_processed = 0;
     const uint8_t MAX_PACKETS_PER_CALL = 16;
     

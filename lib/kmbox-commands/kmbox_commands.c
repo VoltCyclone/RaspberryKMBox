@@ -1312,6 +1312,29 @@ bool kmbox_has_pending_movement(void)
             g_kmbox_state.wheel_accumulator != 0);
 }
 
+bool kmbox_has_forced_buttons(void)
+{
+    // Check if any button is currently forced by a bridge/kmbox command.
+    // Unrolled for performance — KMBOX_BUTTON_COUNT is always 5.
+    return g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_forced  |
+           g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_forced |
+           g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_forced |
+           g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_forced |
+           g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_forced;
+}
+
+uint8_t kmbox_get_current_buttons(void)
+{
+    // Return the current combined button byte (physical | forced) without
+    // draining any accumulators.  Used by hid_device_task() to detect
+    // button-only state changes that need an immediate report.
+    return (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
+           (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
+           (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
+           (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
+           (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
+}
+
 void kmbox_set_axis_lock(bool lock_x, bool lock_y)
 {
     g_kmbox_state.lock_mx = lock_x;

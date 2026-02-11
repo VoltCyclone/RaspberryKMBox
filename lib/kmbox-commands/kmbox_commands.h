@@ -143,6 +143,10 @@ bool kmbox_get_lock_my(void);
 // Check if any button is currently forced
 bool kmbox_has_forced_buttons(void);
 
+// Get the current combined button byte (physical | forced) without draining accumulators.
+// Used to detect button-only state changes that need an immediate report.
+uint8_t kmbox_get_current_buttons(void);
+
 // Get button name string for debugging
 const char* kmbox_get_button_name(kmbox_button_t button);
 
