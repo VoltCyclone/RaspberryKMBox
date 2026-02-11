@@ -1,13 +1,16 @@
 /**
  * Makcu to KMBox Protocol Translator Implementation
- * Translates Makcu binary protocol to KMBox text protocol
+ * Translates Makcu binary protocol to KMBox binary fast commands
  */
 
 #include "makcu_translator.h"
 #include "makcu_protocol.h"
-#include "protocol_luts.h"
+#include "fast_commands.h"
 #include <string.h>
 #include <stdio.h>
+
+// Persistent button state — accumulated across individual button commands
+static uint8_t g_button_state = 0;
 
 void makcu_translator_init(void) {
     // Nothing to initialize yet
@@ -98,12 +101,11 @@ translate_result_t makcu_translate_command(
             
             makcu_move_t* move = (makcu_move_t*)payload;
             
-            // Translate to KMBox text protocol: "M<x>,<y>\n"
-            out_cmd->length = fast_build_move((char*)out_cmd->buffer, move->dx, move->dy);
+            // Direct accumulator — output-stage humanization applies tremor.
+            // Smooth queue (0x07) overflows at high streaming rates.
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer, move->dx, move->dy,
+                                                    g_button_state, 0);
             out_cmd->result = TRANSLATE_OK;
-            
-            // Note: Bezier segments/control points ignored
-            // KMBox does smoothing internally
             return TRANSLATE_OK;
         }
         
@@ -116,18 +118,13 @@ translate_result_t makcu_translate_command(
             
             makcu_mo_t* mo = (makcu_mo_t*)payload;
             
-            // Translate movement and wheel
-            if (mo->x != 0 || mo->y != 0) {
-                out_cmd->length = fast_build_move((char*)out_cmd->buffer, mo->x, mo->y);
-                if (mo->wheel != 0) {
-                    // Append wheel command
-                    out_cmd->length += fast_build_wheel((char*)out_cmd->buffer + out_cmd->length, mo->wheel);
-                }
-            } else if (mo->wheel != 0) {
-                out_cmd->length = fast_build_wheel((char*)out_cmd->buffer, mo->wheel);
-            }
+            // Raw frame: movement + buttons + wheel in a single 0x01 packet.
+            // Direct accumulator — output-stage humanization applies tremor.
+            g_button_state = mo->buttons;  // Raw frame sets absolute button state
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer,
+                                                    mo->x, mo->y,
+                                                    g_button_state, mo->wheel);
             
-            // Note: Button state and pan/tilt not supported in simple text protocol
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -161,9 +158,16 @@ translate_result_t makcu_translate_command(
                 return TRANSLATE_INVALID;
             }
             
-            // Translate to KMBox text protocol: "B<mask>\n"
-            // If pressing, set the mask; if releasing, clear it (send 0)
-            out_cmd->length = fast_build_button((char*)out_cmd->buffer, (state == 1) ? button_mask : 0);
+            // Update persistent button state
+            if (state == 1) {
+                g_button_state |= button_mask;   // Press: set bit
+            } else {
+                g_button_state &= ~button_mask;  // Release: clear bit
+            }
+            
+            // Binary instant mouse move with updated button state
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer, 0, 0,
+                                                    g_button_state, 0);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -182,10 +186,9 @@ translate_result_t makcu_translate_command(
                 return TRANSLATE_INVALID;
             }
             
-            // Translate to KMBox click command: press then release
-            // Since KMBox doesn't have direct click with count, we'll do a single click
-            out_cmd->length = fast_build_button((char*)out_cmd->buffer, button_mask);
-            out_cmd->length += fast_build_button((char*)out_cmd->buffer + out_cmd->length, 0);
+            // Binary click command (press + release in one 8-byte packet)
+            out_cmd->length = fast_build_mouse_click(out_cmd->buffer, button_mask,
+                                                     click->count > 0 ? click->count : 1);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -199,8 +202,9 @@ translate_result_t makcu_translate_command(
             
             int8_t delta = (int8_t)payload[0];
             
-            // Translate to KMBox text protocol: "W<delta>\n"
-            out_cmd->length = fast_build_wheel((char*)out_cmd->buffer, delta);
+            // Binary instant mouse move with wheel only
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer, 0, 0,
+                                                    g_button_state, delta);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }

@@ -299,7 +299,7 @@ static bool process_keyboard_report_internal(const hid_keyboard_report_t *report
 static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 
 // Humanization helpers
-static void apply_output_humanization(int16_t *x, int16_t *y);
+static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x, int16_t injected_y);
 static inline int8_t clamp_i8(int32_t val);
 
 // --- Runtime HID descriptor mirroring storage & helpers ---
@@ -498,20 +498,30 @@ static __force_inline int8_t clamp_i8(int32_t val) {
 }
 
 //--------------------------------------------------------------------+
-// Final Stage Humanization (Applied to ALL movement sources)
+// Final Stage Humanization (Applied proportionally to injected movement)
 //--------------------------------------------------------------------+
 
 /**
  * Apply humanization tremor to final HID output movement.
- * This is called AFTER all movement sources are combined (physical mouse,
- * kmbox accumulator, smooth queue) to ensure consistent humanization
- * regardless of input pathway.
  * 
- * @param x Pointer to X movement (modified in place)
- * @param y Pointer to Y movement (modified in place)
+ * KEY DESIGN: Human mouse movement is already human — it doesn't need
+ * additional tremor/jitter. Tremor is only applied proportionally to the
+ * synthetic (injected) fraction of the total movement. This keeps the
+ * mouse feeling natural and responsive during normal use while still
+ * humanizing injected/bot movement.
+ * 
+ * Blend logic:
+ *   - Pure physical movement (injected == 0): no tremor applied
+ *   - Mixed (physical + injected): tremor scaled by injected fraction
+ *   - Pure injected (no physical): full tremor applied
+ * 
+ * @param x Pointer to total X movement (modified in place)
+ * @param y Pointer to total Y movement (modified in place)
+ * @param injected_x The injected/synthetic X component (smooth queue + kmbox serial)
+ * @param injected_y The injected/synthetic Y component (smooth queue + kmbox serial)
  */
-static void apply_output_humanization(int16_t *x, int16_t *y) {
-    // Skip only if humanization is completely disabled
+static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x, int16_t injected_y) {
+    // Skip if humanization is completely disabled
     humanization_mode_t mode = smooth_get_humanization_mode();
     if (mode == HUMANIZATION_OFF) {
         return;
@@ -526,10 +536,43 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
         return;
     }
     
-    // Calculate movement magnitude
-    float fx = (float)(*x);
-    float fy = (float)(*y);
-    float magnitude = sqrtf(fx * fx + fy * fy);
+    // --- Calculate blend ratio: how much of this movement is synthetic? ---
+    // If there's no injected component, the user is just moving their mouse.
+    // Human movement is already human — don't add tremor to it.
+    float inject_mag = sqrtf((float)injected_x * injected_x + (float)injected_y * injected_y);
+    
+    // No injected movement — nothing to humanize. Do NOT apply tremor.
+    // This prevents phantom tremor after injection queue drains (the "shaking" bug).
+    if (inject_mag < 0.5f) {
+        return;
+    }
+    
+    float total_mag  = sqrtf((float)(*x) * (*x) + (float)(*y) * (*y));
+    
+    // No movement at all — skip (don't generate idle tremor on pure physical idle)
+    if (total_mag < 0.5f && inject_mag < 0.5f) {
+        return;
+    }
+    
+    // Blend ratio: 0.0 = pure physical, 1.0 = pure injected
+    float blend;
+    if (total_mag < 0.5f) {
+        // Total is ~zero but inject is non-zero (rare edge: physical cancelled inject)
+        blend = 1.0f;
+    } else {
+        blend = inject_mag / total_mag;
+        // Clamp to [0, 1] — inject_mag can exceed total_mag if they oppose
+        if (blend > 1.0f) blend = 1.0f;
+    }
+    
+    // If movement is almost entirely physical, skip tremor entirely
+    // This threshold avoids wasting FPU cycles for negligible tremor
+    if (blend < 0.05f) {
+        return;
+    }
+    
+    // --- Calculate tremor magnitude ---
+    float magnitude = total_mag;
     
     // Mode-dependent intensity scaling
     float mode_scale = 1.0f;
@@ -547,11 +590,10 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
             break;
     }
     
-    // Calculate tremor scale — use movement_scale for moving cursor,
-    // idle-level tremor for zero/micro movement (the anti-cheat sweet spot)
+    // Calculate tremor scale with blend factor
     float movement_scale = humanization_jitter_scale(magnitude);
     float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
-    float tremor_scale = base_jitter * movement_scale * mode_scale;
+    float tremor_scale = base_jitter * movement_scale * mode_scale * blend;
     
     // Get runtime tremor (layered oscillators + noise)
     float tremor_x, tremor_y;
@@ -559,6 +601,8 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
     
     if (magnitude > 2.0f) {
         // Moving cursor: perpendicular + parallel decomposition
+        float fx = (float)(*x);
+        float fy = (float)(*y);
         float norm_x = fx / magnitude;
         float norm_y = fy / magnitude;
         
@@ -574,7 +618,7 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
         *x = (int16_t)(*x + (int16_t)(perp_dx + para_dx + 0.5f));
         *y = (int16_t)(*y + (int16_t)(perp_dy + para_dy + 0.5f));
     } else {
-        // Idle / micro-movement: apply tremor as raw X/Y (no direction to decompose)
+        // Small/idle movement with injection active: apply tremor as raw X/Y
         *x += (int16_t)(tremor_x + 0.5f);
         *y += (int16_t)(tremor_y + 0.5f);
     }
@@ -1332,13 +1376,18 @@ static inline void build_raw_mouse_report(uint8_t *buf, uint8_t sz,
         buf[L->pan_offset] = (uint8_t)pan;
 }
 
-static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, uint16_t raw_len)
+/**
+ * Core1 accumulate-only mouse report handler.
+ *
+ * ARCHITECTURE NOTE: TinyUSB device API (tud_hid_report, etc.) is NOT
+ * thread-safe.  Core0 runs tud_task() in the main loop, so ALL device
+ * API calls must happen on Core0.  This function — called from Core1's
+ * tuh_hid_report_received_cb — ONLY extracts physical mouse data and
+ * writes it into the shared accumulators (spinlock-protected).  Core0's
+ * hid_device_task() drains the accumulators and sends the USB report.
+ */
+static void __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, uint16_t raw_len)
 {
-    // We need a mutable copy to inject deltas
-    uint8_t buf[64];
-    if (raw_len > sizeof(buf)) raw_len = sizeof(buf);
-    memcpy(buf, raw, raw_len);
-
     const mouse_report_layout_t *L = &host_mouse_layout;
 
     // --- Extract physical movement from the raw report ---
@@ -1349,55 +1398,49 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
     // Extract buttons (handle both 8-bit and 16-bit button fields)
     if (L->buttons_offset < raw_len) {
         if (L->buttons_bits > 8 && L->buttons_offset + 1 < raw_len) {
-            // 16-bit button field: read two bytes, mask to actual bit count
-            uint16_t buttons16 = buf[L->buttons_offset] | (buf[L->buttons_offset + 1] << 8);
+            uint16_t buttons16 = raw[L->buttons_offset] | (raw[L->buttons_offset + 1] << 8);
             uint16_t mask = (L->buttons_bits >= 16) ? 0xFFFF : ((1u << L->buttons_bits) - 1);
-            phys_buttons = (uint8_t)(buttons16 & mask);  // Only use low 8 bits for now
+            phys_buttons = (uint8_t)(buttons16 & mask);
         } else {
-            // 8-bit or less: single byte
             uint8_t mask = (L->buttons_bits >= 8) ? 0xFF : ((1u << L->buttons_bits) - 1);
-            phys_buttons = buf[L->buttons_offset] & mask;
+            phys_buttons = raw[L->buttons_offset] & mask;
         }
     }
 
+    // X axis extraction (all bit-width variants)
     if ((L->x_bits > 0 && L->x_bits != 8 && L->x_bits != 16) || (L->x_is_16bit && (L->x_bit_offset % 8 != 0))) {
         uint8_t nbits = L->x_bits;
         uint8_t start_byte = L->x_start_byte;
         uint8_t bit_in_byte = L->x_bit_in_byte;
         uint8_t end_byte = (L->x_bit_offset + nbits - 1) / 8;
-        
         if (end_byte < raw_len) {
-            // Read up to 3 bytes to cover the field
-            uint32_t raw32 = (uint32_t)buf[start_byte];
-            if (start_byte + 1 < raw_len) raw32 |= ((uint32_t)buf[start_byte + 1] << 8);
-            if (start_byte + 2 < raw_len) raw32 |= ((uint32_t)buf[start_byte + 2] << 16);
-            
+            uint32_t raw32 = (uint32_t)raw[start_byte];
+            if (start_byte + 1 < raw_len) raw32 |= ((uint32_t)raw[start_byte + 1] << 8);
+            if (start_byte + 2 < raw_len) raw32 |= ((uint32_t)raw[start_byte + 2] << 16);
             raw32 >>= bit_in_byte;
             raw32 &= (1u << nbits) - 1;
-            // Sign-extend
             if (raw32 & (1u << (nbits - 1)))
                 raw32 |= ~((1u << nbits) - 1);
             phys_x = (int16_t)(int32_t)raw32;
         }
     } else if (L->x_is_16bit) {
         if (L->x_offset + 1 < raw_len)
-            phys_x = (int16_t)(buf[L->x_offset] | (buf[L->x_offset + 1] << 8));
+            phys_x = (int16_t)(raw[L->x_offset] | (raw[L->x_offset + 1] << 8));
     } else if (L->x_bits == 8) {
         if (L->x_offset < raw_len)
-            phys_x = (int8_t)buf[L->x_offset];
+            phys_x = (int8_t)raw[L->x_offset];
     }
 
+    // Y axis extraction
     if ((L->y_bits > 0 && L->y_bits != 8 && L->y_bits != 16) || (L->y_is_16bit && (L->y_bit_offset % 8 != 0))) {
         uint8_t nbits = L->y_bits;
         uint8_t start_byte = L->y_start_byte;
         uint8_t bit_in_byte = L->y_bit_in_byte;
         uint8_t end_byte = (L->y_bit_offset + nbits - 1) / 8;
-
         if (end_byte < raw_len) {
-            uint32_t raw32 = (uint32_t)buf[start_byte];
-            if (start_byte + 1 < raw_len) raw32 |= ((uint32_t)buf[start_byte + 1] << 8);
-            if (start_byte + 2 < raw_len) raw32 |= ((uint32_t)buf[start_byte + 2] << 16);
-
+            uint32_t raw32 = (uint32_t)raw[start_byte];
+            if (start_byte + 1 < raw_len) raw32 |= ((uint32_t)raw[start_byte + 1] << 8);
+            if (start_byte + 2 < raw_len) raw32 |= ((uint32_t)raw[start_byte + 2] << 16);
             raw32 >>= bit_in_byte;
             raw32 &= (1u << nbits) - 1;
             if (raw32 & (1u << (nbits - 1)))
@@ -1405,23 +1448,21 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
             phys_y = (int16_t)(int32_t)raw32;
         }
     } else if (L->y_is_16bit) {
-
         if (L->y_offset + 1 < raw_len)
-            phys_y = (int16_t)(buf[L->y_offset] | (buf[L->y_offset + 1] << 8));
+            phys_y = (int16_t)(raw[L->y_offset] | (raw[L->y_offset + 1] << 8));
     } else if (L->y_bits == 8) {
         if (L->y_offset < raw_len)
-            phys_y = (int8_t)buf[L->y_offset];
+            phys_y = (int8_t)raw[L->y_offset];
     }
 
     if (L->has_wheel && L->wheel_offset < raw_len) {
-        phys_wheel = (int8_t)buf[L->wheel_offset];
+        phys_wheel = (int8_t)raw[L->wheel_offset];
     }
-
     if (L->has_pan && L->pan_offset < raw_len) {
-        phys_pan = (int8_t)buf[L->pan_offset];
+        phys_pan = (int8_t)raw[L->pan_offset];
     }
 
-    // --- Feed physical data into the kmbox accumulator / smooth system ---
+    // --- Accumulate into shared state (spinlock-protected inside each call) ---
     kmbox_update_physical_buttons(phys_buttons & 0x1F);
 
     if (phys_x != 0 || phys_y != 0) {
@@ -1430,176 +1471,22 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         smooth_record_physical_movement(tx, ty);
         kmbox_add_mouse_movement(tx, ty);
     }
-    if (phys_wheel != 0) {
-        kmbox_add_wheel_movement(phys_wheel);
-    }
-    if (phys_pan != 0) {
-        kmbox_add_pan_movement(phys_pan);
-    }
+    if (phys_wheel != 0) kmbox_add_wheel_movement(phys_wheel);
+    if (phys_pan != 0)   kmbox_add_pan_movement(phys_pan);
 
-    // --- Get combined movement (physical + bridge/kmbox pending) ---
-    uint8_t btn_send;
-    int16_t mx, my;
-    int8_t mwheel, mpan;
-    
-    // Use 16-bit getter to avoid clamping high-speed/resolution movement
-    kmbox_get_mouse_report_16(&btn_send, &mx, &my, &mwheel, &mpan);
-
-    // Blend smooth injection
-    int8_t smooth_x = 0, smooth_y = 0;
-    if (smooth_has_pending()) {
-        smooth_process_frame(&smooth_x, &smooth_y);
-        mx += smooth_x;
-        my += smooth_y;
-    }
-
-    // Apply output-stage humanization (tremor) — single point for all paths
-    apply_output_humanization(&mx, &my);
-
-    // --- Check endpoint readiness ---
-    if (!tud_hid_ready()) {
-        // Re-accumulate raw (pre-smooth) movement to avoid losing it
-        int16_t raw_mx = mx - smooth_x;
-        int16_t raw_my = my - smooth_y;
-        if (raw_mx != 0 || raw_my != 0)
-            kmbox_add_mouse_movement((int16_t)raw_mx, (int16_t)raw_my);
-        if (mwheel != 0)
-            kmbox_add_wheel_movement(mwheel);
-        return true;
-    }
-
-    // --- Patch the raw report buffer with combined values ---
-    // Buttons (handle both 8-bit and 16-bit button fields)
-    if (L->buttons_offset < raw_len) {
-        if (L->buttons_bits > 8 && L->buttons_offset + 1 < raw_len) {
-            // 16-bit button field: write two bytes
-            uint16_t mask = (L->buttons_bits >= 16) ? 0xFFFF : ((1u << L->buttons_bits) - 1);
-            uint16_t buttons16 = buf[L->buttons_offset] | (buf[L->buttons_offset + 1] << 8);
-            buttons16 = (buttons16 & ~mask) | (btn_send & mask);
-            buf[L->buttons_offset] = (uint8_t)(buttons16 & 0xFF);
-            buf[L->buttons_offset + 1] = (uint8_t)((buttons16 >> 8) & 0xFF);
-        } else {
-            // 8-bit or less
-            uint8_t btn_mask = (L->buttons_bits >= 8) ? 0xFF : ((1u << L->buttons_bits) - 1);
-            buf[L->buttons_offset] = (buf[L->buttons_offset] & ~btn_mask) | (btn_send & btn_mask);
-        }
-    }
-
-    // X axis
-    if (L->x_bits > 0 && L->x_bits != 8 && L->x_bits != 16) {
-        uint8_t nbits = L->x_bits;
-        uint8_t start_byte = L->x_start_byte;
-        uint8_t bit_in_byte = L->x_bit_in_byte;
-        int32_t max_val = (1 << (nbits - 1)) - 1;
-        int32_t min_val = -(1 << (nbits - 1));
-        int32_t cx = mx;
-        if (cx > max_val) cx = max_val;
-        if (cx < min_val) cx = min_val;
-        uint32_t uval = (uint32_t)cx & ((1u << nbits) - 1);
-        if (start_byte + 2 < raw_len) {
-            uint32_t mask = ((1u << nbits) - 1) << bit_in_byte;
-            uint32_t raw32 = (uint32_t)buf[start_byte]
-                           | ((uint32_t)buf[start_byte + 1] << 8)
-                           | ((uint32_t)buf[start_byte + 2] << 16);
-            raw32 = (raw32 & ~mask) | ((uval << bit_in_byte) & mask);
-            buf[start_byte]     = (uint8_t)(raw32 & 0xFF);
-            buf[start_byte + 1] = (uint8_t)((raw32 >> 8) & 0xFF);
-            buf[start_byte + 2] = (uint8_t)((raw32 >> 16) & 0xFF);
-        }
-    } else if (L->x_is_16bit) {
-        // Clamp to int16 range
-        int32_t cx = mx;
-        if (cx > 32767) cx = 32767;
-        if (cx < -32768) cx = -32768;
-        if (L->x_offset + 1 < raw_len) {
-            buf[L->x_offset]     = (uint8_t)(cx & 0xFF);
-            buf[L->x_offset + 1] = (uint8_t)((cx >> 8) & 0xFF);
-        }
-    } else {
-        int16_t cx = mx;
-        if (cx > 127) cx = 127;
-        if (cx < -128) cx = -128;
-        if (L->x_offset < raw_len)
-            buf[L->x_offset] = (uint8_t)(int8_t)cx;
-    }
-
-    // Y axis
-    if (L->y_bits > 0 && L->y_bits != 8 && L->y_bits != 16) {
-        uint8_t nbits = L->y_bits;
-        uint8_t start_byte = L->y_start_byte;
-        uint8_t bit_in_byte = L->y_bit_in_byte;
-        int32_t max_val = (1 << (nbits - 1)) - 1;
-        int32_t min_val = -(1 << (nbits - 1));
-        int32_t cy = my;
-        if (cy > max_val) cy = max_val;
-        if (cy < min_val) cy = min_val;
-        uint32_t uval = (uint32_t)cy & ((1u << nbits) - 1);
-        if (start_byte + 2 < raw_len) {
-            uint32_t mask = ((1u << nbits) - 1) << bit_in_byte;
-            uint32_t raw32 = (uint32_t)buf[start_byte]
-                           | ((uint32_t)buf[start_byte + 1] << 8)
-                           | ((uint32_t)buf[start_byte + 2] << 16);
-            raw32 = (raw32 & ~mask) | ((uval << bit_in_byte) & mask);
-            buf[start_byte]     = (uint8_t)(raw32 & 0xFF);
-            buf[start_byte + 1] = (uint8_t)((raw32 >> 8) & 0xFF);
-            buf[start_byte + 2] = (uint8_t)((raw32 >> 16) & 0xFF);
-        }
-    } else if (L->y_is_16bit) {
-        int32_t cy = my;
-        if (cy > 32767) cy = 32767;
-        if (cy < -32768) cy = -32768;
-        if (L->y_offset + 1 < raw_len) {
-            buf[L->y_offset]     = (uint8_t)(cy & 0xFF);
-            buf[L->y_offset + 1] = (uint8_t)((cy >> 8) & 0xFF);
-        }
-    } else {
-        int16_t cy = my;
-        if (cy > 127) cy = 127;
-        if (cy < -128) cy = -128;
-        if (L->y_offset < raw_len)
-            buf[L->y_offset] = (uint8_t)(int8_t)cy;
-    }
-
-    // Wheel
-    if (L->has_wheel && L->wheel_offset < raw_len) {
-        int16_t cw = mwheel;
-        if (cw > 127) cw = 127;
-        if (cw < -128) cw = -128;
-        buf[L->wheel_offset] = (uint8_t)(int8_t)cw;
-    }
-
-    // Pan
-    if (L->has_pan && L->pan_offset < raw_len) {
-        int16_t cp = mpan;
-        if (cp > 127) cp = 127;
-        if (cp < -128) cp = -128;
-        buf[L->pan_offset] = (uint8_t)(int8_t)cp;
-    }
-
-    // Send the raw report using the mouse report ID from the parsed layout.
-    // When the host mouse descriptor uses Report IDs, we must forward with
-    // the same ID.  When it doesn't, use our default REPORT_ID_MOUSE.
-    
-    // CRITICAL FIX: When using 16-bit output override, rebuild the report
-    // using output_mouse_layout_16bit instead of just patching in-place.
-    if (using_16bit_output_override) {
-        uint8_t out_buf[16];  // 16-bit report: 2 bytes buttons + 2 bytes X + 2 bytes Y + 1 byte wheel + 1 byte pan = 8 bytes
-        build_raw_mouse_report(out_buf, sizeof(out_buf), &output_mouse_layout_16bit,
-                              btn_send, mx, my, mwheel, mpan);
-        // Keep file-scope button/activity state in sync for hid_device_task()
-        last_sent_buttons = btn_send;
-        was_active = true;
-        return tud_hid_report(REPORT_ID_MOUSE, out_buf, output_mouse_layout_16bit.report_size);
-    }
-    
-    // Keep file-scope button/activity state in sync for hid_device_task()
-    last_sent_buttons = btn_send;
+    // Signal Core0 that fresh physical data is available.
+    // hid_device_task() on Core0 will drain accumulators and send the report.
     was_active = true;
-
-    uint8_t rid = L->has_report_id ? L->mouse_report_id : REPORT_ID_MOUSE;
-    return tud_hid_report(rid, buf, raw_len);
 }
 
+/**
+ * Accumulate-only mouse report handler.
+ *
+ * ARCHITECTURE: This function is called from both Core0 (fast command click
+ * handler) and Core1 (legacy boot-protocol mouse path).  It MUST NOT call
+ * any tud_* device API.  It only accumulates into the shared kmbox state;
+ * Core0's hid_device_task() will drain and send.
+ */
 static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_report_t *report)
 {
     if (report == NULL)
@@ -1608,13 +1495,12 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
     }
 
     // Fast button validation using bitwise AND
-    uint8_t valid_buttons = report->buttons & 0x1F; // Keep first 5 bits (L/R/M/S1/S2 buttons)
+    uint8_t valid_buttons = report->buttons & 0x1F;
 
     // Update physical button states in kmbox (for lock functionality)
     kmbox_update_physical_buttons(valid_buttons);
 
     // Record physical movement for velocity tracking (smooth injection)
-    // Apply transform to physical mouse movement if enabled
     if (report->x != 0 || report->y != 0)
     {
         int16_t transformed_x, transformed_y;
@@ -1630,66 +1516,9 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         kmbox_add_wheel_movement(report->wheel);
     }
 
-    // Always get and send the combined movement (physical + any pending bridge commands)
-    // This ensures bridge movements get sent COMBINED with physical movements
-    // rather than waiting for a separate send opportunity
-    uint8_t buttons_to_send;
-    int8_t x, y, wheel, pan;
-    kmbox_get_mouse_report(&buttons_to_send, &x, &y, &wheel, &pan);
-
-    // Process smooth injection queue and blend with physical movement
-    // This provides sub-pixel precision and velocity-aware blending
-    int8_t smooth_x = 0, smooth_y = 0;
-    if (smooth_has_pending())
-    {
-        smooth_process_frame(&smooth_x, &smooth_y);
-        // Add smooth injection to the physical/kmbox movement
-        // Clamp the total to int8_t range
-        int16_t total_x = (int16_t)x + (int16_t)smooth_x;
-        int16_t total_y = (int16_t)y + (int16_t)smooth_y;
-        x = (total_x > 127) ? 127 : ((total_x < -128) ? -128 : (int8_t)total_x);
-        y = (total_y > 127) ? 127 : ((total_y < -128) ? -128 : (int8_t)total_y);
-    }
-    
-    // *** CRITICAL FIX: Apply humanization to physical mouse path too ***
-    // Convert to int16_t for humanization (avoid overflow)
-    int16_t x16 = x;
-    int16_t y16 = y;
-    apply_output_humanization(&x16, &y16);
-    x = (int8_t)clamp_i8(x16);
-    y = (int8_t)clamp_i8(y16);
-
-    // Save pre-smooth values for re-accumulation if endpoint is busy
-    int8_t raw_x = x - smooth_x;
-    int8_t raw_y = y - smooth_y;
-    int8_t final_x = x;
-    int8_t final_y = y;
-    int8_t final_wheel = wheel;
-
-    // Check readiness right before send to minimize latency
-    // If not ready, re-accumulate ONLY the raw kmbox values (before smooth injection)
-    // to avoid doubling the smooth injection delta on next cycle
-    if (!tud_hid_ready())
-    {
-        // Endpoint busy - put back only the raw consumed movement (pre-smooth)
-        // We must NOT re-add the smooth injection delta or it compounds each miss
-        if (raw_x != 0 || raw_y != 0) {
-            kmbox_add_mouse_movement(raw_x, raw_y);
-        }
-        if (wheel != 0) {
-            kmbox_add_wheel_movement(wheel);
-        }
-        return true;
-    }
-
-    // Send the report
-    bool success = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons_to_send, final_x, final_y, final_wheel, pan);
-    if (success) {
-        // Keep file-scope button/activity state in sync for hid_device_task()
-        last_sent_buttons = buttons_to_send;
-        was_active = true;
-    }
-    return success;
+    // Signal Core0 that data is available
+    was_active = true;
+    return true;
 }
 
 void __not_in_flash_func(process_kbd_report)(const hid_keyboard_report_t *report)
@@ -1789,12 +1618,9 @@ void hid_device_task(void)
     // on the very next poll — otherwise the delay is detectably wrong.
     // (last_sent_buttons / was_active are file-scope for cross-path sync)
 
-    // Flush pending bridge/smooth movements from Core0
-    // CRITICAL: When a physical mouse IS connected, Core1 handles physical movement
-    // via process_mouse_report_internal() which drains kmbox accumulators.
-    // We must NOT drain accumulators here when mouse is connected or we race Core1
-    // and steal its movement data. Only drain smooth injection standalone when
-    // mouse is connected but idle.
+    // ARCHITECTURE: Core0 is the ONLY core that calls tud_hid_report().
+    // Core1 (physical mouse callbacks) accumulates into kmbox accumulators
+    // and sets was_active=true.  We drain everything here.
     if (tud_hid_ready())
     {
         bool has_kmbox = kmbox_has_pending_movement();
@@ -1806,89 +1632,64 @@ void hid_device_task(void)
         bool has_pending = has_kmbox || has_smooth || buttons_changed;
 
         if (!has_pending) goto check_idle;
-        
-        if (!connection_state.mouse_connected)
-        {
-            // No physical mouse — Core0 is the only sender, safe to drain everything
-            uint8_t buttons;
-            int16_t x, y;
-            int8_t wheel, pan;
-            kmbox_get_mouse_report_16(&buttons, &x, &y, &wheel, &pan);
-            
-            int8_t smooth_x = 0, smooth_y = 0;
-            if (has_smooth) {
-                smooth_process_frame(&smooth_x, &smooth_y);
-                x += smooth_x;
-                y += smooth_y;
-            }
-            
-            // *** CRITICAL FIX: Apply humanization to FINAL output ***
-            // This ensures ALL movements (kmbox, smooth, physical) get tremor
-            apply_output_humanization(&x, &y);
-            
-            // Send if there's any movement, wheel, OR button state to report.
-            // Button-only changes (clicks with no movement) must send immediately.
-            if (x != 0 || y != 0 || wheel != 0 || buttons != 0 || buttons_changed) {
-                // When we have a cloned gaming mouse layout, build a raw report
-                // that matches the descriptor format.  Otherwise use the standard API.
-                if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
-                    uint8_t raw[64];
-                    uint8_t sz = host_mouse_layout.report_size;
-                    if (sz > sizeof(raw)) sz = sizeof(raw);
 
-                    build_raw_mouse_report(raw, sz, &host_mouse_layout,
-                                           buttons, x, y, wheel, pan);
+        // Drain accumulators (spinlock-protected, safe from both cores)
+        uint8_t buttons;
+        int16_t x, y;
+        int8_t wheel, pan;
+        kmbox_get_mouse_report_16(&buttons, &x, &y, &wheel, &pan);
 
-                    uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
-                    tud_hid_report(rid, raw, sz);
-                } else {
-                    tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, x, y, wheel, pan);
-                }
-                last_sent_buttons = buttons;
-                was_active = true;
-                return;
+        // Process smooth injection
+        int16_t smooth_x = 0, smooth_y = 0;
+        if (has_smooth) {
+            int8_t sx8 = 0, sy8 = 0;
+            smooth_process_frame(&sx8, &sy8);
+            smooth_x = sx8;
+            smooth_y = sy8;
+            x += smooth_x;
+            y += smooth_y;
+        }
+
+        // Apply output-stage humanization (tremor).
+        // Physical mouse movement is already human; only humanize the
+        // synthetic (smooth injection + bridge) portion.
+        if (!connection_state.mouse_connected) {
+            // No physical mouse — everything is synthetic, full humanization
+            apply_output_humanization(&x, &y, x, y);
+        } else {
+            // Physical mouse connected — only humanize the smooth injection part
+            if (smooth_x != 0 || smooth_y != 0) {
+                apply_output_humanization(&x, &y, smooth_x, smooth_y);
             }
         }
-        else
-        {
-            // Physical mouse IS connected.
-            // Handle smooth injection OR button-only changes from bridge commands.
-            // Do NOT drain kmbox movement accumulators (Core1 owns those via
-            // forward_raw_mouse_report / process_mouse_report_internal).
-            int8_t smooth_x = 0, smooth_y = 0;
-            if (has_smooth) {
-                smooth_process_frame(&smooth_x, &smooth_y);
+
+        // Send if there's any movement, wheel, OR button state to report.
+        if (x != 0 || y != 0 || wheel != 0 || buttons != 0 || buttons_changed) {
+            // Build raw report matching host mouse descriptor when available.
+            if (using_16bit_output_override) {
+                uint8_t raw[16];
+                build_raw_mouse_report(raw, sizeof(raw), &output_mouse_layout_16bit,
+                                       buttons, x, y, wheel, pan);
+                tud_hid_report(REPORT_ID_MOUSE, raw, output_mouse_layout_16bit.report_size);
+            } else if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
+                uint8_t raw[64];
+                uint8_t sz = host_mouse_layout.report_size;
+                if (sz > sizeof(raw)) sz = sizeof(raw);
+
+                build_raw_mouse_report(raw, sz, &host_mouse_layout,
+                                       buttons, x, y, wheel, pan);
+
+                uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
+                tud_hid_report(rid, raw, sz);
+            } else {
+                // Clamp to int8 for standard HID mouse report
+                int8_t cx = (x > 127) ? 127 : ((x < -128) ? -128 : (int8_t)x);
+                int8_t cy = (y > 127) ? 127 : ((y < -128) ? -128 : (int8_t)y);
+                tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, cx, cy, wheel, pan);
             }
-
-            // Convert to int16_t for humanization
-            int16_t x16 = smooth_x;
-            int16_t y16 = smooth_y;
-
-            // Apply humanization to smooth injection
-            if (x16 != 0 || y16 != 0) {
-                apply_output_humanization(&x16, &y16);
-            }
-
-            if (x16 != 0 || y16 != 0 || buttons_changed) {
-                // Use current_buttons so button-only bridge clicks get sent
-                // even when the physical mouse is idle.
-                if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
-                    uint8_t raw[64];
-                    uint8_t sz = host_mouse_layout.report_size;
-                    if (sz > sizeof(raw)) sz = sizeof(raw);
-
-                    build_raw_mouse_report(raw, sz, &host_mouse_layout,
-                                           current_buttons, x16, y16, 0, 0);
-
-                    uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
-                    tud_hid_report(rid, raw, sz);
-                } else {
-                    tud_hid_mouse_report(REPORT_ID_MOUSE, current_buttons, (int8_t)x16, (int8_t)y16, 0, 0);
-                }
-                last_sent_buttons = current_buttons;
-                was_active = true;
-                return;
-            }
+            last_sent_buttons = buttons;
+            was_active = true;
+            return;
         }
     }
 check_idle:

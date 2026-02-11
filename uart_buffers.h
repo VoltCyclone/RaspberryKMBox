@@ -21,9 +21,9 @@
 
 // RX Buffer: Holds incoming commands from Bridge
 // - Largest command is 8 bytes (fast binary protocol)
-// - At 2 Mbaud: ~200KB/sec = ~200 bytes/ms
-// - 512 bytes gives ~2.5ms of buffer time (safe margin at 2 Mbaud)
-#define UART_RX_BUFFER_SIZE     512
+// - At 3 Mbaud: ~375KB/sec = ~375 bytes/ms
+// - 2048 bytes gives ~5.5ms of buffer time (safe margin at 3 Mbaud)
+#define UART_RX_BUFFER_SIZE     2048
 #define UART_RX_BUFFER_MASK     (UART_RX_BUFFER_SIZE - 1)
 
 // TX Buffer: Holds outgoing responses to Bridge  

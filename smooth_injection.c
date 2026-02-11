@@ -855,6 +855,15 @@ apply_accumulator:
     *out_x = clamp_i8(out_x_int);
     *out_y = clamp_i8(out_y_int);
     
+    // Fix: When queue is fully drained and output rounds to zero, flush
+    // sub-pixel accumulator residuals. Without this, tiny residuals (<1px)
+    // keep smooth_has_pending() returning true forever, which causes the
+    // output humanization to keep applying tremor → infinite mouse shaking.
+    if (g_smooth.queue_count == 0 && out_x_int == 0 && out_y_int == 0) {
+        g_smooth.x_accumulator_fp = 0;
+        g_smooth.y_accumulator_fp = 0;
+    }
+    
     g_smooth.frames_processed++;
 }
 
