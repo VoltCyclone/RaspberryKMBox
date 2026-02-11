@@ -143,6 +143,11 @@ bool kmbox_get_lock_my(void);
 // Check if any button is currently forced
 bool kmbox_has_forced_buttons(void);
 
+// Start a timed button click sequence (press → hold → release with randomized timing)
+// button: KMBOX_BUTTON_LEFT through KMBOX_BUTTON_SIDE2
+// current_time_ms: current timestamp for timing calculations
+void kmbox_start_button_click(kmbox_button_t button, uint32_t current_time_ms);
+
 // Get the current combined button byte (physical | forced) without draining accumulators.
 // Used to detect button-only state changes that need an immediate report.
 uint8_t kmbox_get_current_buttons(void);

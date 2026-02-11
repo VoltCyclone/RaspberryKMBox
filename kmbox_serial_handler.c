@@ -25,11 +25,8 @@
 #include <stdio.h>
 
 //--------------------------------------------------------------------+
-// Configuration
+// Configuration (UART_RX_BUFFER_SIZE defined in uart_buffers.h)
 //--------------------------------------------------------------------+
-
-#define UART_RX_BUFFER_SIZE     2048
-#define UART_RX_BUFFER_MASK     (UART_RX_BUFFER_SIZE - 1)
 
 //--------------------------------------------------------------------+
 // Temperature Sensor (with caching for performance)
@@ -422,15 +419,23 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
         
         case FAST_CMD_MOUSE_CLICK: {
             const fast_cmd_click_t *c = (const fast_cmd_click_t *)pkt;
-            uint8_t btn_mask = kmbox_map_button_to_hid_mask(c->button);
-            uint8_t count = c->count ? c->count : 1;
-            hid_mouse_report_t report = {0};
-            for (uint8_t i = 0; i < count && i < 10; i++) {
-                report.buttons = btn_mask;
-                process_mouse_report(&report);
-                report.buttons = 0;
-                process_mouse_report(&report);
+            // Map button number to kmbox_button_t enum
+            // FAST_BTN: 1=left, 2=right, 4=middle, 8=side1, 16=side2
+            kmbox_button_t btn;
+            switch (c->button) {
+                case 0: case 1: btn = KMBOX_BUTTON_LEFT;   break;
+                case 2:         btn = KMBOX_BUTTON_RIGHT;  break;
+                case 3:         btn = KMBOX_BUTTON_MIDDLE; break;
+                case 4:         btn = KMBOX_BUTTON_SIDE1;  break;
+                case 5:         btn = KMBOX_BUTTON_SIDE2;  break;
+                default:        btn = KMBOX_BUTTON_LEFT;   break;
             }
+            // Use timed click mechanism — press/hold/release with randomized
+            // timing, handled by kmbox_update_states() on each main loop tick.
+            // Only single-click is supported; the count field is ignored for now
+            // because multi-click requires waiting for each click to complete.
+            uint32_t click_now = time_us_32() / 1000;
+            kmbox_start_button_click(btn, click_now);
             fast_cmd_count++;
             return true;
         }

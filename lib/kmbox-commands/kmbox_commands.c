@@ -8,6 +8,16 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include "hardware/sync.h"
+
+//--------------------------------------------------------------------+
+// Hardware Spinlock for Cross-Core Accumulator Safety
+// Core0 (bridge fast commands + hid_device_task) and Core1 (physical mouse
+// forwarding) both read/write the mouse accumulators.  A hardware spinlock
+// ensures atomic read-modify-write without disabling interrupts globally.
+//--------------------------------------------------------------------+
+#define KMBOX_ACCUMULATOR_SPINLOCK_NUM 16  // Use spinlock 16 (0-15 reserved by SDK)
+static spin_lock_t *g_acc_spinlock;
 
 //--------------------------------------------------------------------+
 // Constants
@@ -774,6 +784,8 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
 
 void kmbox_commands_init(void)
 {
+    // Claim hardware spinlock for accumulator protection
+    g_acc_spinlock = spin_lock_init(KMBOX_ACCUMULATOR_SPINLOCK_NUM);
     // Initialize state
     memset(&g_kmbox_state, 0, sizeof(g_kmbox_state));
     memset(&g_parser, 0, sizeof(g_parser));
@@ -1158,7 +1170,6 @@ void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* whee
     }
     
     // Build button byte from current states - UNROLLED for performance
-    // Direct bit manipulation eliminates loop overhead and enables better optimization
     uint8_t button_byte = 
         (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
         (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
@@ -1166,11 +1177,11 @@ void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* whee
         (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
         (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
     
-    // Set output values
     *buttons = button_byte;
     
-    // Get movement values from accumulators
-    // Clamp to int8_t range (-128 to 127)
+    // --- Spinlock-protected accumulator drain ---
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
+    
     if (g_kmbox_state.mouse_x_accumulator > 127) {
         *x = 127;
         g_kmbox_state.mouse_x_accumulator -= 127;
@@ -1193,23 +1204,24 @@ void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* whee
         g_kmbox_state.mouse_y_accumulator = 0;
     }
     
-    // Get wheel value
-    *wheel = g_kmbox_state.wheel_accumulator;
+    int16_t w_acc = g_kmbox_state.wheel_accumulator;
     g_kmbox_state.wheel_accumulator = 0;
     
-    // Pan (horizontal scroll) - new logic
-    // Pan is tricky because standard kmbox protocol doesn't support it well,
-    // but we accumulate it anyway.
-    if (g_kmbox_state.pan_accumulator > 127) {
+    int16_t p_acc = g_kmbox_state.pan_accumulator;
+    if (p_acc > 127) {
         *pan = 127;
-        g_kmbox_state.pan_accumulator -= 127;
-    } else if (g_kmbox_state.pan_accumulator < -128) {
+        g_kmbox_state.pan_accumulator = p_acc - 127;
+    } else if (p_acc < -128) {
         *pan = -128;
-        g_kmbox_state.pan_accumulator -= -128;
+        g_kmbox_state.pan_accumulator = p_acc + 128;
     } else {
-        *pan = (int8_t)g_kmbox_state.pan_accumulator;
+        *pan = (int8_t)p_acc;
         g_kmbox_state.pan_accumulator = 0;
     }
+    
+    spin_unlock(g_acc_spinlock, irq);
+    
+    *wheel = (int8_t)w_acc;
 }
 
 void kmbox_get_mouse_report_16(uint8_t* buttons, int16_t* x, int16_t* y, int8_t* wheel, int8_t* pan)
@@ -1228,8 +1240,9 @@ void kmbox_get_mouse_report_16(uint8_t* buttons, int16_t* x, int16_t* y, int8_t*
     
     *buttons = button_byte;
     
-    // Get movement values - drain full 16-bit accumulator
-    // The accumulator is clamped to +/- 4096 so it fits safely in int16_t
+    // --- Spinlock-protected accumulator drain ---
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
+    
     *x = g_kmbox_state.mouse_x_accumulator;
     g_kmbox_state.mouse_x_accumulator = 0;
     
@@ -1237,35 +1250,42 @@ void kmbox_get_mouse_report_16(uint8_t* buttons, int16_t* x, int16_t* y, int8_t*
     g_kmbox_state.mouse_y_accumulator = 0;
     
     // Wheel
-    if (g_kmbox_state.wheel_accumulator > 127) {
+    int16_t w_acc = g_kmbox_state.wheel_accumulator;
+    if (w_acc > 127) {
         *wheel = 127;
-        g_kmbox_state.wheel_accumulator -= 127;
-    } else if (g_kmbox_state.wheel_accumulator < -128) {
+        g_kmbox_state.wheel_accumulator = w_acc - 127;
+    } else if (w_acc < -128) {
         *wheel = -128;
-        g_kmbox_state.wheel_accumulator -= -128;
+        g_kmbox_state.wheel_accumulator = w_acc + 128;
     } else {
-        *wheel = (int8_t)g_kmbox_state.wheel_accumulator;
+        *wheel = (int8_t)w_acc;
         g_kmbox_state.wheel_accumulator = 0;
     }
     
     // Pan
-    if (g_kmbox_state.pan_accumulator > 127) {
+    int16_t p_acc = g_kmbox_state.pan_accumulator;
+    if (p_acc > 127) {
         *pan = 127;
-        g_kmbox_state.pan_accumulator -= 127;
-    } else if (g_kmbox_state.pan_accumulator < -128) {
+        g_kmbox_state.pan_accumulator = p_acc - 127;
+    } else if (p_acc < -128) {
         *pan = -128;
-        g_kmbox_state.pan_accumulator -= -128;
+        g_kmbox_state.pan_accumulator = p_acc + 128;
     } else {
-        *pan = (int8_t)g_kmbox_state.pan_accumulator;
+        *pan = (int8_t)p_acc;
         g_kmbox_state.pan_accumulator = 0;
     }
+    
+    spin_unlock(g_acc_spinlock, irq);
 }
 
 void kmbox_add_mouse_movement(int16_t x, int16_t y)
 {
-    // Apply axis locks
     int16_t ax = 0;
     int16_t ay = 0;
+    
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
+    
+    // Apply axis locks
     if (!g_kmbox_state.lock_mx) {
         g_kmbox_state.mouse_x_accumulator += x;
         ax = x;
@@ -1276,40 +1296,43 @@ void kmbox_add_mouse_movement(int16_t x, int16_t y)
     }
     
     // Clamp accumulators to prevent unbounded growth
-    // Max ±4096 (~32 frames of max movement) is plenty of headroom
-    // while preventing wrap-around that causes movement hangs
     if (g_kmbox_state.mouse_x_accumulator > 4096) g_kmbox_state.mouse_x_accumulator = 4096;
     else if (g_kmbox_state.mouse_x_accumulator < -4096) g_kmbox_state.mouse_x_accumulator = -4096;
     if (g_kmbox_state.mouse_y_accumulator > 4096) g_kmbox_state.mouse_y_accumulator = 4096;
     else if (g_kmbox_state.mouse_y_accumulator < -4096) g_kmbox_state.mouse_y_accumulator = -4096;
+    
+    spin_unlock(g_acc_spinlock, irq);
 
     // Record actual movement applied (post-lock) using the latest known time
-    // from update loop. This may lag slightly for command-initiated moves,
-    // but remains accurate within the scheduling tick.
     record_movement_event(ax, ay, g_kmbox_state.last_update_time);
 }
 
 void kmbox_add_wheel_movement(int8_t wheel)
 {
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
     g_kmbox_state.wheel_accumulator += wheel;
-    // Clamp to prevent overflow (though very unlikely with 8-bit inputs)
     if (g_kmbox_state.wheel_accumulator > 1000) g_kmbox_state.wheel_accumulator = 1000;
     else if (g_kmbox_state.wheel_accumulator < -1000) g_kmbox_state.wheel_accumulator = -1000;
+    spin_unlock(g_acc_spinlock, irq);
 }
 
 void kmbox_add_pan_movement(int8_t pan)
 {
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
     g_kmbox_state.pan_accumulator += pan;
-    // Clamp to prevent overflow
     if (g_kmbox_state.pan_accumulator > 1000) g_kmbox_state.pan_accumulator = 1000;
     else if (g_kmbox_state.pan_accumulator < -1000) g_kmbox_state.pan_accumulator = -1000;
+    spin_unlock(g_acc_spinlock, irq);
 }
 
 bool kmbox_has_pending_movement(void)
 {
-    return (g_kmbox_state.mouse_x_accumulator != 0 ||
-            g_kmbox_state.mouse_y_accumulator != 0 ||
-            g_kmbox_state.wheel_accumulator != 0);
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
+    bool pending = (g_kmbox_state.mouse_x_accumulator != 0 ||
+                    g_kmbox_state.mouse_y_accumulator != 0 ||
+                    g_kmbox_state.wheel_accumulator != 0);
+    spin_unlock(g_acc_spinlock, irq);
+    return pending;
 }
 
 bool kmbox_has_forced_buttons(void)
@@ -1321,6 +1344,11 @@ bool kmbox_has_forced_buttons(void)
            g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_forced |
            g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_forced |
            g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_forced;
+}
+
+void kmbox_start_button_click(kmbox_button_t button, uint32_t current_time_ms)
+{
+    start_button_click(button, current_time_ms);
 }
 
 uint8_t kmbox_get_current_buttons(void)
