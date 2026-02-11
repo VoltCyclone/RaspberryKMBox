@@ -39,7 +39,7 @@
 #include "makcu_translator.h"
 #include "ferrum_protocol.h"
 #include "ferrum_translator.h"
-#include "protocol_luts.h"
+#include "fast_commands.h"
 #include "core1_translator.h"
 #include "neopixel_dma.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
@@ -734,22 +734,20 @@ static void uart_debug_task(void) {
 }
 
 // ============================================================================
-// Mouse Command Protocol - Send to KMBox (Simple Text Protocol)
+// Mouse Command Protocol - Send to KMBox (Binary Fast Commands)
 // ============================================================================
 
-// Send a simple text command to KMBox: "M<x>,<y>\n"
-static void send_text_mouse_move(int16_t dx, int16_t dy) {
-    char cmd[24];
-    // Use fast LUT-based builder instead of snprintf (~10x faster)
-    size_t len = fast_build_move(cmd, dx, dy);
+// Send a binary mouse move command to KMBox (direct accumulator + output-stage humanization)
+static void send_smooth_mouse_move(int16_t dx, int16_t dy) {
+    uint8_t pkt[FAST_CMD_PACKET_SIZE];
+    size_t len = fast_build_mouse_move(pkt, dx, dy, 0, 0);
     
     // Non-blocking LED pulse using timestamp comparison
     static uint32_t led_off_time = 0;
     gpio_put(LED_PIN, 1);
     led_off_time = time_us_32() + 50;  // Schedule LED off
     
-    send_uart_packet((const uint8_t*)cmd, len);
-    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
+    send_uart_packet(pkt, len);
     tft_mouse_activity_count++;  // Track mouse commands for TFT display
     injection_count++;  // Track successful injections
     
@@ -780,12 +778,15 @@ static void send_transform_command(int16_t scale_x, int16_t scale_y, bool enable
 
 // Legacy binary send (keep for now)
 static void send_mouse_command(int16_t dx, int16_t dy, uint8_t buttons) {
-    // Use simple text protocol instead of binary
-    send_text_mouse_move(dx, dy);
+    // Use binary smooth move for movement
+    send_smooth_mouse_move(dx, dy);
     
-    // If buttons changed, could send button command
-    // For now, ignore buttons in text mode
-    (void)buttons;
+    // If buttons changed, send instant button state
+    if (buttons) {
+        uint8_t pkt[FAST_CMD_PACKET_SIZE];
+        size_t len = fast_build_mouse_move(pkt, 0, 0, buttons, 0);
+        send_uart_packet(pkt, len);
+    }
 }
 
 // ============================================================================
@@ -1312,7 +1313,6 @@ int main(void) {
     button_init();
     hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
     latency_tracker_init(); // Initialize latency tracking
-    protocol_luts_init();   // Initialize protocol translation LUTs
     
     // Initialize Core1 translator
     core1_translator_init();

@@ -28,7 +28,7 @@
 // Configuration
 //--------------------------------------------------------------------+
 
-#define UART_RX_BUFFER_SIZE     512
+#define UART_RX_BUFFER_SIZE     2048
 #define UART_RX_BUFFER_MASK     (UART_RX_BUFFER_SIZE - 1)
 
 //--------------------------------------------------------------------+
@@ -993,13 +993,12 @@ void kmbox_serial_task(void) {
     // Process pending timed moves
     process_pending_timed_move();
     
-    // Process RX buffer — drain up to 16 packets per call to avoid
-    // starving tud_task() while still batch-processing bursts efficiently.
-    // Reduced from 32 to 16 to prevent core0 starvation under high-rate
-    // Ferrum traffic with full humanization (each move subdivides into 5-8 queue entries).
-    // At 3 Mbaud with 8-byte packets, 16 packets = ~427µs of buffer.
-    uint8_t packets_processed = 0;
-    const uint8_t MAX_PACKETS_PER_CALL = 16;
+    // Process RX buffer — drain up to 64 packets per call.
+    // The 0x01 fast move path is just two atomic adds (~10ns each),
+    // so we can process aggressively without starving tud_task().
+    // At 3 Mbaud with 8-byte packets, 64 packets = ~1.7ms of buffer.
+    uint16_t packets_processed = 0;
+    const uint16_t MAX_PACKETS_PER_CALL = 64;
     
     while (rx_available() > 0 && packets_processed < MAX_PACKETS_PER_CALL) {
         uint8_t first = rx_peek_at(0);

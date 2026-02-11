@@ -299,7 +299,7 @@ static bool process_keyboard_report_internal(const hid_keyboard_report_t *report
 static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 
 // Humanization helpers
-static void apply_output_humanization(int16_t *x, int16_t *y);
+static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x, int16_t injected_y);
 static inline int8_t clamp_i8(int32_t val);
 
 // --- Runtime HID descriptor mirroring storage & helpers ---
@@ -498,20 +498,30 @@ static __force_inline int8_t clamp_i8(int32_t val) {
 }
 
 //--------------------------------------------------------------------+
-// Final Stage Humanization (Applied to ALL movement sources)
+// Final Stage Humanization (Applied proportionally to injected movement)
 //--------------------------------------------------------------------+
 
 /**
  * Apply humanization tremor to final HID output movement.
- * This is called AFTER all movement sources are combined (physical mouse,
- * kmbox accumulator, smooth queue) to ensure consistent humanization
- * regardless of input pathway.
  * 
- * @param x Pointer to X movement (modified in place)
- * @param y Pointer to Y movement (modified in place)
+ * KEY DESIGN: Human mouse movement is already human — it doesn't need
+ * additional tremor/jitter. Tremor is only applied proportionally to the
+ * synthetic (injected) fraction of the total movement. This keeps the
+ * mouse feeling natural and responsive during normal use while still
+ * humanizing injected/bot movement.
+ * 
+ * Blend logic:
+ *   - Pure physical movement (injected == 0): no tremor applied
+ *   - Mixed (physical + injected): tremor scaled by injected fraction
+ *   - Pure injected (no physical): full tremor applied
+ * 
+ * @param x Pointer to total X movement (modified in place)
+ * @param y Pointer to total Y movement (modified in place)
+ * @param injected_x The injected/synthetic X component (smooth queue + kmbox serial)
+ * @param injected_y The injected/synthetic Y component (smooth queue + kmbox serial)
  */
-static void apply_output_humanization(int16_t *x, int16_t *y) {
-    // Skip only if humanization is completely disabled
+static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x, int16_t injected_y) {
+    // Skip if humanization is completely disabled
     humanization_mode_t mode = smooth_get_humanization_mode();
     if (mode == HUMANIZATION_OFF) {
         return;
@@ -526,10 +536,43 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
         return;
     }
     
-    // Calculate movement magnitude
-    float fx = (float)(*x);
-    float fy = (float)(*y);
-    float magnitude = sqrtf(fx * fx + fy * fy);
+    // --- Calculate blend ratio: how much of this movement is synthetic? ---
+    // If there's no injected component, the user is just moving their mouse.
+    // Human movement is already human — don't add tremor to it.
+    float inject_mag = sqrtf((float)injected_x * injected_x + (float)injected_y * injected_y);
+    
+    // No injected movement — nothing to humanize. Do NOT apply tremor.
+    // This prevents phantom tremor after injection queue drains (the "shaking" bug).
+    if (inject_mag < 0.5f) {
+        return;
+    }
+    
+    float total_mag  = sqrtf((float)(*x) * (*x) + (float)(*y) * (*y));
+    
+    // No movement at all — skip (don't generate idle tremor on pure physical idle)
+    if (total_mag < 0.5f && inject_mag < 0.5f) {
+        return;
+    }
+    
+    // Blend ratio: 0.0 = pure physical, 1.0 = pure injected
+    float blend;
+    if (total_mag < 0.5f) {
+        // Total is ~zero but inject is non-zero (rare edge: physical cancelled inject)
+        blend = 1.0f;
+    } else {
+        blend = inject_mag / total_mag;
+        // Clamp to [0, 1] — inject_mag can exceed total_mag if they oppose
+        if (blend > 1.0f) blend = 1.0f;
+    }
+    
+    // If movement is almost entirely physical, skip tremor entirely
+    // This threshold avoids wasting FPU cycles for negligible tremor
+    if (blend < 0.05f) {
+        return;
+    }
+    
+    // --- Calculate tremor magnitude ---
+    float magnitude = total_mag;
     
     // Mode-dependent intensity scaling
     float mode_scale = 1.0f;
@@ -547,11 +590,10 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
             break;
     }
     
-    // Calculate tremor scale — use movement_scale for moving cursor,
-    // idle-level tremor for zero/micro movement (the anti-cheat sweet spot)
+    // Calculate tremor scale with blend factor
     float movement_scale = humanization_jitter_scale(magnitude);
     float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
-    float tremor_scale = base_jitter * movement_scale * mode_scale;
+    float tremor_scale = base_jitter * movement_scale * mode_scale * blend;
     
     // Get runtime tremor (layered oscillators + noise)
     float tremor_x, tremor_y;
@@ -559,6 +601,8 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
     
     if (magnitude > 2.0f) {
         // Moving cursor: perpendicular + parallel decomposition
+        float fx = (float)(*x);
+        float fy = (float)(*y);
         float norm_x = fx / magnitude;
         float norm_y = fy / magnitude;
         
@@ -574,7 +618,7 @@ static void apply_output_humanization(int16_t *x, int16_t *y) {
         *x = (int16_t)(*x + (int16_t)(perp_dx + para_dx + 0.5f));
         *y = (int16_t)(*y + (int16_t)(perp_dy + para_dy + 0.5f));
     } else {
-        // Idle / micro-movement: apply tremor as raw X/Y (no direction to decompose)
+        // Small/idle movement with injection active: apply tremor as raw X/Y
         *x += (int16_t)(tremor_x + 0.5f);
         *y += (int16_t)(tremor_y + 0.5f);
     }
@@ -1453,8 +1497,9 @@ static bool __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         my += smooth_y;
     }
 
-    // Apply output-stage humanization (tremor) — single point for all paths
-    apply_output_humanization(&mx, &my);
+    // Apply output-stage humanization (tremor) — scaled by injected fraction
+    // Physical mouse movement is already human; only humanize the synthetic part
+    apply_output_humanization(&mx, &my, smooth_x, smooth_y);
 
     // --- Check endpoint readiness ---
     if (!tud_hid_ready()) {
@@ -1651,11 +1696,11 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
         y = (total_y > 127) ? 127 : ((total_y < -128) ? -128 : (int8_t)total_y);
     }
     
-    // *** CRITICAL FIX: Apply humanization to physical mouse path too ***
-    // Convert to int16_t for humanization (avoid overflow)
+    // Apply humanization scaled by injected fraction
+    // Physical mouse movement is already human; only humanize the synthetic part
     int16_t x16 = x;
     int16_t y16 = y;
-    apply_output_humanization(&x16, &y16);
+    apply_output_humanization(&x16, &y16, smooth_x, smooth_y);
     x = (int8_t)clamp_i8(x16);
     y = (int8_t)clamp_i8(y16);
 
@@ -1822,9 +1867,9 @@ void hid_device_task(void)
                 y += smooth_y;
             }
             
-            // *** CRITICAL FIX: Apply humanization to FINAL output ***
-            // This ensures ALL movements (kmbox, smooth, physical) get tremor
-            apply_output_humanization(&x, &y);
+            // All movement is injected (no physical mouse) — full humanization
+            // Pass total as injected since it's all synthetic
+            apply_output_humanization(&x, &y, x, y);
             
             // Send if there's any movement, wheel, OR button state to report.
             // Button-only changes (clicks with no movement) must send immediately.
@@ -1864,9 +1909,9 @@ void hid_device_task(void)
             int16_t x16 = smooth_x;
             int16_t y16 = smooth_y;
 
-            // Apply humanization to smooth injection
+            // Apply humanization to smooth injection (fully synthetic)
             if (x16 != 0 || y16 != 0) {
-                apply_output_humanization(&x16, &y16);
+                apply_output_humanization(&x16, &y16, x16, y16);
             }
 
             if (x16 != 0 || y16 != 0 || buttons_changed) {
