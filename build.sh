@@ -26,6 +26,7 @@ usage() {
     echo "  pico2     Build main KMBox for RP2350 (Pico 2)"
     echo "  bridge    Build UART bridge for Metro RP2350 + ILI9341 (default)"
     echo "  bridge-feather  Build UART bridge for Feather RP2350 + ST7735"
+    echo "  bridge-fpga     Build FPGA bridge for pico2-ice (iCE40 + RP2350)"
     echo "  both      Build main KMBox for Metro RP2350 and Pico 2"
     echo "  all       Build and flash KMBox + Bridge (Metro RP2350, interactive)"
     echo "  flash-metros  Build and flash both Metros (KMBox + Bridge) [default]"
@@ -43,6 +44,7 @@ usage() {
     echo "  $0 metro flash       # Build and flash for Metro RP2350"
     echo "  $0 pico2 flash       # Build and flash for RP2350 (Pico 2)"
     echo "  $0 bridge            # Build UART bridge for Metro RP2350 + ILI9341"
+    echo "  $0 bridge-fpga       # Build FPGA bridge for pico2-ice"
     echo "  $0 all               # Build & flash KMBox + Bridge (Metro, guided)"
     echo "  $0 both clean        # Clean build Metro + Pico 2"
 }
@@ -149,6 +151,52 @@ build_bridge() {
     fi
 }
 
+build_bridge_fpga() {
+    local build_dir="$SCRIPT_DIR/bridge-fpga/build"
+    
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}Building FPGA Bridge for pico2-ice${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    
+    # Check for FPGA toolchain
+    local missing_tools=0
+    for tool in yosys nextpnr-ice40 icepack; do
+        if ! command -v "$tool" &>/dev/null; then
+            echo -e "${RED}Missing required tool: $tool${NC}"
+            missing_tools=1
+        fi
+    done
+    if [ "$missing_tools" = "1" ]; then
+        echo -e "${YELLOW}Install OSS FPGA toolchain: brew install yosys nextpnr icestorm${NC}"
+        return 1
+    fi
+    
+    if [ "$CLEAN" = "1" ]; then
+        echo "Cleaning $build_dir..."
+        rm -rf "$build_dir"
+    fi
+    
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+    
+    echo "Configuring..."
+    PICO_SDK_PATH="$PICO_SDK_PATH" cmake "$SCRIPT_DIR/bridge-fpga" \
+        -DPICO_BOARD="pico2_ice" \
+        -DCMAKE_BUILD_TYPE=Release
+    
+    echo "Building (includes Verilog synthesis)..."
+    make -j"$NJOBS"
+    
+    if [ -f "kmbox_fpga_bridge.uf2" ]; then
+        local size=$(ls -la kmbox_fpga_bridge.uf2 | awk '{print $5}')
+        echo -e "${GREEN}✓ Built: $build_dir/kmbox_fpga_bridge.uf2 ($size bytes)${NC}"
+        return 0
+    else
+        echo -e "${RED}✗ FPGA bridge build failed${NC}"
+        return 1
+    fi
+}
+
 wait_for_device() {
     local name=$1
     echo ""
@@ -215,7 +263,7 @@ FLASH=0
 
 for arg in "$@"; do
     case $arg in
-        pico2|metro|bridge|bridge-metro|bridge-feather|both|all|dual-metro|flash-metros|white-label|white-label-verify)
+        pico2|metro|bridge|bridge-metro|bridge-feather|bridge-fpga|both|all|dual-metro|flash-metros|white-label|white-label-verify)
             TARGET="$arg"
             ;;
         clean)
@@ -279,6 +327,13 @@ case $TARGET in
         if [ "$FLASH" = "1" ]; then
             wait_for_device "UART Bridge (Feather RP2350)"
             flash_firmware "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" "UART Bridge (Feather)"
+        fi
+        ;;
+    bridge-fpga)
+        build_bridge_fpga
+        if [ "$FLASH" = "1" ]; then
+            wait_for_device "FPGA Bridge (pico2-ice)"
+            flash_firmware "$SCRIPT_DIR/bridge-fpga/build/kmbox_fpga_bridge.uf2" "FPGA Bridge (pico2-ice)"
         fi
         ;;
     dual-metro)
@@ -449,3 +504,4 @@ echo "Firmware locations:"
 [ -f "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" ] && echo "  KMBox (Metro RP2350):      build-metro/PIOKMbox.uf2"
 [ -f "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" ] && echo "  Bridge (Feather):          bridge/build/kmbox_bridge.uf2"
 [ -f "$SCRIPT_DIR/bridge/build-metro/kmbox_bridge.uf2" ] && echo "  Bridge (Metro RP2350):     bridge/build-metro/kmbox_bridge.uf2"
+[ -f "$SCRIPT_DIR/bridge-fpga/build/kmbox_fpga_bridge.uf2" ] && echo "  Bridge (FPGA pico2-ice):   bridge-fpga/build/kmbox_fpga_bridge.uf2"

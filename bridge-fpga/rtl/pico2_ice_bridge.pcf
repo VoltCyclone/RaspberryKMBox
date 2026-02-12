@@ -1,0 +1,26 @@
+# KMBox FPGA Bridge - Pin Constraints for pico2-ice
+# iCE40 UP5K in SG48 package
+#
+# References:
+#   pico-ice-sdk/rtl/pico2_ice.pcf (master pin catalogue)
+#   pico2-ice schematic
+
+# Clock from RP2350 (48 MHz via GPOUT0)
+set_io -nowarn CLK              35
+
+# SPI bus (shared with CRAM/flash - directly connected to RP2350)
+set_io -nowarn ICE_SCK          15
+set_io -nowarn ICE_SI           17   # MOSI from RP2350 perspective (into FPGA)
+set_io -nowarn ICE_SO           14   # MISO from RP2350 perspective (out of FPGA)
+set_io -nowarn ICE_SSN          16   # Chip select (active low)
+
+# UART to KMBox device (via PMOD A top connector)
+# Pin 2 (ICE_PMOD_A_TOP_IO2) = FPGA TX → KMBox RX
+# Pin 4 (ICE_PMOD_A_TOP_IO1) = FPGA RX ← KMBox TX
+set_io -nowarn UART_TX          2
+set_io -nowarn UART_RX          4
+
+# RGB status LEDs (active low, accent from RP2350)
+set_io -nowarn LED_R            41
+set_io -nowarn LED_G            39
+set_io -nowarn LED_B            40
