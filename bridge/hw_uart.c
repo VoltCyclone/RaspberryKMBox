@@ -1,25 +1,21 @@
 /**
  * Hardware UART Driver for KMBox Bridge
- * 
+ *
  * High-performance hardware UART implementation with DMA support.
- * 
- * Clock Configuration for Overclocking:
- * When CPU is overclocked above 133MHz, clk_peri is switched to 48MHz USB PLL
- * to ensure stable UART timing. At 240MHz system clock with 240MHz clk_peri,
- * UART baudrate divisors become fractional causing timing drift.
- * 
- * At 48MHz: 48000000 / 921600 = 52.08 (acceptable error)
- * At 240MHz: 240000000 / 921600 = 260.4 (excessive error)
+ *
+ * Clock: We keep clk_peri at the system clock (240MHz) because 3Mbaud
+ * divides exactly: 240M / (16 * 5) = 3.0M.  Keeping clk_peri high
+ * also benefits SPI throughput for the TFT display (40MHz vs 24MHz).
  */
 
 #include "hw_uart.h"
+#include "dma_uart.h"
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
-#include "hardware/vreg.h"
 #include "hardware/structs/uart.h"
 #include <stdio.h>
 #include <string.h>
@@ -54,46 +50,12 @@ static void tx_dma_irq_handler(void) {
     }
 }
 
-/**
- * Configure peripheral clock for stable UART operation
- * 
- * After set_sys_clock_khz() is called, clk_peri is automatically attached to
- * USB PLL (48MHz). For maximum UART performance, we attach it directly to the
- * system PLL instead, keeping it at the full system clock speed.
- * 
- * CRITICAL: Must be called AFTER set_sys_clock_khz() and BEFORE uart_init()!
- */
-static void configure_stable_peri_clock(void) {
-    uint32_t peri_freq_before = clock_get_hz(clk_peri);
-    uint32_t sys_freq = clock_get_hz(clk_sys);
-    
-    printf("[HW_UART] clk_sys=%luHz, clk_peri=%luHz (before)\n", sys_freq, peri_freq_before);
-    
-    // If overclocked, switch clk_peri to stable 48MHz USB PLL
-    // This avoids fractional baudrate divisors that cause timing drift
-    if (sys_freq > 133000000) {
-        printf("[HW_UART] Overclock detected! Switching clk_peri to 48MHz USB PLL\n");
-        clock_configure(
-            clk_peri,
-            0,                                                // No glitchless mux
-            CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB, // USB PLL (48MHz)
-            48000000,                                         // 48MHz input
-            48000000                                          // 48MHz output
-        );
-    }
-    
-    uint32_t peri_freq_after = clock_get_hz(clk_peri);
-    printf("[HW_UART] clk_peri now %luHz (%.2f MHz)\n", peri_freq_after, peri_freq_after / 1000000.0f);
-}
-
 bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
-    // CRITICAL: Configure stable peripheral clock BEFORE UART init
-    // This must happen first so uart_init() calculates correct divisor
-    configure_stable_peri_clock();
-    
-    // Log the peripheral clock frequency that uart_init will use for baud calculation
+    // NOTE: We intentionally skip peri_clock_configure_stable() here.
+    // 3Mbaud divides exactly from 240MHz (div=5), and keeping clk_peri
+    // at 240MHz gives the TFT SPI bus 40MHz instead of 24MHz.
     uint32_t peri_freq = clock_get_hz(clk_peri);
-    printf("[HW_UART] Using clk_peri: %lu Hz (%.2f MHz) for UART baud calculation\n", 
+    printf("[HW_UART] clk_peri: %lu Hz (%.2f MHz)\n",
            peri_freq, peri_freq / 1000000.0f);
     
     // Set up GPIO pins with correct UART function select BEFORE uart_init
@@ -267,65 +229,39 @@ void hw_uart_puts(const char *str) {
     }
 }
 
+#define RX_MASK (HW_UART_RX_BUFFER_SIZE - 1)
+
 static inline uint32_t get_rx_write_pos(void) {
-    if (rx_dma_chan < 0) return 0;
-    uintptr_t write_addr = (uintptr_t)dma_channel_hw_addr(rx_dma_chan)->write_addr;
-    uintptr_t base_addr = (uintptr_t)rx_buffer;
-    return (uint32_t)((write_addr - base_addr) & (HW_UART_RX_BUFFER_SIZE - 1));
+    return dma_ring_write_pos(rx_dma_chan, rx_buffer, RX_MASK);
 }
 
 bool hw_uart_rx_available(void) {
-    uint32_t write_pos = get_rx_write_pos();
-    return (write_pos != rx_read_pos);
+    return dma_ring_available(rx_read_pos, get_rx_write_pos(), RX_MASK) > 0;
 }
 
 size_t hw_uart_rx_count(void) {
-    uint32_t write_pos = get_rx_write_pos();
-    size_t available = (write_pos - rx_read_pos) & (HW_UART_RX_BUFFER_SIZE - 1);
-    if (available >= HW_UART_RX_BUFFER_SIZE - 16) {
+    uint32_t avail = dma_ring_available(rx_read_pos, get_rx_write_pos(), RX_MASK);
+    if (avail >= HW_UART_RX_BUFFER_SIZE - 16) {
         rx_overflows++;
     }
-    return available;
+    return avail;
 }
 
 int hw_uart_getc(void) {
-    uint32_t write_pos = get_rx_write_pos();
-    if (write_pos == rx_read_pos) {
-        return -1;
-    }
-    
+    if (!hw_uart_rx_available()) return -1;
+
     uint8_t c = rx_buffer[rx_read_pos];
-    rx_read_pos = (rx_read_pos + 1) & (HW_UART_RX_BUFFER_SIZE - 1);
+    rx_read_pos = (rx_read_pos + 1) & RX_MASK;
     total_rx_bytes++;
-    
-    // REMOVED: WS2812 debug flashing - was causing 1-2µs jitter in hot path
-    // Status LED updates handled by main loop neopixel task
-    
     return c;
 }
 
 size_t hw_uart_read(uint8_t *buf, size_t maxlen) {
     if (maxlen == 0) return 0;
-    
-    uint32_t write_pos = get_rx_write_pos();
-    size_t available = (write_pos - rx_read_pos) & (HW_UART_RX_BUFFER_SIZE - 1);
-    if (available == 0) return 0;
-    
-    size_t to_read = (available < maxlen) ? available : maxlen;
-    
-    size_t first_chunk = HW_UART_RX_BUFFER_SIZE - rx_read_pos;
-    if (first_chunk > to_read) first_chunk = to_read;
-    
-    memcpy(buf, &rx_buffer[rx_read_pos], first_chunk);
-    
-    if (to_read > first_chunk) {
-        memcpy(buf + first_chunk, rx_buffer, to_read - first_chunk);
-    }
-    
-    rx_read_pos = (rx_read_pos + to_read) & (HW_UART_RX_BUFFER_SIZE - 1);
-    total_rx_bytes += to_read;
-    
-    return to_read;
+    uint32_t wp = get_rx_write_pos();
+    size_t n = dma_ring_read(rx_buffer, &rx_read_pos, wp, RX_MASK, buf, maxlen);
+    total_rx_bytes += n;
+    return n;
 }
 
 bool hw_uart_tx_ready(void) {

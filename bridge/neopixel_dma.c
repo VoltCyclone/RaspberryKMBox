@@ -12,6 +12,7 @@
 
 #include "neopixel_dma.h"
 #include "config.h"
+#include "led_color.h"
 
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
@@ -86,34 +87,10 @@ static inline uint32_t rgb_to_pio(uint8_t r, uint8_t g, uint8_t b) {
     return grb << 8;  // WS2812 PIO expects data in top 24 bits
 }
 
-/** Apply 0-255 brightness to an RGB triplet (integer math, no FPU). */
-static inline void apply_brightness(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t bright) {
-    *r = (uint8_t)(((uint16_t)*r * bright) >> 8);
-    *g = (uint8_t)(((uint16_t)*g * bright) >> 8);
-    *b = (uint8_t)(((uint16_t)*b * bright) >> 8);
-}
-
-/** Simple HSV→RGB (hue 0-359, saturation & value 0-255). Integer only. */
-static void hsv_to_rgb(uint16_t h, uint8_t s, uint8_t v,
-                        uint8_t *r, uint8_t *g, uint8_t *b) {
-    if (s == 0) { *r = *g = *b = v; return; }
-
-    uint8_t region  = h / 60;
-    uint16_t remainder = (h - (region * 60)) * 6; // 0-359 → 0-354 → ×6 ≤ 2124
-
-    uint8_t p = (uint8_t)(((uint16_t)v * (255 - s)) >> 8);
-    uint8_t q = (uint8_t)(((uint16_t)v * (255 - ((s * remainder) >> 8))) >> 8);
-    uint8_t t = (uint8_t)(((uint16_t)v * (255 - ((s * (1530 - remainder)) >> 8))) >> 8);
-
-    switch (region) {
-        case 0:  *r = v; *g = t; *b = p; break;
-        case 1:  *r = q; *g = v; *b = p; break;
-        case 2:  *r = p; *g = v; *b = t; break;
-        case 3:  *r = p; *g = q; *b = v; break;
-        case 4:  *r = t; *g = p; *b = v; break;
-        default: *r = v; *g = p; *b = q; break;
-    }
-}
+// HSV→RGB and brightness scaling provided by shared lib/led-utils/led_color.h
+// Local aliases for shorter call sites
+#define apply_brightness  led_apply_brightness_u8
+#define hsv_to_rgb        led_hsv_to_rgb
 
 // ── Timer ISR (~30 Hz) ──────────────────────────────────────────────
 

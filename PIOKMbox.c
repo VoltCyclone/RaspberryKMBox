@@ -25,6 +25,7 @@
 #include "state_management.h"
 #include "kmbox_serial_handler.h"
 #include "smooth_injection.h"
+#include "peri_clock.h"
 
 #if PIO_USB_AVAILABLE
 #include "pio_usb.h"
@@ -178,34 +179,6 @@ static void core1_task_loop(void) {
 // System Initialization Functions
 //--------------------------------------------------------------------+
 
-/**
- * Configure peripheral clock for stable UART operation at overclock speeds
- * 
- * MUST be called BEFORE uart_init() when running at 240MHz!
- * Switches clk_peri from clk_sys (240MHz) to USB PLL (48MHz) for stability.
- * 
- * CRITICAL: Must be called AFTER set_sys_clock_khz() and BEFORE uart_init()!
- */
-static void configure_stable_peri_clock(void) {
-    uint32_t sys_freq = clock_get_hz(clk_sys);
-    
-    printf("[UART] clk_sys = %lu Hz\n", sys_freq);
-    
-    // If overclocked (>133MHz), switch clk_peri to 48MHz USB PLL
-    if (sys_freq > 133000000) {
-        printf("[UART] Overclock detected! Switching clk_peri to 48MHz USB PLL\n");
-        
-        clock_configure(clk_peri,
-                        0,  // No glitchless mux for clk_peri
-                        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-                        48000000,
-                        48000000);
-        
-        uint32_t peri_freq = clock_get_hz(clk_peri);
-        printf("[UART] clk_peri now = %lu Hz\n", peri_freq);
-    }
-}
-
 static bool initialize_system(void) {
     // Initialize stdio first for early debug output
     stdio_init_all();
@@ -223,7 +196,7 @@ static bool initialize_system(void) {
     
     // CRITICAL: Configure stable peripheral clock BEFORE UART init
     // This must happen before kmbox_serial_init() so uart_init() calculates correct divisor
-    configure_stable_peri_clock();
+    peri_clock_configure_stable();
     
     // Re-initialize stdio after clock change with proper delay
     sleep_ms(100);  // Allow clock to stabilize

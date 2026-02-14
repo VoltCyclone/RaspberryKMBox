@@ -13,6 +13,7 @@
  */
 
 #include "ft6206_touch.h"
+#include "tft.h"
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
@@ -61,9 +62,9 @@ static touch_point_t last_touch_point = {0, 0, false};  // Coordinates at touch-
 // Calibration (defaults match Adafruit 2.8" ILI9341 capacitive shield)
 static touch_calibration_t calibration = {
     .x_min = 0,
-    .x_max = 240,
+    .x_max = TFT_RAW_WIDTH,
     .y_min = 0,
-    .y_max = 320,
+    .y_max = TFT_RAW_HEIGHT,
     .swap_xy = false,
     .invert_x = false,
     .invert_y = true     // Display Y=0 is top, but touch Y=0 is bottom on Metro RP2350
@@ -203,18 +204,18 @@ bool ft6206_read(touch_point_t *point) {
         cy = tmp;
     }
     
-    // Map to calibrated range
-    cx = ((cx - calibration.x_min) * 240) / (calibration.x_max - calibration.x_min);
-    cy = ((cy - calibration.y_min) * 320) / (calibration.y_max - calibration.y_min);
-    
-    if (calibration.invert_x) cx = 239 - cx;
-    if (calibration.invert_y) cy = 319 - cy;
-    
+    // Map to display coordinates
+    cx = ((cx - calibration.x_min) * TFT_RAW_WIDTH) / (calibration.x_max - calibration.x_min);
+    cy = ((cy - calibration.y_min) * TFT_RAW_HEIGHT) / (calibration.y_max - calibration.y_min);
+
+    if (calibration.invert_x) cx = TFT_RAW_WIDTH - 1 - cx;
+    if (calibration.invert_y) cy = TFT_RAW_HEIGHT - 1 - cy;
+
     // Clamp
     if (cx < 0) cx = 0;
-    if (cx > 239) cx = 239;
+    if (cx > TFT_RAW_WIDTH - 1) cx = TFT_RAW_WIDTH - 1;
     if (cy < 0) cy = 0;
-    if (cy > 319) cy = 319;
+    if (cy > TFT_RAW_HEIGHT - 1) cy = TFT_RAW_HEIGHT - 1;
     
     point->x = (uint16_t)cx;
     point->y = (uint16_t)cy;

@@ -1,0 +1,3 @@
+add_library(peri_clock peri_clock.c)
+target_include_directories(peri_clock PUBLIC include)
+target_link_libraries(peri_clock pico_stdlib hardware_clocks)

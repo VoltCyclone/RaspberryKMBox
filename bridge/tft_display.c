@@ -167,9 +167,9 @@ static volatile bool touch_view_requested = false;
 static volatile bool touch_api_requested = false;
 static volatile bool touch_human_requested = false;
 
-// Touch zone boundaries (240x320 display split into thirds)
-#define TOUCH_ZONE_TOP_END     106
-#define TOUCH_ZONE_MID_END     213
+// Touch zone boundaries (display split into thirds, adapts to any height)
+#define TOUCH_ZONE_TOP_END     (TFT_HEIGHT / 3)
+#define TOUCH_ZONE_MID_END     (TFT_HEIGHT * 2 / 3)
 
 // Double-buffered stats: main loop writes, timer ISR reads
 static tft_stats_t shared_stats;           // Latest stats from main loop
@@ -724,49 +724,84 @@ static inline int angle_to_idx(int deg) {
     return idx;
 }
 
-static void draw_circular_gauge(int cx, int cy, int radius, float value, float max_value, 
-                                const char* label, uint8_t color) {
-    // Draw gauge outline using LUT
-    for (int r = radius - 2; r <= radius; r++) {
-        for (int ai = 0; ai < SINCOS_LUT_SIZE; ai++) {
-            int x = cx + (r * lut_cos(ai) + 16384) / 32768;
-            int y = cy + (r * lut_sin(ai) + 16384) / 32768;
-            if (x >= 0 && x < TFT_WIDTH && y >= 0 && y < TFT_HEIGHT) {
-                tft_input[y * TFT_WIDTH + x] = COL_DARK;
-            }
+// Draw a Bresenham circle ring directly into the framebuffer
+static void draw_circle_ring(int cx, int cy, int r_inner, int r_outer, uint8_t color) {
+    int r2_inner = r_inner * r_inner;
+    int r2_outer = r_outer * r_outer;
+
+    for (int dy = -r_outer; dy <= r_outer; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= TFT_HEIGHT) continue;
+
+        int dy2 = dy * dy;
+        // Solve for x range: r_inner^2 <= dx^2+dy^2 <= r_outer^2
+        int xo2 = r2_outer - dy2;
+        if (xo2 < 0) continue;
+
+        // Outer x extent (integer sqrt via isqrt approximation)
+        int xo = 0;
+        while ((xo + 1) * (xo + 1) <= xo2) xo++;
+
+        // Inner x extent (hollow center)
+        int xi = 0;
+        int xi2 = r2_inner - dy2;
+        if (xi2 > 0) {
+            while ((xi + 1) * (xi + 1) <= xi2) xi++;
+            xi++; // inner boundary is exclusive
         }
+
+        uint8_t *row = &tft_input[py * TFT_WIDTH];
+
+        // Left arc segment
+        int x0 = cx - xo;
+        int x1 = cx - xi;
+        if (x0 < 0) x0 = 0;
+        if (x1 > TFT_WIDTH) x1 = TFT_WIDTH;
+        if (x0 < x1) memset(&row[x0], color, x1 - x0);
+
+        // Right arc segment
+        x0 = cx + xi;
+        x1 = cx + xo + 1;
+        if (x0 < 0) x0 = 0;
+        if (x1 > TFT_WIDTH) x1 = TFT_WIDTH;
+        if (x0 < x1) memset(&row[x0], color, x1 - x0);
     }
-    
-    // Draw value arc using LUT
+}
+
+static void draw_circular_gauge(int cx, int cy, int radius, float value, float max_value,
+                                const char* label, uint8_t color) {
+    // Draw gauge outline ring (3px thick)
+    draw_circle_ring(cx, cy, radius - 2, radius, COL_DARK);
+
+    // Draw value arc using LUT (6px thick band)
     float percentage = (value / max_value);
     if (percentage > 1.0f) percentage = 1.0f;
     int end_angle = (int)(percentage * 270.0f) - 135;
-    
+
     for (int angle = -135; angle < end_angle && angle < 135; angle += 2) {
         int ai = angle_to_idx(angle);
         int16_t s = lut_sin(ai);
         int16_t c = lut_cos(ai);
+        // Draw just inner and outer edge pixels of the arc band
         for (int r = radius - 8; r <= radius - 3; r++) {
             int x = cx + (r * c + 16384) / 32768;
             int y = cy + (r * s + 16384) / 32768;
-            if (x >= 0 && x < TFT_WIDTH && y >= 0 && y < TFT_HEIGHT) {
+            if ((unsigned)x < (unsigned)TFT_WIDTH && (unsigned)y < (unsigned)TFT_HEIGHT) {
                 tft_input[y * TFT_WIDTH + x] = color;
             }
         }
     }
-    
-    // Draw value text in center (lean formatting)
+
+    // Draw value text in center
     char value_str[16];
     char *p = u32_to_str(value_str, (uint32_t)(value + 0.5f));
     *p = '\0';
     int text_len = (int)(p - value_str);
-    int text_x = cx - (text_len * FONT_W) / 2;
-    tft_draw_string(text_x, cy - FONT_H / 2, color, value_str);
-    
+    tft_draw_string(cx - (text_len * FONT_W) / 2, cy - FONT_H / 2, color, value_str);
+
     // Draw label below
     int label_len = strlen(label);
-    int label_x = cx - (label_len * FONT_W) / 2;
-    tft_draw_string(label_x, cy + radius + 4, COL_GRAY, label);
+    tft_draw_string(cx - (label_len * FONT_W) / 2, cy + radius + 4, COL_GRAY, label);
 }
 
 static void draw_bar_gauge(int x, int y, int width, int height, float value, float max_value,

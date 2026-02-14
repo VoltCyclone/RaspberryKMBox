@@ -67,11 +67,26 @@
 // UART configuration for KMBox serial communication with RP2350 Bridge
 // Physical connection (crossed wiring):
 // The RP2350 bridge provides USB CDC interface to PC and translates to/from KMBox
-#define BRIDGE_UART_TX_PIN      PICO_DEFAULT_UART_TX_PIN   
-#define BRIDGE_UART_RX_PIN      PICO_DEFAULT_UART_RX_PIN  
-#define KMBOX_UART              uart0    // UART0 instance
+//
+// UART instance selection (set via CMake -DKMBOX_UART_INSTANCE=0 or 1):
+//   Instance 0: UART0 on GPIO 0 (TX) / GPIO 1 (RX)  — default, Metro bridge
+//   Instance 1: UART1 on GPIO 8 (TX) / GPIO 9 (RX)  — Feather bridge
+#ifndef KMBOX_UART_INSTANCE
+#define KMBOX_UART_INSTANCE     0
+#endif
+
+#if KMBOX_UART_INSTANCE == 1
+#define KMBOX_UART              uart1
+#define KMBOX_UART_TX_PIN       8       // UART1 TX (to Bridge RX)
+#define KMBOX_UART_RX_PIN       9       // UART1 RX (from Bridge TX)
+#else
+#define KMBOX_UART              uart0
 #define KMBOX_UART_TX_PIN       PICO_DEFAULT_UART_TX_PIN    // UART0 TX (to Bridge RX)
 #define KMBOX_UART_RX_PIN       PICO_DEFAULT_UART_RX_PIN    // UART0 RX (from Bridge TX)
+#endif
+
+#define BRIDGE_UART_TX_PIN      KMBOX_UART_TX_PIN
+#define BRIDGE_UART_RX_PIN      KMBOX_UART_RX_PIN
 #define KMBOX_UART_BAUDRATE     3000000  // Baud rate (must match bridge) - 3 Mbaud for max throughput
                                         // At 48MHz clk_peri: 48000000/3000000 = 16 (exact, 0 ppm error)
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering

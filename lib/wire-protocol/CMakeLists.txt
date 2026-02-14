@@ -1,0 +1,2 @@
+add_library(wire_protocol INTERFACE)
+target_include_directories(wire_protocol INTERFACE include)

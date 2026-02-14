@@ -1,9 +1,9 @@
 /**
- * Configuration for KMBox Bridge Autopilot
- * 
- * This header defines all tunable parameters for the color tracking
- * and mouse control system running on the RP2350 bridge.
- * 
+ * Configuration for KMBox Bridge
+ *
+ * This header defines all tunable parameters for the bridge firmware.
+ * Feature flags control which subsystems are compiled in.
+ *
  * UART Architecture:
  * Both devices use UART0 for communication with crossed wiring:
  * This eliminates the need for PIO-based UART and frees up state machines.
@@ -14,9 +14,25 @@
 
 #include "pico/stdlib.h"
 
+// ============================================================================
+// Feature Flags (set via CMake or override here)
+// ============================================================================
+
+#ifndef ENABLE_TFT_DISPLAY
+#define ENABLE_TFT_DISPLAY       0
+#endif
+
+#ifndef ENABLE_COLOR_TRACKER
+#define ENABLE_COLOR_TRACKER     0
+#endif
+
+#ifndef ENABLE_MAKCU_PROTOCOL
+#define ENABLE_MAKCU_PROTOCOL    0
+#endif
+
 // Hardware Configuration
-#define UART_TX_PIN          PICO_DEFAULT_UART_TX_PIN 
-#define UART_RX_PIN          PICO_DEFAULT_UART_RX_PIN 
+#define UART_TX_PIN          PICO_DEFAULT_UART_TX_PIN
+#define UART_RX_PIN          PICO_DEFAULT_UART_RX_PIN
 #define UART_BAUD            3000000  // Baud rate for RP2350<->RP2350 communication (3 Mbaud)
                                       // At 48MHz clk_peri: 48M/3M = 16 (exact, 0 ppm error)
 #define LED_PIN              PICO_DEFAULT_LED_PIN

@@ -8,6 +8,8 @@
 #include "kmbox_serial_handler.h"
 #include "lib/kmbox-commands/kmbox_commands.h"
 #include "bridge_protocol.h"
+#include "wire_protocol.h"
+#include "dma_uart.h"
 #include "usb_hid.h"
 #include "led_control.h"
 #include "smooth_injection.h"
@@ -80,20 +82,17 @@ static volatile uint16_t dma_tx_len = 0;
 static int uart_tx_dma_chan = -1;
 static volatile bool dma_tx_busy = false;
 
-// DMA-based RX: get current write position from DMA write address
-// __force_inline guarantees inlining even at -Os (Pico SDK macro)
+// Thin wrappers over shared dma_uart.h helpers, bound to our local buffer
 static __force_inline uint32_t rx_get_write_pos(void) {
-    if (uart_rx_dma_chan < 0) return 0;
-    uintptr_t write_addr = (uintptr_t)dma_channel_hw_addr(uart_rx_dma_chan)->write_addr;
-    return (uint32_t)((write_addr - (uintptr_t)uart_rx_buffer) & UART_RX_BUFFER_MASK);
+    return dma_ring_write_pos(uart_rx_dma_chan, uart_rx_buffer, UART_RX_BUFFER_MASK);
 }
 
 static __force_inline uint16_t rx_available(void) {
-    return (uint16_t)((rx_get_write_pos() - uart_rx_read_pos) & UART_RX_BUFFER_MASK);
+    return (uint16_t)dma_ring_available(uart_rx_read_pos, rx_get_write_pos(), UART_RX_BUFFER_MASK);
 }
 
 static __force_inline uint8_t rx_peek_at(uint16_t offset) {
-    return uart_rx_buffer[(uart_rx_read_pos + offset) & UART_RX_BUFFER_MASK];
+    return dma_ring_peek(uart_rx_buffer, uart_rx_read_pos, offset, UART_RX_BUFFER_MASK);
 }
 
 static __force_inline void rx_consume(uint16_t count) {
@@ -387,11 +386,130 @@ static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, s
 }
 
 //--------------------------------------------------------------------+
-// Fast Binary Command Processing (8-byte fixed packets)
+// Wire Protocol v2 Processing (variable-length, LUT-based)
 //--------------------------------------------------------------------+
 
 extern void process_mouse_report(const hid_mouse_report_t *report);
 extern void process_kbd_report(const hid_keyboard_report_t *report);
+
+static bool __not_in_flash_func(process_wire_command)(const uint8_t *pkt, uint8_t len) {
+    (void)len;
+    switch (pkt[0]) {
+        case WIRE_MOVE8: {
+            int8_t x = (int8_t)pkt[1];
+            int8_t y = (int8_t)pkt[2];
+            kmbox_add_mouse_movement(x, y);
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_MOVE16: {
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            kmbox_add_mouse_movement(x, y);
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_BUTTONS: {
+            kmbox_update_physical_buttons(pkt[1]);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_WHEEL: {
+            kmbox_add_wheel_movement((int8_t)pkt[1]);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_MOVE_ALL: {
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            if (x || y) kmbox_add_mouse_movement(x, y);
+            if (pkt[5]) kmbox_update_physical_buttons(pkt[5]);
+            if (pkt[6]) kmbox_add_wheel_movement((int8_t)pkt[6]);
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_MOVE8_BTN: {
+            int8_t x = (int8_t)pkt[1];
+            int8_t y = (int8_t)pkt[2];
+            if (x || y) kmbox_add_mouse_movement(x, y);
+            if (pkt[3]) kmbox_update_physical_buttons(pkt[3]);
+            if (pkt[4]) kmbox_add_wheel_movement((int8_t)pkt[4]);
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_SMOOTH16: {
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            inject_mode_t mode = (pkt[5] <= 3) ? (inject_mode_t)pkt[5] : INJECT_MODE_SMOOTH;
+            smooth_inject_movement(x, y, mode);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_KEYDOWN: {
+            hid_keyboard_report_t report = {.modifier = pkt[2], .keycode = {pkt[1]}};
+            process_kbd_report(&report);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_KEYUP: {
+            hid_keyboard_report_t report = {0};
+            process_kbd_report(&report);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_SMOOTH_CFG: {
+            if (pkt[1] > 0) smooth_set_max_per_frame(pkt[1]);
+            smooth_set_velocity_matching(pkt[2] != 0);
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_SMOOTH_CLR:
+            smooth_clear_queue();
+            fast_cmd_count++;
+            return true;
+        case WIRE_INFO_REQ:
+            kmbox_send_info_to_bridge();
+            fast_cmd_count++;
+            return true;
+        case WIRE_CYCLE_HUM: {
+            humanization_mode_t new_mode = smooth_cycle_humanization_mode();
+            uint32_t mode_color;
+            switch (new_mode) {
+                case HUMANIZATION_OFF:    mode_color = COLOR_HUMANIZATION_OFF;    break;
+                case HUMANIZATION_LOW:    mode_color = COLOR_HUMANIZATION_LOW;    break;
+                case HUMANIZATION_MEDIUM: mode_color = COLOR_HUMANIZATION_MEDIUM; break;
+                case HUMANIZATION_HIGH:   mode_color = COLOR_HUMANIZATION_HIGH;   break;
+                default:                  mode_color = COLOR_ERROR;               break;
+            }
+            neopixel_set_color(mode_color);
+            neopixel_trigger_mode_flash(mode_color, 1500);
+            kmbox_send_info_to_bridge();
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_PING: {
+            uint8_t resp[6];
+            uint32_t ts = (uint32_t)(time_us_64() & 0xFFFFFFFF);
+            wire_build_response(resp, WIRE_RESP_PONG,
+                (uint8_t)(ts & 0xFF), (uint8_t)((ts >> 8) & 0xFF),
+                (uint8_t)((ts >> 16) & 0xFF), (uint8_t)((ts >> 24) & 0xFF));
+            uart_send_bytes(resp, 6);
+            fast_cmd_count++;
+            return true;
+        }
+        default:
+            fast_cmd_errors++;
+            return false;
+    }
+}
+
+//--------------------------------------------------------------------+
+// Fast Binary Command Processing (8-byte fixed packets, legacy)
+//--------------------------------------------------------------------+
 
 static __force_inline bool is_fast_cmd_start(uint8_t byte) {
     if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;  // Exclude line terminators
@@ -1007,9 +1125,33 @@ void kmbox_serial_task(void) {
     
     while (rx_available() > 0 && packets_processed < MAX_PACKETS_PER_CALL) {
         uint8_t first = rx_peek_at(0);
-        
+
         //--------------------------------------------------------------
-        // Bridge protocol (sync byte 0xBD)
+        // Wire protocol v2 (command byte determines length via LUT)
+        //--------------------------------------------------------------
+        {
+            uint8_t wire_len = wire_get_packet_len(first);
+            if (wire_len > 0) {
+                if (rx_available() >= wire_len) {
+                    uint8_t pkt[WIRE_MAX_PACKET];
+                    uint16_t tail = (uint16_t)(uart_rx_read_pos & UART_RX_BUFFER_MASK);
+                    if (tail + wire_len <= UART_RX_BUFFER_SIZE) {
+                        memcpy(pkt, &uart_rx_buffer[tail], wire_len);
+                    } else {
+                        for (uint8_t i = 0; i < wire_len; i++) pkt[i] = rx_peek_at(i);
+                    }
+                    rx_consume(wire_len);
+                    process_wire_command(pkt, wire_len);
+                    mark_activity(now_ms);
+                    packets_processed++;
+                    continue;
+                }
+                break;  // Incomplete packet, wait for more data
+            }
+        }
+
+        //--------------------------------------------------------------
+        // Bridge protocol (sync byte 0xBD) — legacy
         //--------------------------------------------------------------
         if (first == BRIDGE_SYNC_BYTE) {
             uint16_t avail = rx_available();
@@ -1137,27 +1279,16 @@ void kmbox_process_bridge_injections(void) {
 //--------------------------------------------------------------------+
 
 void kmbox_send_info_to_bridge(void) {
-    int16_t temp = read_temperature_decidegrees();
     uint8_t queue_count = 0;
     smooth_get_stats(NULL, NULL, NULL, &queue_count);
-    
-    // Pack flags byte: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
     humanization_mode_t hm = smooth_get_humanization_mode();
-    uint8_t flags = 0;
-    if (hm >= HUMANIZATION_LOW) flags |= 0x01;
-    if (smooth_get_velocity_matching()) flags |= 0x02;
-    uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
-    flags |= (q3 & 0x07) << 2;
-    
-    uint8_t info_pkt[8] = {
-        FAST_CMD_INFO,
+
+    // Wire protocol v2 response (6 bytes)
+    uint8_t wire_resp[6];
+    wire_build_response(wire_resp, WIRE_RESP_INFO,
         (uint8_t)hm,
         (uint8_t)smooth_get_inject_mode(),
         (uint8_t)smooth_get_max_per_frame(),
-        queue_count,
-        (uint8_t)(temp & 0xFF),
-        (uint8_t)((temp >> 8) & 0xFF),
-        flags
-    };
-    uart_send_bytes(info_pkt, 8);
+        queue_count);
+    uart_send_bytes(wire_resp, 6);
 }
