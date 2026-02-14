@@ -1,42 +1,47 @@
 /**
- * KMBox FPGA Bridge - Top Level Module
+ * KMBox FPGA Bridge - Top Level Module (SPI)
  *
- * iCE40 UP5K FPGA that offloads KMBox UART communication from the RP2350,
- * leaving it free for USB CDC handling and TFT display rendering.
+ * iCE40 UP5K FPGA that relays SPI traffic between the RP2350 and KMBox,
+ * with autonomous auto-ping keepalive and connection tracking.
  *
  * Architecture:
- *   RP2350 ←(SPI)→ iCE40 FPGA ←(UART 3Mbaud)→ KMBox RP2350
+ *   RP2350 ←(SPI 12M)→ iCE40 FPGA ←(SPI 12M)→ KMBox RP2350
  *
- * The RP2350 sends mouse/keyboard commands via SPI registers.
- * The FPGA builds bridge protocol packets and sends them over UART.
- * The FPGA receives responses and buffers them for RP2350 readback.
- * Auto-ping keepalive runs independently in the FPGA.
+ * The RP2350 sends 8-byte KMBox fast binary packets via SPI (PIO2 master).
+ * The FPGA receives them on an SPI target (slave), buffers in a FIFO,
+ * and forwards them to KMBox via a second SPI master on PMOD A.
+ * The FPGA provides the clock for the KMBox link — deterministic timing.
+ * Auto-ping runs independently in the FPGA when the RP2350 is idle.
  *
  * Pin Usage (pico2-ice board):
- *   SPI: Uses on-board SPI bus (shared with CRAM loading)
- *   UART: Uses PMOD A pins for KMBox communication
- *   LEDs: Status indication via on-board RGB LEDs
+ *   Bridge SPI: iCE40 pins 14-17 (connected to RP2350 GPIO 4-7)
+ *   KMBox SPI: PMOD A pins 2/4/47/45
+ *   LEDs: RGB status via on-board active-low LEDs
  */
 module top (
-    input  wire CLK,           // 48 MHz from RP2350
+    input  wire CLK,            // 48 MHz from RP2350
 
-    // SPI interface (directly on ICE40-RP2350 bus)
-    input  wire ICE_SCK,       // SPI clock
-    input  wire ICE_SI,        // SPI MOSI (master out, slave in)
-    output wire ICE_SO,        // SPI MISO (master in, slave out)
-    input  wire ICE_SSN,       // SPI chip select (active low)
+    // Bridge SPI (SPI target, RP2350 is master)
+    input  wire SPI_MOSI,       // iCE40 pin 14 ← RP2350 GPIO 7
+    input  wire SPI_SCK,        // iCE40 pin 15 ← RP2350 GPIO 6
+    input  wire SPI_CS_N,       // iCE40 pin 16 ← RP2350 GPIO 5
+    output wire SPI_MISO,       // iCE40 pin 17 → RP2350 GPIO 4
 
-    // UART to KMBox (PMOD A top pins)
-    output wire UART_TX,       // FPGA TX → KMBox RX (PMOD_A_TOP_IO2 = pin 2)
-    input  wire UART_RX,       // FPGA RX ← KMBox TX (PMOD_A_TOP_IO1 = pin 4)
+    // KMBox SPI (SPI master, FPGA drives clock)
+    output wire SPI_KM_SCK,     // iCE40 pin 2 → KMBox SCK
+    output wire SPI_KM_MOSI,    // iCE40 pin 4 → KMBox MOSI
+    output wire SPI_KM_CS_N,    // iCE40 pin 47 → KMBox CS_N
+    input  wire SPI_KM_MISO,    // iCE40 pin 45 ← KMBox MISO
 
-    // Status LEDs (active low, accent from RP2350)
+    // Status LEDs (active low on pico2-ice)
     output wire LED_R,
     output wire LED_G,
     output wire LED_B
 );
 
-    // Internal reset (power-on reset using iCE40 SB_GB)
+    // ================================================================
+    // Power-on reset (256 clocks at 48 MHz ≈ 5.3 us)
+    // ================================================================
     reg [7:0] rst_cnt = 0;
     wire rst_n = rst_cnt[7];
 
@@ -46,129 +51,138 @@ module top (
     end
 
     // ================================================================
-    // SPI Target
+    // SPI Target (Bridge RP2350 → FPGA)
+    //
+    // Receives 8-byte commands from RP2350 PIO SPI master.
+    // Returns 8-byte status on MISO simultaneously.
     // ================================================================
-    wire [6:0] reg_addr;
-    wire [7:0] reg_wdata;
-    wire       reg_wen;
-    wire [7:0] reg_rdata;
-    wire       reg_ren;
-    wire       reg_done;
+    wire [63:0] tgt_cmd_data;
+    wire        tgt_cmd_valid;
+    wire        tgt_txn_done;
 
-    spi_target u_spi (
+    spi_target u_spi_target (
         .clk       (CLK),
         .rst_n     (rst_n),
-        .spi_sck   (ICE_SCK),
-        .spi_mosi  (ICE_SI),
-        .spi_miso  (ICE_SO),
-        .spi_cs_n  (ICE_SSN),
-        .reg_addr  (reg_addr),
-        .reg_wdata (reg_wdata),
-        .reg_wen   (reg_wen),
-        .reg_rdata (reg_rdata),
-        .reg_ren   (reg_ren),
-        .reg_done  (reg_done)
+        // SPI pins
+        .spi_sck   (SPI_SCK),
+        .spi_cs_n  (SPI_CS_N),
+        .spi_mosi  (SPI_MOSI),
+        .spi_miso  (SPI_MISO),
+        // Internal interface
+        .cmd_data  (tgt_cmd_data),
+        .cmd_valid (tgt_cmd_valid),
+        .resp_data (engine_resp_data),
+        .txn_done  (tgt_txn_done)
     );
 
     // ================================================================
-    // UART TX
+    // SPI Master (FPGA → KMBox RP2350)
+    //
+    // Sends 8-byte packets to KMBox at 12 MHz (FPGA-generated clock).
     // ================================================================
-    wire [7:0] uart_tx_data;
-    wire       uart_tx_valid;
-    wire       uart_tx_ready;
+    wire [63:0] km_tx_data;
+    wire        km_tx_valid;
+    wire        km_tx_ready;
+    wire [63:0] km_rx_data;
+    wire        km_rx_valid;
 
-    uart_tx #(
-        .CLK_FREQ (48_000_000),
-        .BAUD     (3_000_000)
-    ) u_uart_tx (
-        .clk      (CLK),
-        .rst_n    (rst_n),
-        .tx_data  (uart_tx_data),
-        .tx_valid (uart_tx_valid),
-        .tx_ready (uart_tx_ready),
-        .uart_txd (UART_TX)
+    spi_master u_spi_master (
+        .clk       (CLK),
+        .rst_n     (rst_n),
+        // SPI pins
+        .spi_sck   (SPI_KM_SCK),
+        .spi_cs_n  (SPI_KM_CS_N),
+        .spi_mosi  (SPI_KM_MOSI),
+        .spi_miso  (SPI_KM_MISO),
+        // Internal interface
+        .tx_data   (km_tx_data),
+        .tx_valid  (km_tx_valid),
+        .tx_ready  (km_tx_ready),
+        .rx_data   (km_rx_data),
+        .rx_valid  (km_rx_valid)
     );
 
     // ================================================================
-    // UART RX
+    // Bridge Engine (SPI→SPI FIFO relay + auto-ping + connection tracking)
     // ================================================================
-    wire [7:0] uart_rx_data;
-    wire       uart_rx_valid;
-    wire       uart_rx_frame_err;
+    wire [63:0] engine_resp_data;
+    wire        engine_connected;
+    wire        engine_activity;
 
-    uart_rx #(
-        .CLK_FREQ (48_000_000),
-        .BAUD     (3_000_000)
-    ) u_uart_rx (
-        .clk          (CLK),
-        .rst_n        (rst_n),
-        .rx_data      (uart_rx_data),
-        .rx_valid     (uart_rx_valid),
-        .rx_frame_err (uart_rx_frame_err),
-        .uart_rxd     (UART_RX)
-    );
-
-    // ================================================================
-    // Bridge Protocol Engine
-    // ================================================================
-    wire       engine_connected;
-    wire [7:0] engine_tx_fifo_count;
-    wire [7:0] engine_rx_fifo_count;
-
-    bridge_engine #(
+    bridge_engine_spi #(
         .CLK_FREQ      (48_000_000),
-        .PING_INTERVAL (48_000_000 * 2)  // 2s auto-ping
+        .PING_INTERVAL (48_000_000 * 2),  // 2s auto-ping
+        .TIMEOUT_CLKS  (48_000_000 * 5)   // 5s connection timeout
     ) u_engine (
-        .clk            (CLK),
-        .rst_n          (rst_n),
-        .reg_addr       (reg_addr),
-        .reg_wdata      (reg_wdata),
-        .reg_wen        (reg_wen),
-        .reg_rdata      (reg_rdata),
-        .reg_ren        (reg_ren),
-        .tx_data        (uart_tx_data),
-        .tx_valid       (uart_tx_valid),
-        .tx_ready       (uart_tx_ready),
-        .rx_data        (uart_rx_data),
-        .rx_valid       (uart_rx_valid),
-        .connected      (engine_connected),
-        .tx_fifo_count  (engine_tx_fifo_count),
-        .rx_fifo_count  (engine_rx_fifo_count)
+        .clk         (CLK),
+        .rst_n       (rst_n),
+        // From SPI target (bridge RP2350 commands)
+        .cmd_data    (tgt_cmd_data),
+        .cmd_valid   (tgt_cmd_valid),
+        .txn_done    (tgt_txn_done),
+        // To/from SPI master (KMBox output)
+        .km_tx_data  (km_tx_data),
+        .km_tx_valid (km_tx_valid),
+        .km_tx_ready (km_tx_ready),
+        .km_rx_data  (km_rx_data),
+        .km_rx_valid (km_rx_valid),
+        // Response data for SPI target MISO
+        .resp_data   (engine_resp_data),
+        // Status
+        .connected   (engine_connected),
+        .activity    (engine_activity)
     );
 
     // ================================================================
-    // LED Status (active low on pico2-ice)
-    //   Green = connected, Red = disconnected, Blue = SPI activity
+    // FPGA RGB LED Status (active low, iCE40 pins 39/40/41)
+    //
+    // Separate physical LED from the Pico RGB LED (RP2350 GPIO 0/1/9).
+    // Both LEDs show independent status simultaneously.
+    //
+    //   Green (pin 39) = KMBox SPI connected (solid)
+    //   Red   (pin 41) = KMBox SPI disconnected (blinks 1 Hz)
+    //   Blue  (pin 40) = SPI activity (brief flash)
     // ================================================================
     reg [23:0] led_timer;
     reg        led_blink;
-    reg [7:0]  spi_activity_cnt;
+    reg        led_tick;   // Registered terminal count to avoid wide comparator
 
     always @(posedge CLK or negedge rst_n) begin
         if (!rst_n) begin
-            led_timer        <= 0;
-            led_blink        <= 0;
-            spi_activity_cnt <= 0;
+            led_timer <= 0;
+            led_blink <= 0;
+            led_tick  <= 0;
         end else begin
-            // 1 Hz blink
-            if (led_timer == 24'd12_000_000) begin
+            led_tick <= (led_timer == 24'd23_999_999);
+            if (led_tick) begin
                 led_timer <= 0;
                 led_blink <= ~led_blink;
             end else begin
                 led_timer <= led_timer + 1;
             end
-
-            // SPI activity flash (decaying counter)
-            if (reg_wen || reg_ren)
-                spi_activity_cnt <= 8'hFF;
-            else if (spi_activity_cnt > 0)
-                spi_activity_cnt <= spi_activity_cnt - 1;
         end
     end
 
-    // Active-low LEDs
-    assign LED_G = engine_connected ? 1'b0 : 1'b1;    // Green on when connected
-    assign LED_R = engine_connected ? 1'b1 : led_blink; // Red blinks when disconnected
-    assign LED_B = (spi_activity_cnt > 0) ? 1'b0 : 1'b1; // Blue flashes on SPI activity
+    // Register LED outputs to avoid combinational paths to IO pads
+    //   Green = KMBox SPI connected (solid)
+    //   Red   = KMBox SPI disconnected (blinks 1 Hz)
+    //   Blue  = bridge RP2350 SPI activity
+    reg led_r_reg, led_g_reg, led_b_reg;
+    always @(posedge CLK or negedge rst_n) begin
+        if (!rst_n) begin
+            led_r_reg <= 1'b1;
+            led_g_reg <= 1'b1;
+            led_b_reg <= 1'b1;
+        end else begin
+            led_g_reg <= engine_connected ? 1'b0 : 1'b1;   // Green ON when connected
+            led_r_reg <= engine_connected ? 1'b1 :          // Red OFF when connected
+                         (led_blink ? 1'b0 : 1'b1);        // Red blinks when disconnected
+            led_b_reg <= engine_activity  ? 1'b0 : 1'b1;   // Blue ON during activity
+        end
+    end
+
+    assign LED_G = led_g_reg;
+    assign LED_R = led_r_reg;
+    assign LED_B = led_b_reg;
 
 endmodule

@@ -39,6 +39,7 @@
 // DFU with 2 alternates (flash + CRAM)
 #define CFG_TUD_DFU                 1
 #define CFG_TUD_DFU_ALT             2
+#define CFG_TUD_DFU_XFER_BUFSIZE    ICE_FLASH_PAGE_SIZE
 
 // Disable unused classes
 #define CFG_TUD_MSC                 0

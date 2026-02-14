@@ -1,392 +1,195 @@
 /**
- * Bridge Protocol Engine
+ * Bridge Engine - UART-to-UART Relay with Auto-Ping
  *
- * Handles the KMBox bridge protocol:
- *   - Encodes commands (mouse move, wheel, button, ping) into UART packets
- *   - Decodes incoming UART responses (ACK, NACK, PONG, info packets)
- *   - Auto-generates keepalive pings
- *   - Maintains connection state and statistics
+ * Relays bytes bidirectionally between the CMD UART (RP2350) and
+ * the KMBox UART, with autonomous keepalive ping generation.
  *
- * Register Map (directly accessible via SPI):
- *   See bridge_regs.vh for full register definitions.
+ * Forward path:  CMD UART RX → 16-byte FIFO → KMBox UART TX
+ * Return path:   KMBox UART RX → 16-byte FIFO → CMD UART TX
+ * Auto-ping:     If no CMD traffic for 2s, inject PING (0xBD 0xFE) on KMBox TX
  *
- * Command Submission:
- *   1. Write mouse X/Y or wheel/button data to CMD_DATA registers
- *   2. Write command type to CMD_REG → packet is built and queued for TX
- *
- * Status Readback:
- *   Read STATUS_REG, counters, and RX info registers via SPI.
+ * Connection tracking:
+ *   - `connected` goes high on any KMBox RX activity
+ *   - `connected` goes low after 5s of KMBox RX silence
  */
 module bridge_engine #(
-    parameter CLK_FREQ      = 48_000_000,
-    parameter PING_INTERVAL = 48_000_000 * 2  // 2 seconds at 48MHz
+    parameter CLK_FREQ       = 48_000_000,
+    parameter PING_INTERVAL  = 48_000_000 * 2,   // 2 seconds
+    parameter TIMEOUT_CLKS   = 48_000_000 * 5    // 5 seconds
 )(
     input  wire        clk,
     input  wire        rst_n,
 
-    // --- Register bus from SPI target ---
-    input  wire [6:0]  reg_addr,
-    input  wire [7:0]  reg_wdata,
-    input  wire        reg_wen,
-    output reg  [7:0]  reg_rdata,
-    input  wire        reg_ren,
+    // --- CMD UART (from/to RP2350) ---
+    input  wire [7:0]  cmd_rx_data,
+    input  wire        cmd_rx_valid,
+    output reg  [7:0]  cmd_tx_data,
+    output reg         cmd_tx_valid,
+    input  wire        cmd_tx_ready,
 
-    // --- UART TX interface ---
-    output reg  [7:0]  tx_data,
-    output reg         tx_valid,
-    input  wire        tx_ready,
-
-    // --- UART RX interface ---
-    input  wire [7:0]  rx_data,
-    input  wire        rx_valid,
+    // --- KMBox UART ---
+    input  wire [7:0]  kmbox_rx_data,
+    input  wire        kmbox_rx_valid,
+    output reg  [7:0]  kmbox_tx_data,
+    output reg         kmbox_tx_valid,
+    input  wire        kmbox_tx_ready,
 
     // --- Status ---
     output reg         connected,
-    output wire [7:0]  tx_fifo_count,
-    output wire [7:0]  rx_fifo_count
+    output reg         activity       // High when UART traffic active
 );
 
-    `include "bridge_regs.vh"
-
     // ================================================================
-    // Internal registers
+    // Forward FIFO: CMD RX → KMBox TX (16 bytes)
     // ================================================================
+    reg [7:0]  fwd_fifo [0:15];
+    reg [4:0]  fwd_wr, fwd_rd;
+    wire [4:0] fwd_cnt = fwd_wr - fwd_rd;
+    wire       fwd_empty = (fwd_wr == fwd_rd);
+    wire       fwd_full  = (fwd_cnt == 5'd16);
 
-    // Command data registers (written by RP2350 via SPI)
-    reg signed [15:0] cmd_mouse_x;
-    reg signed [15:0] cmd_mouse_y;
-    reg signed [7:0]  cmd_wheel;
-    reg [7:0]         cmd_btn_mask;
-    reg [7:0]         cmd_btn_state;
-    reg [7:0]         cmd_type;      // Written last → triggers send
-    reg               cmd_pending;
+    // Return FIFO: KMBox RX → CMD TX (16 bytes)
+    reg [7:0]  ret_fifo [0:15];
+    reg [4:0]  ret_wr, ret_rd;
+    wire [4:0] ret_cnt = ret_wr - ret_rd;
+    wire       ret_empty = (ret_wr == ret_rd);
+    wire       ret_full  = (ret_cnt == 5'd16);
 
-    // Status / connection
-    reg [7:0]  conn_state;    // 0=disconnected, 1=connected
-    reg [15:0] tx_pkt_count;
-    reg [15:0] rx_pkt_count;
-    reg [15:0] rx_err_count;
-    reg [7:0]  last_rx_cmd;
-    reg [7:0]  last_rx_payload [0:5];
-
-    // Ping auto-timer
+    // Auto-ping state
     reg [31:0] ping_timer;
-    reg        ping_needed;
+    reg        ping_phase;       // 0 = send sync byte, 1 = send cmd byte
+    reg        ping_active;
 
-    // TX packet builder state machine
-    localparam [2:0]
-        TX_IDLE   = 3'd0,
-        TX_SYNC   = 3'd1,
-        TX_CMD    = 3'd2,
-        TX_DATA   = 3'd3,
-        TX_DONE   = 3'd4;
+    // Connection tracker
+    reg [31:0] conn_timer;
 
-    reg [2:0]  tx_state;
-    reg [7:0]  tx_packet [0:6];  // Max 7 bytes: sync + cmd + 5 payload
-    reg [2:0]  tx_pkt_len;
-    reg [2:0]  tx_byte_idx;
-
-    // RX parser state machine
-    localparam [1:0]
-        RX_IDLE    = 2'd0,
-        RX_CMD     = 2'd1,
-        RX_PAYLOAD = 2'd2;
-
-    reg [1:0]  rx_state;
-    reg [7:0]  rx_cmd;
-    reg [2:0]  rx_bytes_needed;
-    reg [2:0]  rx_byte_idx;
-    reg [7:0]  rx_payload [0:7]; // Up to 8 byte payload for binary responses
-
-    // RX binary packet parser (for 8-byte fixed packets from KMBox)
-    reg [7:0]  rx_bin_buf [0:7];
-    reg [2:0]  rx_bin_idx;
-    reg        rx_bin_active;
-    reg [23:0] rx_timeout_cnt;  // Timeout counter for stuck binary packets
-
-    // RX FIFO for forwarding raw bytes to RP2350
-    reg [7:0]  rx_fifo_mem [0:63];
-    reg [6:0]  rx_fifo_wr;
-    reg [6:0]  rx_fifo_rd;
-    wire [6:0] rx_fifo_cnt = rx_fifo_wr - rx_fifo_rd;
-
-    assign rx_fifo_count = {1'b0, rx_fifo_cnt};
-    assign tx_fifo_count = {5'b0, tx_byte_idx};
-
-    // Connection timeout counter
-    reg [31:0] rx_activity_timer;
-    localparam TIMEOUT_CLKS = CLK_FREQ * 5;  // 5 second timeout
+    // Activity tracker (for LED)
+    reg [7:0]  activity_cnt;
 
     // ================================================================
-    // Register read logic
-    // ================================================================
-    always @(*) begin
-        case (reg_addr)
-            REG_STATUS:       reg_rdata = {7'b0, connected};
-            REG_CONN_STATE:   reg_rdata = conn_state;
-            REG_TX_COUNT_LO:  reg_rdata = tx_pkt_count[7:0];
-            REG_TX_COUNT_HI:  reg_rdata = tx_pkt_count[15:8];
-            REG_RX_COUNT_LO:  reg_rdata = rx_pkt_count[7:0];
-            REG_RX_COUNT_HI:  reg_rdata = rx_pkt_count[15:8];
-            REG_RX_ERR_LO:   reg_rdata = rx_err_count[7:0];
-            REG_RX_ERR_HI:   reg_rdata = rx_err_count[15:8];
-            REG_LAST_RX_CMD:  reg_rdata = last_rx_cmd;
-            REG_RX_FIFO_CNT: reg_rdata = {1'b0, rx_fifo_cnt};
-            REG_RX_FIFO_DATA: reg_rdata = (rx_fifo_wr != rx_fifo_rd) ? rx_fifo_mem[rx_fifo_rd[5:0]] : 8'h00;
-            REG_VERSION:      reg_rdata = 8'h01;  // Firmware version 1.0
-            REG_TX_BUSY:      reg_rdata = {7'b0, (tx_state != TX_IDLE)};
-            default:          reg_rdata = 8'h00;
-        endcase
-    end
-
-    // ================================================================
-    // Register write logic
+    // Forward FIFO write: CMD RX → fwd_fifo
     // ================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            cmd_mouse_x  <= 0;
-            cmd_mouse_y  <= 0;
-            cmd_wheel    <= 0;
-            cmd_btn_mask <= 0;
-            cmd_btn_state <= 0;
-            cmd_type     <= 0;
-            cmd_pending  <= 0;
+            fwd_wr <= 0;
         end else begin
-            // Clear pending once TX FSM picks it up
-            if (tx_state == TX_SYNC && cmd_pending)
-                cmd_pending <= 1'b0;
-
-            if (reg_wen) begin
-                case (reg_addr)
-                    REG_CMD_MOUSE_XL: cmd_mouse_x[7:0]  <= reg_wdata;
-                    REG_CMD_MOUSE_XH: cmd_mouse_x[15:8] <= reg_wdata;
-                    REG_CMD_MOUSE_YL: cmd_mouse_y[7:0]  <= reg_wdata;
-                    REG_CMD_MOUSE_YH: cmd_mouse_y[15:8] <= reg_wdata;
-                    REG_CMD_WHEEL:    cmd_wheel          <= reg_wdata;
-                    REG_CMD_BTN_MASK: cmd_btn_mask       <= reg_wdata;
-                    REG_CMD_BTN_STATE: cmd_btn_state     <= reg_wdata;
-                    REG_CMD_TYPE: begin
-                        cmd_type    <= reg_wdata;
-                        cmd_pending <= 1'b1;
-                    end
-                    default: ;
-                endcase
-            end
-
-            // Pop RX FIFO on read
-            if (reg_ren && reg_addr == REG_RX_FIFO_DATA) begin
-                if (rx_fifo_wr != rx_fifo_rd)
-                    rx_fifo_rd <= rx_fifo_rd + 1;
+            if (cmd_rx_valid && !fwd_full) begin
+                fwd_fifo[fwd_wr[3:0]] <= cmd_rx_data;
+                fwd_wr <= fwd_wr + 1;
             end
         end
     end
 
     // ================================================================
-    // TX Packet Builder FSM
+    // Return FIFO write: KMBox RX → ret_fifo
     // ================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            tx_state    <= TX_IDLE;
-            tx_valid    <= 0;
-            tx_data     <= 0;
-            tx_byte_idx <= 0;
-            tx_pkt_len  <= 0;
-            tx_pkt_count <= 0;
+            ret_wr <= 0;
         end else begin
-            case (tx_state)
-                TX_IDLE: begin
-                    tx_valid <= 1'b0;
-                    if (cmd_pending) begin
-                        // Build packet based on command type
-                        tx_packet[0] <= SYNC_BYTE;
-                        case (cmd_type)
-                            CMD_MOUSE_MOVE: begin
-                                tx_packet[1] <= CMD_MOUSE_MOVE;
-                                tx_packet[2] <= cmd_mouse_x[7:0];
-                                tx_packet[3] <= cmd_mouse_x[15:8];
-                                tx_packet[4] <= cmd_mouse_y[7:0];
-                                tx_packet[5] <= cmd_mouse_y[15:8];
-                                tx_pkt_len   <= 6;
-                            end
-                            CMD_MOUSE_WHEEL: begin
-                                tx_packet[1] <= CMD_MOUSE_WHEEL;
-                                tx_packet[2] <= cmd_wheel;
-                                tx_pkt_len   <= 3;
-                            end
-                            CMD_BUTTON_SET: begin
-                                tx_packet[1] <= CMD_BUTTON_SET;
-                                tx_packet[2] <= cmd_btn_mask;
-                                tx_packet[3] <= cmd_btn_state;
-                                tx_pkt_len   <= 4;
-                            end
-                            CMD_MOUSE_MOVE_WHEEL: begin
-                                tx_packet[1] <= CMD_MOUSE_MOVE_WHEEL;
-                                tx_packet[2] <= cmd_mouse_x[7:0];
-                                tx_packet[3] <= cmd_mouse_x[15:8];
-                                tx_packet[4] <= cmd_mouse_y[7:0];
-                                tx_packet[5] <= cmd_mouse_y[15:8];
-                                tx_packet[6] <= cmd_wheel;
-                                tx_pkt_len   <= 7;
-                            end
-                            CMD_PING: begin
-                                tx_packet[1] <= CMD_PING;
-                                tx_pkt_len   <= 2;
-                            end
-                            CMD_RESET: begin
-                                tx_packet[1] <= CMD_RESET;
-                                tx_pkt_len   <= 2;
-                            end
-                            default: begin
-                                // Unknown command - send as raw 8-byte packet
-                                tx_packet[1] <= cmd_type;
-                                tx_pkt_len   <= 2;
-                            end
-                        endcase
-                        tx_byte_idx <= 0;
-                        tx_state    <= TX_SYNC;
-                    end else if (ping_needed) begin
-                        // Auto-ping
-                        tx_packet[0] <= SYNC_BYTE;
-                        tx_packet[1] <= CMD_PING;
-                        tx_pkt_len   <= 2;
-                        tx_byte_idx  <= 0;
-                        tx_state     <= TX_SYNC;
-                        ping_needed  <= 1'b0;
-                    end
-                end
-
-                TX_SYNC: begin
-                    // Start sending packet bytes
-                    if (tx_ready) begin
-                        tx_data  <= tx_packet[tx_byte_idx];
-                        tx_valid <= 1'b1;
-                        tx_state <= TX_CMD;
-                    end
-                end
-
-                TX_CMD: begin
-                    tx_valid <= 1'b0;
-                    if (tx_ready) begin
-                        tx_byte_idx <= tx_byte_idx + 1;
-                        if (tx_byte_idx + 1 >= tx_pkt_len) begin
-                            tx_state    <= TX_DONE;
-                            tx_pkt_count <= tx_pkt_count + 1;
-                        end else begin
-                            tx_data  <= tx_packet[tx_byte_idx + 1];
-                            tx_valid <= 1'b1;
-                        end
-                    end
-                end
-
-                TX_DONE: begin
-                    tx_valid <= 1'b0;
-                    tx_state <= TX_IDLE;
-                end
-
-                default: tx_state <= TX_IDLE;
-            endcase
-        end
-    end
-
-    // ================================================================
-    // RX Parser - handles both bridge protocol and 8-byte binary packets
-    // ================================================================
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rx_bin_active    <= 0;
-            rx_bin_idx       <= 0;
-            rx_timeout_cnt   <= 0;
-            rx_pkt_count     <= 0;
-            rx_err_count     <= 0;
-            last_rx_cmd      <= 0;
-            rx_fifo_wr       <= 0;
-            rx_fifo_rd       <= 0;
-        end else begin
-            // Timeout: reset binary state if no byte for ~1ms
-            if (rx_bin_active) begin
-                if (rx_timeout_cnt >= (CLK_FREQ / 1000)) begin
-                    rx_bin_active  <= 0;
-                    rx_bin_idx     <= 0;
-                    rx_timeout_cnt <= 0;
-                end else begin
-                    rx_timeout_cnt <= rx_timeout_cnt + 1;
-                end
-            end
-
-            if (rx_valid) begin
-                rx_timeout_cnt <= 0;
-
-                // Push all received bytes into RX FIFO for RP2350 readback
-                if (rx_fifo_cnt < 7'd63) begin
-                    rx_fifo_mem[rx_fifo_wr[5:0]] <= rx_data;
-                    rx_fifo_wr <= rx_fifo_wr + 1;
-                end
-
-                // Try to detect known binary response headers
-                if (!rx_bin_active && 
-                    (rx_data == 8'hFF || rx_data == 8'hFE ||
-                     rx_data == 8'h0C || rx_data == 8'h0E ||
-                     rx_data == 8'hA0 || rx_data == 8'hA2)) begin
-                    rx_bin_active     <= 1;
-                    rx_bin_buf[0]     <= rx_data;
-                    rx_bin_idx        <= 1;
-                end else if (rx_bin_active) begin
-                    rx_bin_buf[rx_bin_idx] <= rx_data;
-                    rx_bin_idx <= rx_bin_idx + 1;
-
-                    if (rx_bin_idx == 3'd7) begin
-                        // Complete 8-byte packet received
-                        rx_pkt_count  <= rx_pkt_count + 1;
-                        last_rx_cmd   <= rx_bin_buf[0];
-                        rx_bin_active <= 0;
-                        rx_bin_idx    <= 0;
-
-                        // Update connection state
-                        rx_activity_timer <= 0;
-                    end
-                end
+            if (kmbox_rx_valid && !ret_full) begin
+                ret_fifo[ret_wr[3:0]] <= kmbox_rx_data;
+                ret_wr <= ret_wr + 1;
             end
         end
     end
 
     // ================================================================
-    // Connection state & auto-ping timer
+    // KMBox TX: fwd_fifo read + auto-ping injection
+    // Manages fwd_rd, kmbox_tx_data, kmbox_tx_valid, ping state
     // ================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            connected        <= 0;
-            conn_state       <= 0;
-            ping_timer       <= 0;
-            ping_needed      <= 0;
-            rx_activity_timer <= 0;
+            fwd_rd         <= 0;
+            kmbox_tx_data  <= 0;
+            kmbox_tx_valid <= 0;
+            ping_timer     <= 0;
+            ping_active    <= 0;
+            ping_phase     <= 0;
         end else begin
-            // Activity timer
-            if (rx_valid) begin
-                rx_activity_timer <= 0;
-                if (!connected) begin
-                    connected  <= 1;
-                    conn_state <= 8'h01;
-                end
-            end else begin
-                if (rx_activity_timer < TIMEOUT_CLKS) begin
-                    rx_activity_timer <= rx_activity_timer + 1;
-                end else begin
-                    connected  <= 0;
-                    conn_state <= 8'h00;
-                end
-            end
+            kmbox_tx_valid <= 1'b0;
 
-            // Ping timer
-            if (ping_timer >= PING_INTERVAL) begin
-                ping_timer  <= 0;
-                ping_needed <= 1'b1;
-            end else begin
+            // Auto-ping timer: reset on any CMD RX traffic
+            if (cmd_rx_valid)
+                ping_timer <= 0;
+            else if (ping_timer < PING_INTERVAL)
                 ping_timer <= ping_timer + 1;
+
+            if (ping_active) begin
+                // Sending auto-ping packet (2 bytes: 0xBD, 0xFE)
+                if (kmbox_tx_ready) begin
+                    if (!ping_phase) begin
+                        kmbox_tx_data  <= 8'hBD;   // SYNC
+                        kmbox_tx_valid <= 1'b1;
+                        ping_phase     <= 1'b1;
+                    end else begin
+                        kmbox_tx_data  <= 8'hFE;   // CMD_PING
+                        kmbox_tx_valid <= 1'b1;
+                        ping_active    <= 1'b0;
+                        ping_phase     <= 1'b0;
+                        ping_timer     <= 0;
+                    end
+                end
+            end else if (ping_timer >= PING_INTERVAL && fwd_empty) begin
+                // Start auto-ping when idle long enough
+                ping_active <= 1'b1;
+                ping_phase  <= 1'b0;
+            end else if (!fwd_empty && kmbox_tx_ready) begin
+                // Normal forward: FIFO → KMBox TX
+                kmbox_tx_data  <= fwd_fifo[fwd_rd[3:0]];
+                kmbox_tx_valid <= 1'b1;
+                fwd_rd         <= fwd_rd + 1;
+            end
+        end
+    end
+
+    // ================================================================
+    // CMD TX: ret_fifo read → RP2350
+    // Manages ret_rd, cmd_tx_data, cmd_tx_valid
+    // ================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ret_rd       <= 0;
+            cmd_tx_data  <= 0;
+            cmd_tx_valid <= 0;
+        end else begin
+            cmd_tx_valid <= 1'b0;
+
+            if (!ret_empty && cmd_tx_ready) begin
+                cmd_tx_data  <= ret_fifo[ret_rd[3:0]];
+                cmd_tx_valid <= 1'b1;
+                ret_rd       <= ret_rd + 1;
+            end
+        end
+    end
+
+    // ================================================================
+    // Connection tracker & activity LED
+    // ================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            connected    <= 0;
+            conn_timer   <= 0;
+            activity_cnt <= 0;
+            activity     <= 0;
+        end else begin
+            // Connection: high when KMBox responds, times out after 5s
+            if (kmbox_rx_valid) begin
+                connected  <= 1'b1;
+                conn_timer <= 0;
+            end else if (conn_timer < TIMEOUT_CLKS) begin
+                conn_timer <= conn_timer + 1;
+            end else begin
+                connected <= 1'b0;
             end
 
-            // Clear ping_needed when consumed
-            if (tx_state == TX_SYNC && ping_needed && !cmd_pending)
-                ping_needed <= 1'b0;
+            // Activity: decaying counter for LED
+            if (cmd_rx_valid || kmbox_rx_valid)
+                activity_cnt <= 8'hFF;
+            else if (activity_cnt > 0)
+                activity_cnt <= activity_cnt - 1;
+
+            activity <= (activity_cnt > 0);
         end
     end
 

@@ -401,7 +401,7 @@ static __force_inline bool is_fast_cmd_start(uint8_t byte) {
     return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) || byte == FAST_CMD_PING;
 }
 
-static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
+bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
     // Hint: mouse move is the most common command by far (~95% of traffic)
     // Direct accumulator path bypasses process_mouse_report() overhead:
     // - Skips transform (bridge moves are pre-transformed)

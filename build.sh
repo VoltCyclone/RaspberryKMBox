@@ -21,31 +21,30 @@ NC='\033[0m' # No Color
 usage() {
     echo "Usage: $0 [target] [options]"
     echo ""
-    echo "Targets:"
-    echo "  metro     Build main KMBox for Adafruit Metro RP2350 (primary)"
-    echo "  pico2     Build main KMBox for RP2350 (Pico 2)"
-    echo "  bridge    Build UART bridge for Metro RP2350 + ILI9341 (default)"
-    echo "  bridge-feather  Build UART bridge for Feather RP2350 + ST7735"
+    echo "Targets (FPGA setup):"
+    echo "  (default)       Build & flash FPGA bridge + Metro broken [default]"
     echo "  bridge-fpga     Build FPGA bridge for pico2-ice (iCE40 + RP2350)"
-    echo "  both      Build main KMBox for Metro RP2350 and Pico 2"
-    echo "  all       Build and flash KMBox + Bridge (Metro RP2350, interactive)"
-    echo "  flash-metros  Build and flash both Metros (KMBox + Bridge) [default]"
+    echo "  metro-broken    Build KMBox for Metro RP2350 (broken D0-D7, SPI input)"
     echo ""
-    echo "  white-label   Burn custom branding into Bridge RP2350 OTP (PERMANENT!)"
-    echo "  white-label-verify  Read current OTP white-label state from Bridge"
+    echo "Targets (other boards):"
+    echo "  metro           Build main KMBox for Adafruit Metro RP2350"
+    echo "  pico2           Build main KMBox for RP2350 (Pico 2)"
+    echo "  xiao            Build main KMBox for Seeed XIAO RP2350"
+    echo "  bridge          Build UART bridge for Metro RP2350 + ILI9341"
+    echo "  bridge-feather  Build UART bridge for Feather RP2350 + ST7735"
+    echo "  both            Build KMBox for Metro RP2350 and Pico 2"
+    echo "  flash-metros    Build and flash both Metros (UART bridge setup)"
     echo ""
     echo "Options:"
     echo "  clean     Clean build directories before building"
     echo "  flash     Flash firmware after building"
     echo ""
     echo "Examples:"
-    echo "  $0                   # Build & flash both Metros (default)"
-    echo "  $0 metro             # Build KMBox for Metro RP2350"
-    echo "  $0 metro flash       # Build and flash for Metro RP2350"
+    echo "  $0                   # Build & flash FPGA bridge + Metro broken (default)"
+    echo "  $0 bridge-fpga       # Build FPGA bridge only"
+    echo "  $0 metro-broken      # Build Metro broken KMBox only"
+    echo "  $0 bridge-fpga flash # Build and flash FPGA bridge"
     echo "  $0 pico2 flash       # Build and flash for RP2350 (Pico 2)"
-    echo "  $0 bridge            # Build UART bridge for Metro RP2350 + ILI9341"
-    echo "  $0 bridge-fpga       # Build FPGA bridge for pico2-ice"
-    echo "  $0 all               # Build & flash KMBox + Bridge (Metro, guided)"
     echo "  $0 both clean        # Clean build Metro + Pico 2"
 }
 
@@ -54,6 +53,7 @@ build_kmbox() {
     local build_dir="$SCRIPT_DIR/build-$target"
     local board=""
     local platform=""
+    local extra_cmake=""
     
     case $target in
         pico2)
@@ -62,6 +62,15 @@ build_kmbox() {
             ;;
         metro)
             board="adafruit_metro_rp2350"
+            platform="rp2350-arm-s"
+            ;;
+        metro-broken)
+            board="adafruit_metro_rp2350"
+            platform="rp2350-arm-s"
+            extra_cmake="-DMETRO_BROKEN_PINS=ON"
+            ;;
+        xiao)
+            board="seeed_xiao_rp2350"
             platform="rp2350-arm-s"
             ;;
         *)
@@ -86,7 +95,8 @@ build_kmbox() {
     PICO_SDK_PATH="$PICO_SDK_PATH" cmake "$SCRIPT_DIR" \
         -DPICO_BOARD="$board" \
         -DPICO_PLATFORM="$platform" \
-        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_BUILD_TYPE=Release \
+        ${extra_cmake:-}
     
     echo "Building..."
     make -j"$NJOBS"
@@ -263,7 +273,7 @@ FLASH=0
 
 for arg in "$@"; do
     case $arg in
-        pico2|metro|bridge|bridge-metro|bridge-feather|bridge-fpga|both|all|dual-metro|flash-metros|white-label|white-label-verify)
+        pico2|metro|metro-broken|xiao|bridge|bridge-metro|bridge-feather|bridge-fpga|both|all|dual-metro|flash-metros|flash-fpga|white-label|white-label-verify)
             TARGET="$arg"
             ;;
         clean)
@@ -284,9 +294,9 @@ for arg in "$@"; do
     esac
 done
 
-# Default target
+# Default target: build & flash FPGA bridge + metro-broken
 if [ -z "$TARGET" ]; then
-    TARGET="flash-metros"
+    TARGET="flash-fpga"
 fi
 
 # Execute build
@@ -305,6 +315,20 @@ case $TARGET in
         if [ "$FLASH" = "1" ]; then
             wait_for_device "KMBox (Metro RP2350)"
             flash_firmware "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" "KMBox (Metro RP2350)"
+        fi
+        ;;
+    metro-broken)
+        build_kmbox metro-broken
+        if [ "$FLASH" = "1" ]; then
+            wait_for_device "KMBox (Metro RP2350 broken-pins)"
+            flash_firmware "$SCRIPT_DIR/build-metro-broken/PIOKMbox.uf2" "KMBox (Metro RP2350 broken-pins)"
+        fi
+        ;;
+    xiao)
+        build_kmbox xiao
+        if [ "$FLASH" = "1" ]; then
+            wait_for_device "KMBox (XIAO RP2350)"
+            flash_firmware "$SCRIPT_DIR/build-xiao/PIOKMbox.uf2" "KMBox (XIAO RP2350)"
         fi
         ;;
     bridge)
@@ -374,10 +398,49 @@ case $TARGET in
             exit 0
         fi
         ;;
-    flash-metros)
-        # Build + flash both Metro RP2350s in guided sequence
+    flash-fpga)
+        # Build + flash FPGA bridge (pico2-ice) + Metro broken KMBox
         echo -e "${CYAN}========================================${NC}"
-        echo -e "${CYAN}  Dual-Metro Build & Flash${NC}"
+        echo -e "${CYAN}  FPGA Bridge + Metro KMBox Build & Flash${NC}"
+        echo -e "${CYAN}========================================${NC}"
+        echo ""
+
+        build_bridge_fpga
+        build_kmbox metro-broken
+
+        echo ""
+        echo -e "${YELLOW}Flash sequence:${NC}"
+        echo "  1) FPGA Bridge  (pico2-ice, USB CDC)"
+        echo "  2) KMBox Metro  (Metro RP2350, USB Host)"
+        echo ""
+
+        wait_for_device "FPGA Bridge (pico2-ice)"
+        flash_firmware "$SCRIPT_DIR/bridge-fpga/build/kmbox_fpga_bridge.uf2" "FPGA Bridge (pico2-ice)"
+
+        echo ""
+        echo -e "${GREEN}✓ FPGA bridge flashed! Now flash the KMBox Metro...${NC}"
+        echo ""
+
+        wait_for_device "KMBox (Metro RP2350 broken-pins)"
+        flash_firmware "$SCRIPT_DIR/build-metro-broken/PIOKMbox.uf2" "KMBox (Metro RP2350)"
+
+        echo ""
+        echo -e "${GREEN}========================================${NC}"
+        echo -e "${GREEN}  FPGA Bridge setup complete!${NC}"
+        echo -e "${GREEN}========================================${NC}"
+        echo ""
+        echo "Wiring (pico2-ice PMOD A → Metro KMBox):"
+        echo "  SPI:  MOSI(iCE40 pin 4) → D10,  SCK(pin 2) → D11"
+        echo "        CS_N(pin 47) → D22,  MISO(pin 45) ← D23"
+        echo "  UART: Bridge GPIO 20 → D9,  Bridge GPIO 25 ← D8"
+        echo "  GND:  Common ground"
+        echo ""
+        exit 0
+        ;;
+    flash-metros)
+        # Legacy: Build + flash both Metro RP2350s (UART bridge setup)
+        echo -e "${CYAN}========================================${NC}"
+        echo -e "${CYAN}  Dual-Metro Build & Flash (UART bridge)${NC}"
         echo -e "${CYAN}========================================${NC}"
         echo ""
 
@@ -410,10 +473,6 @@ case $TARGET in
         echo "  KMBox RX/GPIO1  ◄──── Bridge TX/GPIO0"
         echo "  KMBox GND       ────  Bridge GND"
         echo ""
-        echo "Note: Set the RX/TX switches on both Metros"
-        echo "      so that TX=GPIO0 and RX=GPIO1."
-        echo ""
-        echo "Test with: python bridge/bridge_client.py --test"
         exit 0
         ;;
     white-label)
@@ -502,6 +561,8 @@ echo ""
 echo "Firmware locations:"
 [ -f "$SCRIPT_DIR/build-pico2/PIOKMbox.uf2" ] && echo "  KMBox (Pico 2):            build-pico2/PIOKMbox.uf2"
 [ -f "$SCRIPT_DIR/build-metro/PIOKMbox.uf2" ] && echo "  KMBox (Metro RP2350):      build-metro/PIOKMbox.uf2"
+[ -f "$SCRIPT_DIR/build-metro-broken/PIOKMbox.uf2" ] && echo "  KMBox (Metro broken):      build-metro-broken/PIOKMbox.uf2"
+[ -f "$SCRIPT_DIR/build-xiao/PIOKMbox.uf2" ] && echo "  KMBox (XIAO RP2350):       build-xiao/PIOKMbox.uf2"
 [ -f "$SCRIPT_DIR/bridge/build/kmbox_bridge.uf2" ] && echo "  Bridge (Feather):          bridge/build/kmbox_bridge.uf2"
 [ -f "$SCRIPT_DIR/bridge/build-metro/kmbox_bridge.uf2" ] && echo "  Bridge (Metro RP2350):     bridge/build-metro/kmbox_bridge.uf2"
 [ -f "$SCRIPT_DIR/bridge-fpga/build/kmbox_fpga_bridge.uf2" ] && echo "  Bridge (FPGA pico2-ice):   bridge-fpga/build/kmbox_fpga_bridge.uf2"

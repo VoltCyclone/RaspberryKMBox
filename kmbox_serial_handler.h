@@ -80,4 +80,8 @@ void kmbox_send_info_to_bridge(void);
 // Get TX buffer stats (for debugging/monitoring)
 uint32_t kmbox_get_tx_dropped_bytes(void);
 
+// Process a single 8-byte fast binary command packet.
+// Used by both UART RX path and SPI slave path.
+bool process_fast_command(const uint8_t *pkt);
+
 #endif // KMBOX_SERIAL_HANDLER_H

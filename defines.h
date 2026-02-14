@@ -62,7 +62,9 @@
 #define NEOPIXEL_POWER          (20u)   // Neopixel power pin (255 = not used/always on)
 #endif
 
-#define PIN_BUTTON              (7u)    // Reset button pin
+#ifndef PIN_BUTTON
+#define PIN_BUTTON              (7u)    // Reset button pin (override via CMake PIN_BUTTON)
+#endif
 
 // UART configuration for KMBox serial communication with RP2350 Bridge
 // Physical connection (crossed wiring):

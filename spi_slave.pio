@@ -1,0 +1,54 @@
+; spi_slave.pio — SPI Mode 0 Slave RX for FPGA-clocked KMBox link
+;
+; PIO2 SM0 on KMBox RP2350
+;
+; Pin mapping (relative to in_base):
+;   IN pin 0:  MOSI (data from FPGA SPI master)
+;   IN pin 1:  SCK  (clock from FPGA, 12 MHz)
+;
+; CONSTRAINT: SCK GPIO must be MOSI GPIO + 1 (adjacent pins)
+; CS is managed by GPIO IRQ (not PIO).
+;
+; SPI Mode 0 (CPOL=0, CPHA=0):
+;   - SCK idles low
+;   - Data sampled on SCK rising edge
+;
+; 3 PIO instructions per SPI bit
+; PIO clock = system clock (240 MHz) for maximum responsiveness
+;   At 12 MHz SPI, ~20 PIO clocks per SPI half-period → ample margin
+;
+; Autopush at 8 bits, MSB-first
+; DMA drains 8 bytes per 64-bit packet
+
+.program spi_slave_rx
+
+.wrap_target
+    wait 0 pin 1       ; Wait for SCK low  (in_base + 1)
+    wait 1 pin 1       ; Wait for SCK high (rising edge)
+    in pins, 1         ; Sample MOSI bit   (in_base + 0)
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void spi_slave_rx_program_init(PIO pio, uint sm, uint offset,
+                                              uint mosi_pin, uint sck_pin) {
+    pio_sm_config c = spi_slave_rx_program_get_default_config(offset);
+
+    // IN pin base: MOSI (pin 0 of IN group)
+    // SCK must be mosi_pin + 1 (pin 1 of IN group, used by wait instruction)
+    sm_config_set_in_pins(&c, mosi_pin);
+    pio_gpio_init(pio, mosi_pin);
+    pio_gpio_init(pio, sck_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, mosi_pin, 2, false);  // Both inputs
+
+    // MSB-first, autopush at 8 bits
+    sm_config_set_in_shift(&c, false, true, 8);
+
+    // Run at full system clock for maximum responsiveness to SCK edges
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

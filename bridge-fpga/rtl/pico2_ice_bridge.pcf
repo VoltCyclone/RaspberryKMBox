@@ -1,26 +1,39 @@
-# KMBox FPGA Bridge - Pin Constraints for pico2-ice
+# KMBox FPGA Bridge - Pin Constraints for pico2-ice (SPI)
 # iCE40 UP5K in SG48 package
 #
 # References:
 #   pico-ice-sdk/rtl/pico2_ice.pcf (master pin catalogue)
 #   pico2-ice schematic
+#
+# After CRAM bitstream loading, the SPI configuration pins (14-17)
+# become user I/O. We reuse them as a SPI slave interface for
+# receiving commands from the RP2350.
 
 # Clock from RP2350 (48 MHz via GPOUT0)
 set_io -nowarn CLK              35
 
-# SPI bus (shared with CRAM/flash - directly connected to RP2350)
-set_io -nowarn ICE_SCK          15
-set_io -nowarn ICE_SI           17   # MOSI from RP2350 perspective (into FPGA)
-set_io -nowarn ICE_SO           14   # MISO from RP2350 perspective (out of FPGA)
-set_io -nowarn ICE_SSN          16   # Chip select (active low)
+# Bridge SPI (RP2350 PIO2 master ↔ FPGA target)
+# Reuses the CRAM SPI traces (GPIO 4-7 → iCE40 pins 14-17)
+# Pin 14 (was ICE_SO)  = SPI MOSI ← RP2350 GPIO 7
+# Pin 15 (was ICE_SCK) = SPI SCK  ← RP2350 GPIO 6
+# Pin 16 (was ICE_SSN) = SPI CS_N ← RP2350 GPIO 5
+# Pin 17 (was ICE_SI)  = SPI MISO → RP2350 GPIO 4
+set_io -nowarn SPI_MOSI         14
+set_io -nowarn SPI_SCK          15
+set_io -nowarn SPI_CS_N         16
+set_io -nowarn SPI_MISO         17
 
-# UART to KMBox device (via PMOD A top connector)
-# Pin 2 (ICE_PMOD_A_TOP_IO2) = FPGA TX → KMBox RX
-# Pin 4 (ICE_PMOD_A_TOP_IO1) = FPGA RX ← KMBox TX
-set_io -nowarn UART_TX          2
-set_io -nowarn UART_RX          4
+# KMBox SPI (FPGA master → KMBox RP2350 slave, via PMOD A)
+# Pin 2  (ICE_PMOD_A_TOP_IO2) = SPI_KM_SCK  → KMBox SCK
+# Pin 4  (ICE_PMOD_A_TOP_IO1) = SPI_KM_MOSI → KMBox MOSI
+# Pin 47 (ICE_PMOD_A_TOP_IO4) = SPI_KM_CS_N → KMBox CS_N
+# Pin 45 (ICE_PMOD_A_TOP_IO3) = SPI_KM_MISO ← KMBox MISO
+set_io -nowarn SPI_KM_SCK       2
+set_io -nowarn SPI_KM_MOSI      4
+set_io -nowarn SPI_KM_CS_N      47
+set_io -nowarn SPI_KM_MISO      45
 
-# RGB status LEDs (active low, accent from RP2350)
+# RGB status LEDs (active low)
 set_io -nowarn LED_R            41
 set_io -nowarn LED_G            39
 set_io -nowarn LED_B            40

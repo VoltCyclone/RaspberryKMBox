@@ -1,0 +1,63 @@
+; fpga_spi.pio — SPI Mode 0 Master for FPGA communication
+;
+; PIO2 SM0 on RP2350 (bridge-fpga firmware)
+;
+; Pin mapping:
+;   OUT pin 0:    GPIO 7 (MOSI → iCE40 pin 14)
+;   IN  pin 0:    GPIO 4 (MISO ← iCE40 pin 17)
+;   Side-set (1): GPIO 6 (SCK  → iCE40 pin 15)
+;   CS (GPIO 5):  Managed by software (not PIO)
+;
+; SPI Mode 0 (CPOL=0, CPHA=0):
+;   - Data shifted out on SCK falling edge
+;   - Data sampled on SCK rising edge
+;
+; 4 PIO clocks per SPI bit (2 instructions × [1] delay each)
+;   PIO clock = 48 MHz → SPI clock = 12 MHz
+;
+; Autopull at 32 bits, autopush at 32 bits, MSB-first
+; DMA feeds 2 × 32-bit words (8 bytes), drains 2 × 32-bit words
+
+.program fpga_spi
+.side_set 1
+
+.wrap_target
+    out pins, 1    side 0  [1]   ; Shift out MOSI bit, SCK low (hold 2 cycles)
+    in pins, 1     side 1  [1]   ; Sample MISO bit, SCK high (hold 2 cycles)
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void fpga_spi_program_init(PIO pio, uint sm, uint offset,
+                                          uint mosi_pin, uint miso_pin,
+                                          uint sck_pin, float clkdiv) {
+    pio_sm_config c = fpga_spi_program_get_default_config(offset);
+
+    // OUT pin: MOSI
+    sm_config_set_out_pins(&c, mosi_pin, 1);
+    pio_gpio_init(pio, mosi_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, mosi_pin, 1, true);
+
+    // IN pin: MISO
+    sm_config_set_in_pins(&c, miso_pin);
+    pio_gpio_init(pio, miso_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, miso_pin, 1, false);
+
+    // Side-set: SCK
+    sm_config_set_sideset_pins(&c, sck_pin);
+    pio_gpio_init(pio, sck_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sck_pin, 1, true);
+
+    // MSB-first, autopull at 32 bits, autopush at 32 bits
+    // DMA writes 32-bit words; PIO shifts out all 32 bits before pulling next word
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_in_shift(&c, false, true, 32);
+
+    // Clock divider: PIO clock = 4 × SPI frequency
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

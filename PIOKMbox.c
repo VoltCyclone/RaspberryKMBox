@@ -25,6 +25,8 @@
 #include "state_management.h"
 #include "kmbox_serial_handler.h"
 #include "smooth_injection.h"
+#include "spi_slave.h"
+#include "side_channel.h"
 
 #if PIO_USB_AVAILABLE
 #include "pio_usb.h"
@@ -400,6 +402,8 @@ static void main_application_loop(void) {
         // Initialize DMA after 3 seconds of stable USB operation
         if (!dma_initialized && (current_time - boot_complete_time) > 3000) {
             kmbox_serial_init_dma();
+            spi_slave_init();
+            side_channel_init();
             dma_initialized = true;
         }
         
@@ -407,6 +411,12 @@ static void main_application_loop(void) {
         // Bridge movements are added to the shared accumulator and combined
         // with physical mouse movements automatically
         kmbox_serial_task();
+
+        // SPI slave task - process FPGA bridge commands (parallel to UART path)
+        spi_slave_task();
+
+        // Side channel task - respond to bridge status queries via UART1
+        side_channel_task();
         
         // HID device task - processes physical mouse/keyboard and sends combined reports
         hid_device_task();
