@@ -1458,14 +1458,9 @@ int main(void) {
         uint8_t translated_packet[8];
         while (core1_has_kmbox_commands()) {
             if (core1_dequeue_kmbox_command(translated_packet)) {
-                // Translate 8-byte KMBox to optimized bridge protocol
-                // (Core1 outputs old format, we convert to new)
-                int16_t x = translated_packet[1] | (translated_packet[2] << 8);
-                int16_t y = translated_packet[3] | (translated_packet[4] << 8);
-                
-                uint8_t bridge_pkt[7];
-                size_t len = bridge_build_mouse_move(bridge_pkt, x, y);
-                send_uart_packet(bridge_pkt, len);
+                // Core1 translator outputs 8-byte fast command packets
+                // Send directly to KMBox (no conversion needed)
+                send_uart_packet(translated_packet, 8);
             }
         }
         
