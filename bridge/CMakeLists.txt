@@ -85,7 +85,6 @@ else()
     # Metro/other: full main with compile-gated features
     list(APPEND BRIDGE_SOURCES
         main.c
-        protocol_luts.c
     )
 endif()
 
