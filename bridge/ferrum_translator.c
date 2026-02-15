@@ -1,16 +1,20 @@
 /**
- * Ferrum KM API → Wire Protocol v2 Translator
+ * Ferrum KM API → KMBox Binary Fast Command Translator
  *
  * Parses Ferrum text commands (km.move, km.left, etc.) and emits
- * variable-length wire protocol packets for minimal latency.
+ * 8-byte binary fast command packets.  The KMBox processes these
+ * directly without any string parsing.
  *
- * Move commands use wire_build_move() which auto-selects MOVE8 (3 bytes)
- * for small deltas or MOVE16 (5 bytes) for large ones.
+ * All commands → FAST_CMD_MOUSE_MOVE (0x01) — direct accumulator
+ *   path.  Output-stage humanization (tremor) is applied by
+ *   apply_output_humanization() in usb_hid.c.  The smooth injection
+ *   queue (0x07) is reserved for large one-shot moves, not streaming
+ *   deltas — its 32-slot queue overflows at high Ferrum rates.
  */
 
 #include "ferrum_translator.h"
 #include "ferrum_protocol.h"
-#include "wire_protocol.h"
+#include "fast_commands.h"
 #include <string.h>
 #include <stddef.h>
 #include <ctype.h>
@@ -50,7 +54,7 @@ static void skip_separator(const char **p) {
 }
 
 // ============================================================================
-// Button helpers — update persistent mask, emit WIRE_BUTTONS
+// Button helpers — update persistent mask, emit FAST_CMD_MOUSE_MOVE
 // ============================================================================
 
 static void emit_button_packet(ferrum_translated_t *out, uint8_t mask, bool pressed) {
@@ -59,7 +63,8 @@ static void emit_button_packet(ferrum_translated_t *out, uint8_t mask, bool pres
     else
         g_button_state &= ~mask;
 
-    out->length = (uint16_t)wire_build_buttons(out->buffer, g_button_state);
+    // FAST_CMD_MOUSE_MOVE with zero movement, current buttons, zero wheel
+    out->length = (uint16_t)fast_build_mouse_move(out->buffer, 0, 0, g_button_state, 0);
     out->needs_response = true;
 }
 
@@ -78,7 +83,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
 
     const char *p = line + FERRUM_PREFIX_LEN;
 
-    // ----- km.move(x, y) → WIRE_MOVE8 or WIRE_MOVE16 -----------------------
+    // ----- km.move(x, y) → FAST_CMD_MOUSE_MOVE (direct accumulator) --------
     if (strncmp(p, FERRUM_CMD_MOVE, strlen(FERRUM_CMD_MOVE)) == 0) {
         p += strlen(FERRUM_CMD_MOVE);
         if (*p != '(') return false;
@@ -90,14 +95,16 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (!parse_int(&p, &y)) return false;
         if (*p != ')') return false;
 
-        // Auto-selects MOVE8 (3B) for small deltas or MOVE16 (5B) for large.
-        out->length = (uint16_t)wire_build_move(
-            out->buffer, (int16_t)x, (int16_t)y);
+        // Direct accumulator — output-stage humanization applies tremor.
+        // Do NOT use smooth queue (0x07) for streaming deltas; 32-slot
+        // queue overflows at high Ferrum command rates.
+        out->length = (uint16_t)fast_build_mouse_move(
+            out->buffer, (int16_t)x, (int16_t)y, g_button_state, 0);
         out->needs_response = true;
         return true;
     }
 
-    // ----- km.wheel(amount) → WIRE_WHEEL ------------------------------------
+    // ----- km.wheel(amount) → FAST_CMD_MOUSE_MOVE with wheel ---------------
     if (strncmp(p, FERRUM_CMD_WHEEL, strlen(FERRUM_CMD_WHEEL)) == 0) {
         p += strlen(FERRUM_CMD_WHEEL);
         if (*p != '(') return false;
@@ -107,13 +114,13 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (!parse_int(&p, &wheel)) return false;
         if (*p != ')') return false;
 
-        out->length = (uint16_t)wire_build_wheel(
-            out->buffer, (int8_t)wheel);
+        out->length = (uint16_t)fast_build_mouse_move(
+            out->buffer, 0, 0, g_button_state, (int8_t)wheel);
         out->needs_response = true;
         return true;
     }
 
-    // ----- Button commands → WIRE_BUTTONS with updated mask -----------------
+    // ----- Button commands → FAST_CMD_MOUSE_MOVE with updated mask ----------
 
     // km.left(state)
     if (strncmp(p, FERRUM_CMD_LEFT, strlen(FERRUM_CMD_LEFT)) == 0) {
@@ -121,7 +128,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (*p != '(') return false; p++;
         int32_t state; if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
-        emit_button_packet(out, WIRE_BTN_LEFT, state != 0);
+        emit_button_packet(out, FAST_BTN_LEFT, state != 0);
         return true;
     }
 
@@ -131,7 +138,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (*p != '(') return false; p++;
         int32_t state; if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
-        emit_button_packet(out, WIRE_BTN_RIGHT, state != 0);
+        emit_button_packet(out, FAST_BTN_RIGHT, state != 0);
         return true;
     }
 
@@ -141,7 +148,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (*p != '(') return false; p++;
         int32_t state; if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
-        emit_button_packet(out, WIRE_BTN_MIDDLE, state != 0);
+        emit_button_packet(out, FAST_BTN_MIDDLE, state != 0);
         return true;
     }
 
@@ -151,7 +158,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (*p != '(') return false; p++;
         int32_t state; if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
-        emit_button_packet(out, WIRE_BTN_BACK, state != 0);
+        emit_button_packet(out, FAST_BTN_BACK, state != 0);
         return true;
     }
 
@@ -161,7 +168,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (*p != '(') return false; p++;
         int32_t state; if (!parse_int(&p, &state)) return false;
         if (*p != ')') return false;
-        emit_button_packet(out, WIRE_BTN_FORWARD, state != 0);
+        emit_button_packet(out, FAST_BTN_FORWARD, state != 0);
         return true;
     }
 

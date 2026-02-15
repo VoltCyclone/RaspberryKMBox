@@ -5,7 +5,7 @@
 
 #include "makcu_translator.h"
 #include "makcu_protocol.h"
-#include "wire_protocol.h"
+#include "fast_commands.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -102,25 +102,28 @@ translate_result_t makcu_translate_command(
             makcu_move_t* move = (makcu_move_t*)payload;
             
             // Direct accumulator — output-stage humanization applies tremor.
-            out_cmd->length = wire_build_move(out_cmd->buffer, move->dx, move->dy);
+            // Smooth queue (0x07) overflows at high streaming rates.
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer, move->dx, move->dy,
+                                                    g_button_state, 0);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
-
+        
         case MAKCU_CMD_MO: {
             // Raw mouse frame (0x0B): [buttons:u8, x:i16, y:i16, wheel:i8, pan:i8, tilt:i8]
             if (payload_len < 8) {
                 out_cmd->result = TRANSLATE_INVALID;
                 return TRANSLATE_INVALID;
             }
-
+            
             makcu_mo_t* mo = (makcu_mo_t*)payload;
-
-            // Raw frame: movement + buttons + wheel in one wire packet
+            
+            // Raw frame: movement + buttons + wheel in a single 0x01 packet.
+            // Direct accumulator — output-stage humanization applies tremor.
             g_button_state = mo->buttons;  // Raw frame sets absolute button state
-            out_cmd->length = wire_build_move_all(out_cmd->buffer,
-                                                   mo->x, mo->y,
-                                                   g_button_state, mo->wheel);
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer,
+                                                    mo->x, mo->y,
+                                                    g_button_state, mo->wheel);
             
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
@@ -162,8 +165,9 @@ translate_result_t makcu_translate_command(
                 g_button_state &= ~button_mask;  // Release: clear bit
             }
             
-            // Wire protocol button state update
-            out_cmd->length = wire_build_buttons(out_cmd->buffer, g_button_state);
+            // Binary instant mouse move with updated button state
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer, 0, 0,
+                                                    g_button_state, 0);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -182,9 +186,9 @@ translate_result_t makcu_translate_command(
                 return TRANSLATE_INVALID;
             }
             
-            // Wire protocol click (timed press/release handled by KMBox)
-            out_cmd->length = wire_build_click(out_cmd->buffer, button_mask,
-                                                click->count > 0 ? click->count : 1);
+            // Binary click command (press + release in one 8-byte packet)
+            out_cmd->length = fast_build_mouse_click(out_cmd->buffer, button_mask,
+                                                     click->count > 0 ? click->count : 1);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
@@ -198,8 +202,9 @@ translate_result_t makcu_translate_command(
             
             int8_t delta = (int8_t)payload[0];
             
-            // Wire protocol wheel command
-            out_cmd->length = wire_build_wheel(out_cmd->buffer, delta);
+            // Binary instant mouse move with wheel only
+            out_cmd->length = fast_build_mouse_move(out_cmd->buffer, 0, 0,
+                                                    g_button_state, delta);
             out_cmd->result = TRANSLATE_OK;
             return TRANSLATE_OK;
         }
