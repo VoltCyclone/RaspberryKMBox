@@ -7,7 +7,6 @@
 
 #include "kmbox_serial_handler.h"
 #include "lib/kmbox-commands/kmbox_commands.h"
-#include "bridge_protocol.h"
 #include "wire_protocol.h"
 #include "dma_uart.h"
 #include "usb_hid.h"
@@ -283,9 +282,9 @@ void kmbox_send_status(const char *message) {
 }
 
 void kmbox_send_ping_to_bridge(void) {
-    uint8_t ping[8] = {FAST_CMD_PING, 0, 0, 0, 0, 0, 0, 0};
-    uart_send_bytes(ping, 8);
-    // Non-blocking: TX IRQ handles actual transmission
+    uint8_t resp[6];
+    wire_build_response(resp, WIRE_RESP_PONG, 0, 0, 0, 0);
+    uart_send_bytes(resp, 6);
 }
 
 // Get TX buffer stats (for debugging)
@@ -342,48 +341,6 @@ static __force_inline void mark_activity(uint32_t now_ms) {
 //--------------------------------------------------------------------+
 // Bridge Protocol Parser (variable-length binary, sync byte 0xBD)
 //--------------------------------------------------------------------+
-
-static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, size_t available) {
-    if (available < 2) return 0;
-    if (data[0] != BRIDGE_SYNC_BYTE) return 1;  // Skip invalid sync
-    
-    switch (data[1]) {
-        case BRIDGE_CMD_MOUSE_MOVE:
-            if (available < 6) return 0;
-            kmbox_add_mouse_movement(read_i16_le(data + 2), read_i16_le(data + 4));
-            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
-            return 6;
-            
-        case BRIDGE_CMD_MOUSE_WHEEL:
-            if (available < 3) return 0;
-            kmbox_add_wheel_movement((int8_t)data[2]);
-            return 3;
-            
-        case BRIDGE_CMD_BUTTON_SET:
-            if (available < 4) return 0;
-            kmbox_update_physical_buttons(data[3] ? data[2] : 0);
-            return 4;
-            
-        case BRIDGE_CMD_MOUSE_MOVE_WHEEL:
-            if (available < 7) return 0;
-            kmbox_add_mouse_movement(read_i16_le(data + 2), read_i16_le(data + 4));
-            kmbox_add_wheel_movement((int8_t)data[6]);
-            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
-            return 7;
-            
-        case BRIDGE_CMD_PING:
-            return 2;
-            
-        case BRIDGE_CMD_RESET:
-            kmbox_add_mouse_movement(0, 0);
-            kmbox_add_wheel_movement(0);
-            kmbox_update_physical_buttons(0);
-            return 2;
-            
-        default:
-            return 1;  // Unknown command, skip sync byte
-    }
-}
 
 //--------------------------------------------------------------------+
 // Wire Protocol v2 Processing (variable-length, LUT-based)
@@ -461,6 +418,22 @@ static bool __not_in_flash_func(process_wire_command)(const uint8_t *pkt, uint8_
             fast_cmd_count++;
             return true;
         }
+        case WIRE_CLICK: {
+            // Map button number to kmbox_button_t enum
+            kmbox_button_t btn;
+            switch (pkt[1]) {
+                case 0: case 1: btn = KMBOX_BUTTON_LEFT;   break;
+                case 2:         btn = KMBOX_BUTTON_RIGHT;  break;
+                case 3:         btn = KMBOX_BUTTON_MIDDLE; break;
+                case 4:         btn = KMBOX_BUTTON_SIDE1;  break;
+                case 5:         btn = KMBOX_BUTTON_SIDE2;  break;
+                default:        btn = KMBOX_BUTTON_LEFT;   break;
+            }
+            uint32_t click_now = time_us_32() / 1000;
+            kmbox_start_button_click(btn, click_now);
+            fast_cmd_count++;
+            return true;
+        }
         case WIRE_SMOOTH_CFG: {
             if (pkt[1] > 0) smooth_set_max_per_frame(pkt[1]);
             smooth_set_velocity_matching(pkt[2] != 0);
@@ -471,23 +444,82 @@ static bool __not_in_flash_func(process_wire_command)(const uint8_t *pkt, uint8_
             smooth_clear_queue();
             fast_cmd_count++;
             return true;
-        case WIRE_INFO_REQ:
+        case WIRE_INFO_REQ: {
             kmbox_send_info_to_bridge();
+            // Also send binary info packets for TFT display (temp, flags, extended stats)
+            {
+                uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+                int16_t temp = get_cached_temperature(now_ms);
+                uint8_t queue_count = 0;
+                smooth_get_stats(NULL, NULL, NULL, &queue_count);
+                uint8_t flags = 0;
+                humanization_mode_t hm = smooth_get_humanization_mode();
+                if (hm >= HUMANIZATION_MICRO) flags |= 0x01;
+                if (smooth_get_velocity_matching()) flags |= 0x02;
+                uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
+                flags |= (q3 & 0x07) << 2;
+                uint8_t info[8] = {
+                    WIRE_BIN_INFO,
+                    (uint8_t)hm,
+                    (uint8_t)smooth_get_inject_mode(),
+                    (uint8_t)smooth_get_max_per_frame(),
+                    queue_count,
+                    (uint8_t)(temp & 0xFF),
+                    (uint8_t)((temp >> 8) & 0xFF),
+                    flags
+                };
+                uart_send_bytes(info, 8);
+            }
+            {
+                uint32_t total_injected = 0, frames_processed = 0, queue_overflows = 0;
+                uint8_t queue_count = 0;
+                smooth_get_stats(&total_injected, &frames_processed, &queue_overflows, &queue_count);
+                uint8_t ext[8] = {
+                    WIRE_BIN_EXT,
+                    queue_count,
+                    SMOOTH_QUEUE_SIZE,
+                    (uint8_t)smooth_get_humanization_mode(),
+                    (uint8_t)(total_injected & 0xFF),
+                    (uint8_t)((total_injected >> 8) & 0xFF),
+                    (uint8_t)(queue_overflows & 0xFF),
+                    (uint8_t)((queue_overflows >> 8) & 0xFF)
+                };
+                uart_send_bytes(ext, 8);
+            }
             fast_cmd_count++;
             return true;
+        }
         case WIRE_CYCLE_HUM: {
             humanization_mode_t new_mode = smooth_cycle_humanization_mode();
             uint32_t mode_color;
             switch (new_mode) {
-                case HUMANIZATION_OFF:    mode_color = COLOR_HUMANIZATION_OFF;    break;
-                case HUMANIZATION_LOW:    mode_color = COLOR_HUMANIZATION_LOW;    break;
-                case HUMANIZATION_MEDIUM: mode_color = COLOR_HUMANIZATION_MEDIUM; break;
-                case HUMANIZATION_HIGH:   mode_color = COLOR_HUMANIZATION_HIGH;   break;
-                default:                  mode_color = COLOR_ERROR;               break;
+                case HUMANIZATION_OFF:   mode_color = COLOR_HUMANIZATION_OFF;   break;
+                case HUMANIZATION_MICRO: mode_color = COLOR_HUMANIZATION_MICRO; break;
+                case HUMANIZATION_FULL:  mode_color = COLOR_HUMANIZATION_FULL;  break;
+                default:                 mode_color = COLOR_ERROR;              break;
             }
             neopixel_set_color(mode_color);
             neopixel_trigger_mode_flash(mode_color, 1500);
             kmbox_send_info_to_bridge();
+            fast_cmd_count++;
+            return true;
+        }
+        case WIRE_CONFIG: {
+            uint8_t param = pkt[1];
+            uint8_t value = pkt[2];
+            if (param == WIRE_CFG_HUMANIZATION && value < HUMANIZATION_MODE_COUNT) {
+                smooth_set_humanization_mode((humanization_mode_t)value);
+                uint32_t mode_color;
+                switch ((humanization_mode_t)value) {
+                    case HUMANIZATION_OFF:   mode_color = COLOR_HUMANIZATION_OFF;   break;
+                    case HUMANIZATION_MICRO: mode_color = COLOR_HUMANIZATION_MICRO; break;
+                    case HUMANIZATION_FULL:  mode_color = COLOR_HUMANIZATION_FULL;  break;
+                    default:                 mode_color = COLOR_ERROR;              break;
+                }
+                neopixel_set_color(mode_color);
+                neopixel_trigger_mode_flash(mode_color, 1500);
+                kmbox_send_info_to_bridge();
+            }
             fast_cmd_count++;
             return true;
         }
@@ -512,237 +544,41 @@ static bool __not_in_flash_func(process_wire_command)(const uint8_t *pkt, uint8_
 //--------------------------------------------------------------------+
 
 static __force_inline bool is_fast_cmd_start(uint8_t byte) {
-    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;  // Exclude line terminators
-    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) || byte == FAST_CMD_PING;
+    return byte == FAST_CMD_TIMED_MOVE;  // 0x0A — only remaining fast command
 }
 
 static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
-    // Hint: mouse move is the most common command by far (~95% of traffic)
-    // Direct accumulator path bypasses process_mouse_report() overhead:
-    // - Skips transform (bridge moves are pre-transformed)
-    // - Skips smooth_record_physical_movement (only for actual HW mouse)
-    // - Skips neopixel flash (too expensive for high-rate moves)
-    if (__builtin_expect(pkt[0] == FAST_CMD_MOUSE_MOVE, 1)) {
-        const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
-        if (m->buttons) kmbox_update_physical_buttons(m->buttons & 0x1F);
-        if (m->x || m->y) kmbox_add_mouse_movement(m->x, m->y);
-        if (m->wheel) kmbox_add_wheel_movement(m->wheel);
-        // Passive LED activity — single volatile store, DMA pushes to PIO at ~30 Hz
-        neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
-        fast_cmd_count++;
-        return true;
+    // Only FAST_CMD_TIMED_MOVE (0x0A) reaches here — all other command bytes
+    // are intercepted by the wire protocol LUT before this function is called.
+    if (pkt[0] != FAST_CMD_TIMED_MOVE) {
+        fast_cmd_errors++;
+        return false;
     }
-    
-    switch (pkt[0]) {
-        
-        case FAST_CMD_MOUSE_CLICK: {
-            const fast_cmd_click_t *c = (const fast_cmd_click_t *)pkt;
-            // Map button number to kmbox_button_t enum
-            // FAST_BTN: 1=left, 2=right, 4=middle, 8=side1, 16=side2
-            kmbox_button_t btn;
-            switch (c->button) {
-                case 0: case 1: btn = KMBOX_BUTTON_LEFT;   break;
-                case 2:         btn = KMBOX_BUTTON_RIGHT;  break;
-                case 3:         btn = KMBOX_BUTTON_MIDDLE; break;
-                case 4:         btn = KMBOX_BUTTON_SIDE1;  break;
-                case 5:         btn = KMBOX_BUTTON_SIDE2;  break;
-                default:        btn = KMBOX_BUTTON_LEFT;   break;
+
+    const fast_cmd_timed_t *t = (const fast_cmd_timed_t *)pkt;
+    if (clock_sync.synced && t->time_us > 0) {
+        uint64_t target = clock_sync.device_base_us + t->time_us;
+        uint64_t now = time_us_64();
+        if (target > now && (target - now) < 100000) {
+            if (g_timed_move_alarm_id >= 0) {
+                cancel_alarm(g_timed_move_alarm_id);
+                g_timed_move_alarm_id = -1;
             }
-            // Use timed click mechanism — press/hold/release with randomized
-            // timing, handled by kmbox_update_states() on each main loop tick.
-            // Only single-click is supported; the count field is ignored for now
-            // because multi-click requires waiting for each click to complete.
-            uint32_t click_now = time_us_32() / 1000;
-            kmbox_start_button_click(btn, click_now);
+            pending_timed_move.x = t->x;
+            pending_timed_move.y = t->y;
+            pending_timed_move.mode = t->mode;
+            pending_timed_move.pending = true;
+            pending_timed_move.fired = false;
+            uint64_t delay_us = target - now;
+            g_timed_move_alarm_id = add_alarm_in_us(delay_us, timed_move_alarm_callback, NULL, true);
             fast_cmd_count++;
             return true;
         }
-        
-        case FAST_CMD_KEY_PRESS: {
-            const fast_cmd_key_t *k = (const fast_cmd_key_t *)pkt;
-            hid_keyboard_report_t report = {.modifier = k->modifiers, .keycode = {k->keycode}};
-            process_kbd_report(&report);
-            memset(&report, 0, sizeof(report));
-            process_kbd_report(&report);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_KEY_COMBO: {
-            const fast_cmd_combo_t *c = (const fast_cmd_combo_t *)pkt;
-            hid_keyboard_report_t report = {.modifier = c->modifiers};
-            uint8_t n = 0;
-            for (int i = 0; i < 4 && c->keys[i]; i++) report.keycode[n++] = c->keys[i];
-            process_kbd_report(&report);
-            memset(&report, 0, sizeof(report));
-            process_kbd_report(&report);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_MULTI_MOVE: {
-            const fast_cmd_multi_t *m = (const fast_cmd_multi_t *)pkt;
-            hid_mouse_report_t report = {0};
-            if (m->x1 || m->y1) { report.x = m->x1; report.y = m->y1; process_mouse_report(&report); }
-            if (m->x2 || m->y2) { report.x = m->x2; report.y = m->y2; process_mouse_report(&report); }
-            if (m->x3 || m->y3) { report.x = m->x3; report.y = m->y3; process_mouse_report(&report); }
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_SMOOTH_MOVE: {
-            const fast_cmd_smooth_t *s = (const fast_cmd_smooth_t *)pkt;
-            inject_mode_t mode = (s->mode <= 3) ? (inject_mode_t)s->mode : INJECT_MODE_SMOOTH;
-            smooth_inject_movement(s->x, s->y, mode);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_SMOOTH_CONFIG: {
-            const fast_cmd_config_t *c = (const fast_cmd_config_t *)pkt;
-            if (c->max_per_frame > 0) smooth_set_max_per_frame(c->max_per_frame);
-            smooth_set_velocity_matching(c->vel_match != 0);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_SMOOTH_CLEAR:
-            smooth_clear_queue();
-            fast_cmd_count++;
-            return true;
-        
-        case FAST_CMD_TIMED_MOVE: {
-            const fast_cmd_timed_t *t = (const fast_cmd_timed_t *)pkt;
-            if (clock_sync.synced && t->time_us > 0) {
-                uint64_t target = clock_sync.device_base_us + t->time_us;
-                uint64_t now = time_us_64();
-                if (target > now && (target - now) < 100000) {
-                    // Cancel any previous pending alarm
-                    if (g_timed_move_alarm_id >= 0) {
-                        cancel_alarm(g_timed_move_alarm_id);
-                        g_timed_move_alarm_id = -1;
-                    }
-                    // Store movement params for alarm callback
-                    pending_timed_move.x = t->x;
-                    pending_timed_move.y = t->y;
-                    pending_timed_move.mode = t->mode;
-                    pending_timed_move.pending = true;
-                    pending_timed_move.fired = false;
-                    // Schedule hardware alarm at exact target time (µs precision)
-                    uint64_t delay_us = target - now;
-                    g_timed_move_alarm_id = add_alarm_in_us(delay_us, timed_move_alarm_callback, NULL, true);
-                    fast_cmd_count++;
-                    return true;
-                }
-            }
-            inject_mode_t mode = (t->mode <= 3) ? (inject_mode_t)t->mode : INJECT_MODE_SMOOTH;
-            smooth_inject_movement(t->x, t->y, mode);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_SYNC: {
-            const fast_cmd_sync_t *s = (const fast_cmd_sync_t *)pkt;
-            clock_sync.device_base_us = time_us_64();
-            clock_sync.pc_base_us = s->timestamp;
-            clock_sync.seq_num = s->seq_num;
-            clock_sync.synced = true;
-            
-            uint8_t resp[8] = {FAST_CMD_RESPONSE, 0x01, 0, 0, 0, 0, 0, 0};
-            uint32_t ts = (uint32_t)(clock_sync.device_base_us & 0xFFFFFFFF);
-            memcpy(resp + 4, &ts, 4);
-            uart_send_bytes(resp, 8);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_PING: {
-            uint8_t resp[8] = {FAST_CMD_RESPONSE, 0x00, 0, 0, 0, 0, 0, 0};
-            uint32_t ts = (uint32_t)(time_us_64() & 0xFFFFFFFF);
-            memcpy(resp + 4, &ts, 4);
-            uart_send_bytes(resp, 8);
-            return true;
-        }
-        
-        case FAST_CMD_INFO: {
-            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-            int16_t temp = get_cached_temperature(now_ms);
-            // Pack extra flags into byte 7 bitfield:
-            // [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit [5:7]=reserved
-            uint8_t queue_count = 0;
-            smooth_get_stats(NULL, NULL, NULL, &queue_count);
-            uint8_t flags = 0;
-            humanization_mode_t hm = smooth_get_humanization_mode();
-            // Jitter is enabled for LOW/MEDIUM/HIGH modes
-            if (hm >= HUMANIZATION_LOW) flags |= 0x01;
-            if (smooth_get_velocity_matching()) flags |= 0x02;
-            // Queue depth as 3-bit value (0-7, clamped from 0-32)
-            uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
-            flags |= (q3 & 0x07) << 2;
-            
-            uint8_t resp[8] = {
-                FAST_CMD_INFO,
-                (uint8_t)hm,
-                (uint8_t)smooth_get_inject_mode(),
-                (uint8_t)smooth_get_max_per_frame(),
-                queue_count,
-                (uint8_t)(temp & 0xFF),
-                (uint8_t)((temp >> 8) & 0xFF),
-                flags
-            };
-            uart_send_bytes(resp, 8);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_INFO_EXT: {
-            // Extended stats packet:
-            // [0x0E][queue_count][queue_cap][overshoot%][total_inj_lo][total_inj_hi][overflows_lo][overflows_hi]
-            uint32_t total_injected = 0, frames_processed = 0, queue_overflows = 0;
-            uint8_t queue_count = 0;
-            smooth_get_stats(&total_injected, &frames_processed, &queue_overflows, &queue_count);
-            
-            uint8_t resp[8] = {
-                FAST_CMD_INFO_EXT,
-                queue_count,
-                SMOOTH_QUEUE_SIZE,  // queue capacity (compile-time constant)
-                (uint8_t)smooth_get_humanization_mode(),  // redundant but useful standalone
-                (uint8_t)(total_injected & 0xFF),
-                (uint8_t)((total_injected >> 8) & 0xFF),
-                (uint8_t)(queue_overflows & 0xFF),
-                (uint8_t)((queue_overflows >> 8) & 0xFF)
-            };
-            uart_send_bytes(resp, 8);
-            fast_cmd_count++;
-            return true;
-        }
-        
-        case FAST_CMD_CYCLE_HUMAN: {
-            // Cycle humanization mode (triggered by bridge button/touch)
-            humanization_mode_t new_mode = smooth_cycle_humanization_mode();
-            
-            // Show mode with LED flash (same as local button press)
-            uint32_t mode_color;
-            switch (new_mode) {
-                case HUMANIZATION_OFF:    mode_color = COLOR_HUMANIZATION_OFF;    break;
-                case HUMANIZATION_LOW:    mode_color = COLOR_HUMANIZATION_LOW;    break;
-                case HUMANIZATION_MEDIUM: mode_color = COLOR_HUMANIZATION_MEDIUM; break;
-                case HUMANIZATION_HIGH:   mode_color = COLOR_HUMANIZATION_HIGH;   break;
-                default:                  mode_color = COLOR_ERROR;               break;
-            }
-            neopixel_set_color(mode_color);
-            neopixel_trigger_mode_flash(mode_color, 1500);
-            
-            // Send updated info back to bridge immediately
-            kmbox_send_info_to_bridge();
-            fast_cmd_count++;
-            return true;
-        }
-        
-        default:
-            fast_cmd_errors++;
-            return false;
     }
+    inject_mode_t mode = (t->mode <= 3) ? (inject_mode_t)t->mode : INJECT_MODE_SMOOTH;
+    smooth_inject_movement(t->x, t->y, mode);
+    fast_cmd_count++;
+    return true;
 }
 
 //--------------------------------------------------------------------+
@@ -1151,40 +987,6 @@ void kmbox_serial_task(void) {
         }
 
         //--------------------------------------------------------------
-        // Bridge protocol (sync byte 0xBD) — legacy
-        //--------------------------------------------------------------
-        if (first == BRIDGE_SYNC_BYTE) {
-            uint16_t avail = rx_available();
-            if (avail < 2) break;  // Need more data
-            
-            uint8_t pkt[8];
-            size_t copy = (avail < 8) ? avail : 8;
-            // Optimized peek - use memcpy if data is contiguous
-            uint16_t tail = (uint16_t)(uart_rx_read_pos & UART_RX_BUFFER_MASK);
-            uint16_t first_chunk = UART_RX_BUFFER_SIZE - tail;
-            if (first_chunk >= copy) {
-                // Data is contiguous, use fast memcpy
-                memcpy(pkt, &uart_rx_buffer[tail], copy);
-            } else {
-                // Data wraps around, copy in two chunks
-                memcpy(pkt, &uart_rx_buffer[tail], first_chunk);
-                memcpy(pkt + first_chunk, uart_rx_buffer, copy - first_chunk);
-            }
-            
-            uint8_t consumed = process_bridge_packet(pkt, copy);
-            if (consumed >= 2) {
-                rx_consume(consumed);
-                mark_activity(now_ms);
-                packets_processed++;
-                continue;
-            } else if (consumed == 1) {
-                rx_consume(1);  // Skip bad sync
-                continue;
-            }
-            break;  // Incomplete packet
-        }
-        
-        //--------------------------------------------------------------
         // Fast binary commands — zero-copy when data is contiguous
         //--------------------------------------------------------------
         if (is_fast_cmd_start(first)) {
@@ -1213,9 +1015,9 @@ void kmbox_serial_task(void) {
         }
         
         //--------------------------------------------------------------
-        // Skip stray binary markers
+        // Skip null bytes
         //--------------------------------------------------------------
-        if (first == 0xFE || first == 0xFF || first == 0x00) {
+        if (first == 0x00) {
             rx_consume(1);
             continue;
         }

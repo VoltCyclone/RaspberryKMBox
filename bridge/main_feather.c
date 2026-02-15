@@ -30,6 +30,7 @@
 #include "neopixel_dma.h"
 #include "wire_protocol.h"
 #include "kmbox_commands.h"
+#include "input_classifier.h"
 
 #include "hardware/pio.h"
 #include "ws2812.pio.h"
@@ -77,6 +78,7 @@ static inline bool send_wire_packet(const uint8_t *data, size_t len) {
 static void handle_text_command(const char *cmd) {
     int x, y;
     if (kmbox_parse_move_command(cmd, &x, &y)) {
+        input_classifier_record_move((int16_t)x, (int16_t)y);
         uint8_t pkt[WIRE_MAX_PACKET];
         size_t len = wire_build_move(pkt, (int16_t)x, (int16_t)y);
         send_wire_packet(pkt, len);
@@ -116,6 +118,14 @@ static void cdc_rx_task(void) {
                 ferrum_translated_t translated;
                 if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
                     if (translated.length > 0) {
+                        if (translated.buffer[0] == WIRE_MOVE8 && translated.length >= 3) {
+                            input_classifier_record_move((int8_t)translated.buffer[1],
+                                                         (int8_t)translated.buffer[2]);
+                        } else if (translated.buffer[0] == WIRE_MOVE16 && translated.length >= 5) {
+                            int16_t mx = (int16_t)(translated.buffer[1] | (translated.buffer[2] << 8));
+                            int16_t my = (int16_t)(translated.buffer[3] | (translated.buffer[4] << 8));
+                            input_classifier_record_move(mx, my);
+                        }
                         send_wire_packet(translated.buffer, translated.length);
                     }
                     if (translated.needs_response && tud_cdc_connected()) {
@@ -252,6 +262,27 @@ static void connection_task(void) {
         uint8_t pkt[1];
         wire_build_ping(pkt);
         send_wire_packet(pkt, 1);
+    }
+
+    // Evaluate input classification (~1Hz)
+    {
+        static uint32_t last_classify_ms = 0;
+        if (now - last_classify_ms >= 1000) {
+            last_classify_ms = now;
+            input_class_t cls = input_classifier_evaluate();
+            static input_class_t last_sent_class = INPUT_UNKNOWN;
+            if (cls != INPUT_UNKNOWN && cls != last_sent_class &&
+                bridge_conn_state == BRIDGE_CONNECTED) {
+                uint8_t hmode = (cls == INPUT_PRE_HUMANIZED) ? 1 : 2;
+                uint8_t cfg[3];
+                wire_build_config(cfg, WIRE_CFG_HUMANIZATION, hmode);
+                send_wire_packet(cfg, 3);
+                last_sent_class = cls;
+                printf("[Bridge] Auto-detected input: %s -> humanization %s\n",
+                       cls == INPUT_PRE_HUMANIZED ? "pre-humanized" : "raw",
+                       hmode == 1 ? "MICRO" : "FULL");
+            }
+        }
     }
 }
 

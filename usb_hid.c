@@ -311,9 +311,6 @@ static inline int8_t clamp_i8(int32_t val);
 static const uint8_t desc_hid_keyboard[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))};
 
-static const uint8_t desc_hid_mouse_default[] = {
-    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE))};
-
 // 16-bit mouse descriptor for gaming mice (G703, G Pro Wireless, etc.)
 // Matches the G703 Lightspeed structure: 16-bit buttons, 16-bit X/Y, 8-bit wheel/pan
 static const uint8_t desc_hid_mouse_16bit[] = {
@@ -577,14 +574,11 @@ static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x
     // Mode-dependent intensity scaling
     float mode_scale = 1.0f;
     switch (mode) {
-        case HUMANIZATION_LOW:
+        case HUMANIZATION_MICRO:
             mode_scale = 0.5f;
             break;
-        case HUMANIZATION_MEDIUM:
+        case HUMANIZATION_FULL:
             mode_scale = 1.0f;
-            break;
-        case HUMANIZATION_HIGH:
-            mode_scale = 1.5f;
             break;
         default:
             break;

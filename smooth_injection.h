@@ -71,10 +71,9 @@ typedef enum {
 //--------------------------------------------------------------------+
 
 typedef enum {
-    HUMANIZATION_OFF = 0,       // No humanization (legacy linear movement)
-    HUMANIZATION_LOW,           // Minimal jitter, basic easing
-    HUMANIZATION_MEDIUM,        // Balanced (default)
-    HUMANIZATION_HIGH,          // Maximum variation and unpredictability
+    HUMANIZATION_OFF = 0,       // No humanization — raw pass-through
+    HUMANIZATION_MICRO,         // Micro-noise only (for pre-humanized input)
+    HUMANIZATION_FULL,          // Full humanization (for raw/robotic input)
     HUMANIZATION_MODE_COUNT
 } humanization_mode_t;
 

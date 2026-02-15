@@ -287,17 +287,13 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
                     mode_color = COLOR_HUMANIZATION_OFF;
                     
                     break;
-                case HUMANIZATION_LOW:
-                    mode_color = COLOR_HUMANIZATION_LOW;
-                    
+                case HUMANIZATION_MICRO:
+                    mode_color = COLOR_HUMANIZATION_MICRO;
+
                     break;
-                case HUMANIZATION_MEDIUM:
-                    mode_color = COLOR_HUMANIZATION_MEDIUM;
-                    
-                    break;
-                case HUMANIZATION_HIGH:
-                    mode_color = COLOR_HUMANIZATION_HIGH;
-                    
+                case HUMANIZATION_FULL:
+                    mode_color = COLOR_HUMANIZATION_FULL;
+
                     break;
                 default:
                     mode_color = COLOR_ERROR;

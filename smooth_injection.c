@@ -485,7 +485,7 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     // 3) We have enough queue space for the sub-steps
     // 4) Queue is less than 75% full (back-pressure protection)
     //    This prevents queue starvation under sustained high-rate Ferrum traffic
-    bool should_subdivide = (g_smooth.humanization.mode != HUMANIZATION_OFF) &&
+    bool should_subdivide = (g_smooth.humanization.mode == HUMANIZATION_FULL) &&
                             (movement_px >= SUBSTEP_MIN_MOVEMENT_PX) &&
                             (g_smooth.queue_count + SUBSTEP_COUNT_BASE <= SMOOTH_QUEUE_SIZE) &&
                             (g_smooth.queue_count < (SMOOTH_QUEUE_SIZE * 3 / 4));
@@ -531,21 +531,8 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     // Subdivided injection path
     //--------------------------------------------------------------------+
     
-    // Determine number of sub-steps based on humanization level
-    uint8_t num_substeps = SUBSTEP_COUNT_BASE;
-    switch (g_smooth.humanization.mode) {
-        case HUMANIZATION_LOW:
-            num_substeps += (uint8_t)rng_range(0, 1);  // 4-5 sub-steps
-            break;
-        case HUMANIZATION_MEDIUM:
-            num_substeps += (uint8_t)rng_range(0, 2);  // 4-6 sub-steps
-            break;
-        case HUMANIZATION_HIGH:
-            num_substeps += (uint8_t)rng_range(1, SUBSTEP_COUNT_EXTRA_MAX);  // 5-8 sub-steps
-            break;
-        default:
-            break;
-    }
+    // Determine number of sub-steps (only reached in FULL mode)
+    uint8_t num_substeps = SUBSTEP_COUNT_BASE + (uint8_t)rng_range(0, 3);  // 4-7 sub-steps
     
     // Clamp to available queue space
     uint8_t available = SMOOTH_QUEUE_SIZE - g_smooth.queue_count;
@@ -912,7 +899,7 @@ bool smooth_has_pending(void) {
 }
 
 static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool auto_save) {
-    if (mode >= HUMANIZATION_MODE_COUNT) mode = HUMANIZATION_MEDIUM;
+    if (mode >= HUMANIZATION_MODE_COUNT) mode = HUMANIZATION_FULL;
     
     humanization_mode_t old_mode = g_smooth.humanization.mode;
     g_smooth.humanization.mode = mode;
@@ -937,56 +924,43 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.humanization.onset_jitter_max = 0;
             break;
             
-        case HUMANIZATION_LOW:
-            // Minimal signal camouflage - light sensor noise simulation
-            g_smooth.max_per_frame = (int16_t)rng_range(15, 17);        // Fix #2: per-session variation
-            g_smooth.velocity_matching_enabled = true;
+        case HUMANIZATION_MICRO:
+            // Micro-noise only — for pre-humanized input
+            // Key: NO subdivision, NO onset delay, NO overshoot
+            // Only adds sub-pixel tremor + sensor noise below the PC's correction threshold
+            g_smooth.max_per_frame = 16;                                // Fixed — don't alter delivery rate
+            g_smooth.velocity_matching_enabled = false;                 // Input already has natural velocity
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 2;  // 0.5px base jitter
-            g_smooth.humanization.overshoot_chance = 0;                 // Fix #6: off at LOW
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 2;  // 0.5px base tremor
+            g_smooth.humanization.overshoot_chance = 0;                 // No overshoot
             g_smooth.humanization.overshoot_max_fp = 0;
-            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(2, 3));   // Fix #7: keep
-            g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(9, 11));
-            g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 100;              // Fix #3: ±1%
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(4);        // Fix #13: ±4px
-            g_smooth.humanization.onset_jitter_min = 0;                 // Fix #1: 0-1 frames
-            g_smooth.humanization.onset_jitter_max = 1;
+            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(2);
+            g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(10);
+            g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 100;  // ±1% sensor noise
+            g_smooth.humanization.accum_clamp_fp = 0;                   // No clamp — trust input
+            g_smooth.humanization.onset_jitter_min = 0;                 // No onset delay
+            g_smooth.humanization.onset_jitter_max = 0;
             break;
-            
-        case HUMANIZATION_MEDIUM:
-            // Balanced signal camouflage - matches physical mouse noise characteristics
-            g_smooth.max_per_frame = (int16_t)rng_range(13, 19);        // Fix #2: wider variation
+
+        case HUMANIZATION_FULL:
+            // Full humanization — for raw/robotic input
+            // Subdivision, easing, onset delay, overshoot — the works
+            g_smooth.max_per_frame = (int16_t)rng_range(12, 20);        // Per-session variation
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base jitter (realistic tremor)
-            g_smooth.humanization.overshoot_chance = 8;                 // 8% chance
-            g_smooth.humanization.overshoot_max_fp = int_to_fp(2);      // max 2px overshoot
-            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));   // Fix #7: wider
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base tremor
+            g_smooth.humanization.overshoot_chance = 10;                // 10% chance
+            g_smooth.humanization.overshoot_max_fp = int_to_fp(2);      // max 2px
+            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(8, 14));
-            g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 50;               // Fix #3: ±2%
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(3);        // Fix #13: ±3px
-            g_smooth.humanization.onset_jitter_min = 1;                 // Fix #1: 1-3 frames
-            g_smooth.humanization.onset_jitter_max = 3;
-            break;
-            
-        case HUMANIZATION_HIGH:
-            // Maximum signal camouflage - full sensor noise simulation
-            g_smooth.max_per_frame = (int16_t)rng_range(10, 22);        // Fix #2: widest variation
-            g_smooth.velocity_matching_enabled = true;
-            g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(3) / 2;  // 1.5px base jitter (maximum realistic tremor)
-            g_smooth.humanization.overshoot_chance = 12;                // 12% chance
-            g_smooth.humanization.overshoot_max_fp = int_to_fp(3);      // max 3px overshoot
-            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 5));   // Fix #7: widest
-            g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(6, 18));
-            g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 33;               // Fix #3: ±3%
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(2);        // Fix #13: ±2px (tightest)
-            g_smooth.humanization.onset_jitter_min = 2;                 // Fix #1: 2-6 frames
-            g_smooth.humanization.onset_jitter_max = 6;
+            g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 50;  // ±2%
+            g_smooth.humanization.accum_clamp_fp = int_to_fp(3);        // ±3px
+            g_smooth.humanization.onset_jitter_min = 1;                 // 1-4 frames
+            g_smooth.humanization.onset_jitter_max = 4;
             break;
             
         default:
-            smooth_set_humanization_mode_internal(HUMANIZATION_MEDIUM, auto_save);
+            smooth_set_humanization_mode_internal(HUMANIZATION_FULL, auto_save);
             return;
     }
     
@@ -1114,7 +1088,7 @@ void smooth_load_humanization_mode(void) {
         smooth_set_humanization_mode_internal(data->mode, false);
     } else {
         // No valid data found, use default (without auto-save during init)
-        smooth_set_humanization_mode_internal(HUMANIZATION_MEDIUM, false);
+        smooth_set_humanization_mode_internal(HUMANIZATION_FULL, false);
     }
 }
 

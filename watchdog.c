@@ -66,8 +66,9 @@ static bool is_core_responsive(uint32_t last_heartbeat_ms, uint32_t current_time
  * Handle timeout warning
  */
 static void handle_timeout_warning(int core_num, uint32_t time_since_heartbeat) {
+    (void)core_num;
     g_watchdog_status.timeout_warnings++;
-    
+
     if (time_since_heartbeat > WATCHDOG_CORE_TIMEOUT_MS * 2) {
         // System is severely unresponsive, prepare for reset
     }

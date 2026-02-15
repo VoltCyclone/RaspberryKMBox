@@ -255,8 +255,8 @@ static inline uint8_t temp_color(float t) {
 }
 
 static inline uint8_t hmode_color(uint8_t m) {
-    static const uint8_t colors[] = { COL_DARK, COL_YELLOW, COL_GREEN, COL_CYAN, COL_RED };
-    return (m < 4) ? colors[m] : COL_RED;
+    static const uint8_t colors[] = { COL_DARK, COL_YELLOW, COL_GREEN, COL_RED };
+    return (m < 3) ? colors[m] : COL_RED;
 }
 
 #define TEMP_VALID(t) ((t) > -50.0f && (t) < 150.0f)
@@ -345,8 +345,8 @@ static void format_stats(const tft_stats_t *stats) {
 
     // Humanization mode: "Off", "Low", "Med", "High"
     if (stats->humanization_valid) {
-        static const char *hmode_labels[] = { "Off", "Low", "Med", "High" };
-        const char *label = (stats->humanization_mode < 4) ? hmode_labels[stats->humanization_mode] : "?";
+        static const char *hmode_labels[] = { "Off", "Micro", "Full" };
+        const char *label = (stats->humanization_mode < 3) ? hmode_labels[stats->humanization_mode] : "?";
         p = fmt_hmode.str;
         const char *lp = label;
         while (*lp) *p++ = *lp++;

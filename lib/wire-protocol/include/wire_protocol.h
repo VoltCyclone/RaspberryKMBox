@@ -38,10 +38,13 @@
 #define WIRE_INFO_REQ    0x0D  // [cmd]                                 = 1 byte
 #define WIRE_SMOOTH_CLR  0x0E  // [cmd]                                 = 1 byte
 #define WIRE_CYCLE_HUM   0x0F  // [cmd]                                 = 1 byte
+#define WIRE_CLICK       0x10  // [cmd][button_num][count]              = 3 bytes
+#define WIRE_BIN_INFO    0x11  // [cmd][hm][im][mpf][qc][tlo][thi][fl] = 8 bytes
+#define WIRE_BIN_EXT     0x12  // [cmd][qc][cap][hm][tlo][thi][olo][ohi] = 8 bytes
 #define WIRE_PING        0xFE  // [cmd]                                 = 1 byte
 #define WIRE_RESPONSE    0xFF  // [cmd][status][d0][d1][d2][d3]         = 6 bytes
 
-#define WIRE_MAX_PACKET  7     // Maximum packet size in bytes
+#define WIRE_MAX_PACKET  8     // Maximum packet size in bytes
 
 // Button masks (match HID standard)
 #define WIRE_BTN_LEFT    0x01
@@ -88,7 +91,10 @@ static const uint8_t wire_cmd_len[256] = {
     [WIRE_INFO_REQ]   = 1,
     [WIRE_SMOOTH_CLR] = 1,
     [WIRE_CYCLE_HUM]  = 1,
-    // 0x10-0xFD = 0 (invalid)
+    [WIRE_CLICK]      = 3,
+    [WIRE_BIN_INFO]   = 8,
+    [WIRE_BIN_EXT]    = 8,
+    // 0x13-0xFD = 0 (invalid)
     [WIRE_PING]       = 1,
     [WIRE_RESPONSE]   = 6,
 };
@@ -222,6 +228,14 @@ static inline size_t wire_build_smooth_clr(uint8_t *buf) {
 static inline size_t wire_build_cycle_hum(uint8_t *buf) {
     buf[0] = WIRE_CYCLE_HUM;
     return 1;
+}
+
+// Mouse click (timed press/release handled by KMBox)
+static inline size_t wire_build_click(uint8_t *buf, uint8_t button, uint8_t count) {
+    buf[0] = WIRE_CLICK;
+    buf[1] = button;
+    buf[2] = count;
+    return 3;
 }
 
 // Keepalive ping

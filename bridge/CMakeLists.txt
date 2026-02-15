@@ -145,7 +145,6 @@ set(BRIDGE_LIBS
     hardware_adc
     kmbox_commands
     wire_protocol
-    peri_clock
     dma_uart
     led_utils
 )
