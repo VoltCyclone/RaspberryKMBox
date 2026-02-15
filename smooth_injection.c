@@ -964,12 +964,14 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             return;
     }
     
-    // Save to flash if mode actually changed and auto_save is enabled
-    // NOTE: We defer the save to avoid flash write issues with multicore
-    if (auto_save && old_mode != mode) {
-        g_save_pending = true;
-        g_save_request_time = to_ms_since_boot(get_absolute_time());
-    }
+    // NOTE: Runtime flash saves are DISABLED to prevent device hangs.
+    // flash_safe_execute() pauses Core1 (USB host) via multicore_lockout
+    // during the ~100ms flash erase/program, which causes the USB host
+    // stack to miss timing-critical operations and hang the device.
+    // Humanization mode will reset to default (FULL) on reboot.
+    // TODO: Re-enable when a safe async flash write mechanism is available.
+    (void)auto_save;
+    (void)old_mode;
 }
 
 void smooth_set_humanization_mode(humanization_mode_t mode) {
@@ -1033,9 +1035,8 @@ static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
 }
 
 void smooth_save_humanization_mode(void) {
-    // Request deferred save instead of immediate save
-    g_save_pending = true;
-    g_save_request_time = to_ms_since_boot(get_absolute_time());
+    // Runtime flash saves are DISABLED — see comment in smooth_set_humanization_mode_internal.
+    // This prevents device hangs caused by multicore_lockout pausing the USB host core.
 }
 
 // Core1 acknowledgment flag — kept for backward compat but flash_safe_execute
@@ -1043,38 +1044,11 @@ void smooth_save_humanization_mode(void) {
 extern volatile bool g_core1_flash_acknowledged;
 
 // Call this periodically from main loop.
-// flash_safe_execute() handles Core1 lockout automatically via multicore_lockout.
+// Runtime flash saves are DISABLED to prevent device hangs.
+// See comment in smooth_set_humanization_mode_internal for details.
 void smooth_process_deferred_save(void) {
-    if (!g_save_pending) return;
-    
-    // Safety check - disable flash saves if we've had too many failures
-    if (g_flash_save_failures >= MAX_FLASH_FAILURES) {
-        g_save_pending = false;
-        return;
-    }
-    
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-    
-    // Wait for the defer period to allow rapid button presses
-    if ((current_time - g_save_request_time) < SAVE_DEFER_MS) return;
-    
-    // flash_safe_execute handles all multicore coordination:
-    // - Pauses Core1 via multicore_lockout
-    // - Disables interrupts
-    // - Calls our callback
-    // - Resumes Core1 and restores interrupts
-    
-    uint8_t failures_before = g_flash_save_failures;
-    smooth_save_humanization_mode_internal();
-    
-    if (g_flash_save_failures == failures_before) {
-        // No new failures — save succeeded
-        g_save_pending = false;
-        g_flash_save_failures = 0;  // Reset failure counter on success
-    } else {
-        // New failure detected — retry later
-        g_save_request_time = current_time;
-    }
+    // No-op: flash saves disabled to prevent multicore_lockout hanging the USB host core.
+    // Humanization mode persists in RAM only; resets to default on reboot.
 }
 
 void smooth_load_humanization_mode(void) {
