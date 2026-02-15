@@ -677,8 +677,8 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
     g_smooth.frame_x_used = 0;
     g_smooth.frame_y_used = 0;
     
-    // Reset per-frame overshoot correction counter (declared static in processing loop)
-    // This is reset here via the extern-visible flag pattern
+    // Per-frame overshoot correction counter (reset each frame)
+    uint8_t corrections_this_frame = 0;
     
     // Process queued movements
     int32_t frame_x_fp = 0;
@@ -751,7 +751,6 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
                 // Inject overshoot if planned
                 // Safety: limit corrections per frame and skip if queue is nearly full
                 // to prevent queue explosion under high command rates
-                static uint8_t corrections_this_frame = 0;
                 if (entry->will_overshoot && 
                     corrections_this_frame < 2 &&
                     g_smooth.queue_count < SMOOTH_QUEUE_SIZE - 4) {
@@ -926,7 +925,6 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             
         case HUMANIZATION_MICRO:
             // Micro-noise only — for pre-humanized input
-            // Key: NO subdivision, NO onset delay, NO overshoot
             // Only adds sub-pixel tremor + sensor noise below the PC's correction threshold
             g_smooth.max_per_frame = 16;                                // Fixed — don't alter delivery rate
             g_smooth.velocity_matching_enabled = false;                 // Input already has natural velocity
@@ -937,7 +935,9 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(2);
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(10);
             g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 100;  // ±1% sensor noise
-            g_smooth.humanization.accum_clamp_fp = 0;                   // No clamp — trust input
+            g_smooth.humanization.accum_clamp_fp = int_to_fp(8);        // ±8px — generous clamp prevents
+                                                                        // unbounded drift from delivery error
+                                                                        // residuals while trusting input
             g_smooth.humanization.onset_jitter_min = 0;                 // No onset delay
             g_smooth.humanization.onset_jitter_max = 0;
             break;
@@ -1062,7 +1062,6 @@ void smooth_process_deferred_save(void) {
     // - Calls our callback
     // - Resumes Core1 and restores interrupts
     
-    // Fix #8: Snapshot failure count before call to detect new failures
     uint8_t failures_before = g_flash_save_failures;
     smooth_save_humanization_mode_internal();
     

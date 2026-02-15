@@ -410,6 +410,11 @@ static void main_application_loop(void) {
         if (task_flags & WATCHDOG_FLAG) {
             watchdog_task();
             watchdog_core0_heartbeat();
+            // Process deferred flash saves at watchdog interval (~100ms)
+            // so saves happen ~2s after mode change (SAVE_DEFER_MS),
+            // not at the 60s status boundary where the surprise 100ms
+            // interrupt blackout from flash_safe_execute kills USB.
+            smooth_process_deferred_save();
             state->last_watchdog_time = current_time;
         }
         
@@ -426,10 +431,6 @@ static void main_application_loop(void) {
         
         if (task_flags & STATUS_FLAG) {
             report_watchdog_status(current_time, &state->watchdog_status_timer);
-            
-            // Process deferred flash saves (checks internally if needed)
-            // Run at status report interval (~10s) since flash save is deferred anyway
-            smooth_process_deferred_save();
         }
     }
 }

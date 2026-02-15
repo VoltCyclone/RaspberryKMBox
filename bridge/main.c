@@ -30,40 +30,26 @@
 #include "ws2812.pio.h"
 
 #include "config.h"
+#include "tracker.h"
 #include "hw_uart.h"
 #include "latency_tracker.h"
-#include "ferrum_protocol.h"
-#include "ferrum_translator.h"
-#include "neopixel_dma.h"
-#include "kmbox_commands.h"
-#include "wire_protocol.h"
-#include "input_classifier.h"
-
-#if ENABLE_COLOR_TRACKER
-#include "tracker.h"
-#endif
-
-#if ENABLE_TFT_DISPLAY
 #include "tft_display.h"
-#endif
-
-#if ENABLE_MAKCU_PROTOCOL
+#include "bridge_protocol.h"
 #include "makcu_protocol.h"
 #include "makcu_translator.h"
+#include "ferrum_protocol.h"
+#include "ferrum_translator.h"
+#include "protocol_luts.h"
 #include "core1_translator.h"
-#endif
+#include "../lib/kmbox-commands/kmbox_commands.h"
 
 // Hardware UART is now used instead of PIO UART
 // DMA circular buffers are handled internally by hw_uart module
 
 // API Mode State (KMBox native, Makcu, or Ferrum)
-#if ENABLE_MAKCU_PROTOCOL
 // Note: api_mode_t is defined in makcu_protocol.h
+
 static api_mode_t current_api_mode = API_MODE_KMBOX;
-#else
-typedef enum { API_MODE_KMBOX = 0, API_MODE_FERRUM = 2 } api_mode_t;
-static api_mode_t current_api_mode = API_MODE_KMBOX;
-#endif
 
 // Button handling - mode toggle on short press
 static uint32_t last_button_check = 0;
@@ -71,13 +57,11 @@ static bool button_state = false;
 static uint32_t button_press_start = 0;
 static bool button_init_done = false;
 
-#if ENABLE_TFT_DISPLAY
 // Humanization cycle request flag (set by touch handler in tft_display.c)
 volatile bool humanization_cycle_requested = false;
 
 // API mode cycle request flag (set by touch handler in tft_display.c)
 volatile bool api_cycle_requested = false;
-#endif
 
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
@@ -91,13 +75,11 @@ static uint8_t ferrum_idx = 0;
 #define KMBOX_PACKET_SIZE 8
 #define ECHO_PREFIX_LEN 5
 
-#if ENABLE_COLOR_TRACKER
 // Frame reception state
 static uint8_t frame_buffer[FRAME_BUFFER_SIZE];
 static volatile bool frame_ready = false;
 static volatile uint16_t current_roi_w = ROI_DEFAULT_SIZE;
 static volatile uint16_t current_roi_h = ROI_DEFAULT_SIZE;
-#endif
 
 // Status tracking
 typedef enum {
@@ -135,7 +117,6 @@ static uint32_t kmbox_connect_attempts = 0;
 #define KMBOX_CONNECT_RETRY_MS      2000    // Retry connect every 2s
 #define KMBOX_INITIAL_DELAY_MS      500     // Wait for KMBox to boot
 
-#if ENABLE_TFT_DISPLAY
 // TFT display tracking variables
 static uint32_t boot_time_ms = 0;
 static uint32_t tft_mouse_activity_count = 0;
@@ -180,12 +161,7 @@ static bool kmbox_humanization_valid = false;
 static uint32_t last_humanization_request_ms = 0;
 #define HUMANIZATION_REQUEST_INTERVAL_MS 2000  // Request humanization info every 2 seconds (was 3s)
 #define HUMANIZATION_INITIAL_DELAY_MS 100      // First request 100ms after connection
-#else
-static uint32_t boot_time_ms = 0;
-static uint32_t button_press_count = 0;
-#endif
 
-#if ENABLE_COLOR_TRACKER
 // CDC receive state machine
 typedef enum {
     RX_STATE_IDLE,
@@ -207,15 +183,34 @@ typedef struct __attribute__((packed)) {
 
 static frame_header_t pending_header;
 static uint8_t header_bytes_received = 0;
-#endif // ENABLE_COLOR_TRACKER
 
-// WS2812 NeoPixel — now handled entirely by neopixel_dma module
-// (DMA + 30 Hz timer; zero CPU on the hot path)
+// WS2812 NeoPixel state (using SDK PIO program)
+static PIO ws2812_pio = pio0;
+static uint ws2812_sm = 0;
+static uint ws2812_offset = 0;
 
-// Legacy compatibility shim — delegates to the DMA-backed module.
-// Existing call sites can use this until fully migrated.
-static inline void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
-    neopixel_dma_set_rgb(r, g, b);
+// ============================================================================
+// WS2812 NeoPixel Control (using SDK ws2812.pio)
+// ============================================================================
+
+static void ws2812_init(void) {
+    // Add the SDK ws2812 program to PIO
+    ws2812_offset = pio_add_program(ws2812_pio, &ws2812_program);
+    
+    // Claim a state machine
+    ws2812_sm = pio_claim_unused_sm(ws2812_pio, true);
+    
+    // Initialize using SDK helper function (800kHz, RGB not RGBW)
+    ws2812_program_init(ws2812_pio, ws2812_sm, ws2812_offset, WS2812_PIN, 800000, false);
+}
+
+void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
+    uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+    // Non-blocking: skip update if PIO FIFO is full (LED is cosmetic, not critical)
+    if (!pio_sm_is_tx_fifo_full(ws2812_pio, ws2812_sm)) {
+        pio_sm_put(ws2812_pio, ws2812_sm, grb << 8);
+    }
 }
 
 // ============================================================================
@@ -238,7 +233,6 @@ static void sync_uart_stats(void) {
 
 // Read internal temperature sensor (RP2040/RP2350)
 // Returns temperature in Celsius
-// Optimized: pre-computed constants use FPU multiply instead of divide
 static float read_temperature_c(void) {
     // Select ADC input 4 (internal temperature sensor)
     adc_select_input(4);
@@ -247,16 +241,12 @@ static float read_temperature_c(void) {
     uint16_t raw = adc_read();
     
     // Convert to voltage (ADC reference is 3.3V)
-    // Pre-computed: 3.3 / 4096 = 0.000806640625
-    static const float ADC_TO_VOLTAGE = 3.3f / 4096.0f;
-    float voltage = (float)raw * ADC_TO_VOLTAGE;
+    const float conversion_factor = 3.3f / (1 << 12);
+    float voltage = raw * conversion_factor;
     
     // Convert voltage to temperature (formula from RP2040 datasheet)
-    // T = 27 - (V - 0.706) / 0.001721
-    // Rewritten as: T = 27 - (V - 0.706) * (1/0.001721)
-    // Pre-computed: 1/0.001721 = 581.057...
-    static const float INV_SLOPE = 1.0f / 0.001721f;
-    float temperature = 27.0f - (voltage - 0.706f) * INV_SLOPE;
+    // T = 27 - (ADC_voltage - 0.706) / 0.001721
+    float temperature = 27.0f - (voltage - 0.706f) / 0.001721f;
     
     return temperature;
 }
@@ -321,17 +311,10 @@ static void button_task(void) {
             // Reset ferrum line buffer on mode change
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
-            // Flash NeoPixel with API-mode color (zero CPU — handled by DMA ISR)
-            switch (current_api_mode) {
-                case API_MODE_KMBOX: neopixel_dma_activity_flash_ms(LED_COLOR_API_KMBOX, 400);  break;
-                case API_MODE_MAKCU: neopixel_dma_activity_flash_ms(LED_COLOR_API_MAKCU, 400);  break;
-                case API_MODE_FERRUM: neopixel_dma_activity_flash_ms(LED_COLOR_API_FERRUM, 400); break;
-            }
         } else {
             // Long press: cycle humanization mode on KMBox
-            uint8_t cycle_pkt[1];
-            wire_build_cycle_hum(cycle_pkt);
-            send_uart_packet(cycle_pkt, 1);
+            uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(cycle_pkt, 8);
             printf("[Bridge] Long press: sent humanization cycle command\n");
         }
     }
@@ -460,106 +443,108 @@ static void process_status_message(const char* msg, size_t len) {
 }
 
 static void uart_rx_task(void) {
-    static uint8_t wire_packet[WIRE_MAX_PACKET];
-    static uint8_t wire_idx = 0;
-    static uint8_t wire_expected = 0;
-    static uint32_t wire_start_time = 0;
-
-    // Cache timestamp ONCE at start
+    static uint8_t binary_packet[8];
+    static uint8_t binary_idx = 0;
+    static bool in_binary_packet = false;
+    static uint32_t binary_packet_start_time = 0;
+    static uint32_t rx_debug_count = 0;
+    
+    // Cache timestamp ONCE at start, not per-byte (saves ~50 cycles per byte)
     const uint32_t now = to_ms_since_boot(get_absolute_time());
-
-    // Batch read from DMA ring buffer
-    uint8_t rx_batch[128];
+    
+    // Batch read up to 64 bytes at once from DMA ring buffer (single memcpy)
+    uint8_t rx_batch[64];
     size_t batch_count = hw_uart_read(rx_batch, sizeof(rx_batch));
     if (batch_count == 0) return;
-
-    kmbox_last_rx_time = now;
-
+    
     for (size_t batch_i = 0; batch_i < batch_count; batch_i++) {
         uint8_t c = rx_batch[batch_i];
-
-        // Timeout: reset if stuck mid-packet
-        if (wire_expected > 0 && (now - wire_start_time) > 100) {
-            wire_idx = 0;
-            wire_expected = 0;
+        
+        // Update last RX time once per batch (moved outside loop)
+        kmbox_last_rx_time = now;
+        
+        // Reset binary packet state if timeout (stuck packet)
+        if (in_binary_packet && (now - binary_packet_start_time) > 100) {
+            in_binary_packet = false;
+            binary_idx = 0;
         }
-
-        // Accumulating a wire protocol packet?
-        if (wire_expected > 0) {
-            wire_packet[wire_idx++] = c;
-            if (wire_idx >= wire_expected) {
-                // Complete wire packet — dispatch by command byte
-                uint8_t cmd = wire_packet[0];
-
-                if (cmd == WIRE_RESPONSE) {
-                    // [0xFF][status][d0][d1][d2][d3]
-                    uint8_t status = wire_packet[1];
+        
+        // Check for start of binary response packet (0xFF, 0xFE, 0x0C, or 0x0E from KMBox)
+        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0C || c == 0x0E)) {
+            in_binary_packet = true;
+            binary_idx = 0;
+            binary_packet[binary_idx++] = c;
+            binary_packet_start_time = now;
+            
+            // Debug: log binary packet detection
+            static uint32_t last_binary_debug = 0;
+            if (now - last_binary_debug > 1000) {
+                printf("[Bridge RX] Binary packet start: 0x%02X\r\n", c);
+                last_binary_debug = now;
+            }
+            continue;
+        }
+        
+        // Continue receiving binary packet
+        if (in_binary_packet) {
+            binary_packet[binary_idx++] = c;
+            if (binary_idx >= 8) {
+                // Complete packet received
+                if (binary_packet[0] == 0xFF) {
+                    // Ping/response packet
                     kmbox_response_count++;
-
-                    if (status == WIRE_RESP_PONG) {
-                        if (kmbox_state != KMBOX_CONNECTED) {
-                            kmbox_state = KMBOX_CONNECTED;
-                        }
-                    } else if (status == WIRE_RESP_INFO) {
-                        // [0xFF][0x0C][hmode][imode][max_pf][queue]
-                        // Basic info via wire response — full info comes in BIN_INFO
-                        if (kmbox_state != KMBOX_CONNECTED) {
-                            kmbox_state = KMBOX_CONNECTED;
-                        }
+                    
+                    // Forward response packet to PC over CDC
+                    if (tud_cdc_connected()) {
+                        tud_cdc_write(binary_packet, 8);
+                        tud_cdc_write_flush();
                     }
-                } else if (cmd == WIRE_BIN_INFO) {
-                    // [0x11][hmode][imode][max_pf][q_count][temp_lo][temp_hi][flags]
-                    kmbox_humanization_mode = wire_packet[1];
-                    kmbox_inject_mode = wire_packet[2];
-                    kmbox_max_per_frame = wire_packet[3];
-                    kmbox_queue_depth = wire_packet[4];
-                    kmbox_humanization_valid = true;
-
-                    int16_t temp_decideg = (int16_t)(wire_packet[5] | (wire_packet[6] << 8));
-                    kmbox_temperature_c = temp_decideg / 10.0f;
-
-                    uint8_t flags = wire_packet[7];
-                    kmbox_jitter_enabled = (flags & 0x01) != 0;
-                    kmbox_velocity_matching = (flags & 0x02) != 0;
-
+                    
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
                     }
-                } else if (cmd == WIRE_BIN_EXT) {
-                    // [0x12][q_count][q_cap][hmode][total_lo][total_hi][ovf_lo][ovf_hi]
-                    kmbox_queue_depth = wire_packet[1];
-                    kmbox_queue_capacity = wire_packet[2];
-                    if (!kmbox_humanization_valid) {
-                        kmbox_humanization_mode = wire_packet[3];
+                } else if (binary_packet[0] == 0x0C) {
+                    // Info response: [0x0C][hmode][imode][max_per_frame][queue_count][temp_lo][temp_hi][flags]
+                    // flags: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
+                    kmbox_humanization_mode = binary_packet[1];
+                    kmbox_inject_mode = binary_packet[2];
+                    kmbox_max_per_frame = binary_packet[3];
+                    kmbox_queue_depth = binary_packet[4];
+                    kmbox_humanization_valid = true;
+                    
+                    // Parse temperature (int16_t in 0.1°C units)
+                    int16_t temp_decideg = (int16_t)(binary_packet[5] | (binary_packet[6] << 8));
+                    kmbox_temperature_c = temp_decideg / 10.0f;
+                    
+                    // Parse flags byte
+                    uint8_t flags = binary_packet[7];
+                    kmbox_jitter_enabled = (flags & 0x01) != 0;
+                    kmbox_velocity_matching = (flags & 0x02) != 0;
+                    
+                    if (kmbox_state != KMBOX_CONNECTED) {
+                        kmbox_state = KMBOX_CONNECTED;
                     }
-                    kmbox_total_injected = (uint16_t)(wire_packet[4] | (wire_packet[5] << 8));
-                    kmbox_queue_overflows = (uint16_t)(wire_packet[6] | (wire_packet[7] << 8));
-
+                } else if (binary_packet[0] == 0x0E) {
+                    // Extended stats: [0x0E][queue_count][queue_cap][hmode][total_lo][total_hi][ovf_lo][ovf_hi]
+                    kmbox_queue_depth = binary_packet[1];
+                    kmbox_queue_capacity = binary_packet[2];
+                    // binary_packet[3] = hmode (redundant, but useful if 0x0C wasn't received)
+                    if (!kmbox_humanization_valid) {
+                        kmbox_humanization_mode = binary_packet[3];
+                    }
+                    kmbox_total_injected = (uint16_t)(binary_packet[4] | (binary_packet[5] << 8));
+                    kmbox_queue_overflows = (uint16_t)(binary_packet[6] | (binary_packet[7] << 8));
+                    
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
                     }
                 }
-
-                wire_idx = 0;
-                wire_expected = 0;
+                in_binary_packet = false;
+                binary_idx = 0;
             }
             continue;
         }
-
-        // Check if this byte starts a wire protocol packet
-        uint8_t pkt_len = wire_get_packet_len(c);
-        if (pkt_len > 0) {
-            if (pkt_len == 1) {
-                // Single-byte command — handle immediately (shouldn't happen from KMBox)
-            } else {
-                wire_packet[0] = c;
-                wire_idx = 1;
-                wire_expected = pkt_len;
-                wire_start_time = now;
-            }
-            continue;
-        }
-
+        
         // Process as text message
         if (c == '\n' || c == '\r') {
             if (status_buffer_idx > 0) {
@@ -571,9 +556,11 @@ static void uart_rx_task(void) {
             if (status_buffer_idx < STATUS_BUFFER_SIZE - 1) {
                 status_buffer[status_buffer_idx++] = c;
             } else {
+                // Buffer overflow - reset
                 status_buffer_idx = 0;
             }
         }
+        // Ignore other non-printable bytes
     } // end for batch_i
 }
 
@@ -582,10 +569,19 @@ static void uart_rx_task(void) {
 // ============================================================================
 
 static void send_kmbox_ping(void) {
-    uint8_t pkt[1];
-    wire_build_ping(pkt);
-    send_uart_packet(pkt, 1);
-    kmbox_ping_count++;
+    // In KMBOX text mode, send a simple text ping instead of binary
+    // This avoids corrupting the text command stream with 0xFE bytes
+    if (current_api_mode == API_MODE_KMBOX) {
+        // Send text ping: "P\n" - simple, won't interfere with M/W/B commands
+        hw_uart_puts("P\n");
+        kmbox_ping_count++;
+        // Don't add to uart_tx_bytes_total - hw_uart tracks internally
+    } else {
+        // Binary ping for other modes
+        uint8_t ping_packet[8] = {0xFE, 0, 0, 0, 0, 0, 0, 0};
+        send_uart_packet(ping_packet, 8);
+        kmbox_ping_count++;
+    }
 }
 
 // Request device info from KMBox (VID, PID, manufacturer, product)
@@ -641,10 +637,9 @@ static void kmbox_connection_task(void) {
             last_info_request_ms = now - INFO_REQUEST_INTERVAL_MS;
             last_humanization_request_ms = now - HUMANIZATION_REQUEST_INTERVAL_MS + HUMANIZATION_INITIAL_DELAY_MS;
             
-            // Send initial info request right away (wire protocol)
-            uint8_t info_req[1];
-            wire_build_info_req(info_req);
-            send_uart_packet(info_req, 1);
+            // Send initial info request right away (binary)
+            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(info_req, 8);
         }
     }
     
@@ -663,34 +658,31 @@ static void kmbox_connection_task(void) {
             request_kmbox_info();
         }
         
-        // Request humanization info periodically (wire protocol — one request returns all info)
+        // Request humanization info periodically (for TFT display) - use binary
         if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
             last_humanization_request_ms = now;
-            uint8_t info_req[1];
-            wire_build_info_req(info_req);
-            send_uart_packet(info_req, 1);
-        }
-        
-        // Evaluate input classification periodically (~1Hz, piggyback on info cycle)
-        {
-            static uint32_t last_classify_ms = 0;
-            if (now - last_classify_ms >= 1000) {
-                last_classify_ms = now;
-                input_class_t cls = input_classifier_evaluate();
-                static input_class_t last_sent_class = INPUT_UNKNOWN;
-                if (cls != INPUT_UNKNOWN && cls != last_sent_class) {
-                    uint8_t hmode = (cls == INPUT_PRE_HUMANIZED) ? 1 : 2;  // MICRO=1, FULL=2
-                    uint8_t config_pkt[3];
-                    wire_build_config(config_pkt, WIRE_CFG_HUMANIZATION, hmode);
-                    send_uart_packet(config_pkt, 3);
-                    last_sent_class = cls;
-                    printf("[Bridge] Auto-detected input: %s → humanization %s\n",
-                           cls == INPUT_PRE_HUMANIZED ? "pre-humanized" : "raw",
-                           hmode == 1 ? "MICRO" : "FULL");
-                }
+            
+            // Alternate between 0x0C (basic info + temp) and 0x0E (extended stats)
+            static uint8_t info_cycle = 0;
+            if (info_cycle % 2 == 0) {
+                // Primary: humanization mode, inject mode, queue depth, temperature, flags
+                uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+                send_uart_packet(info_req, 8);
+            } else {
+                // Extended: total injected, queue overflows, queue capacity
+                uint8_t ext_req[8] = {0x0E, 0, 0, 0, 0, 0, 0, 0};
+                send_uart_packet(ext_req, 8);
+            }
+            info_cycle++;
+            
+            // Debug: confirm we're sending the request
+            static uint32_t last_info_debug = 0;
+            if (now - last_info_debug > 5000) {
+                printf("[Bridge TX] Sending info request (cycle=%d)\n", info_cycle - 1);
+                last_info_debug = now;
             }
         }
-
+        
         // Check for ping timeout (no response after sending ping)
         if (ping_pending && (now - ping_sent_time >= KMBOX_TIMEOUT_MS)) {
             kmbox_state = KMBOX_DISCONNECTED;
@@ -710,12 +702,20 @@ static void kmbox_connection_task(void) {
             }
         }
         
-        // Send info request even when disconnected to detect KMBox
+        // TEMP: Send 0x0C request even when disconnected to test UART RX
         if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
             last_humanization_request_ms = now;
-            uint8_t info_req[1];
-            wire_build_info_req(info_req);
-            send_uart_packet(info_req, 1);
+            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            bool sent = send_uart_packet(info_req, 8);
+            
+            // Debug: confirm we're sending the request
+            static uint32_t last_info_debug_disc = 0;
+            if (now - last_info_debug_disc > 5000) {
+                printf("[Bridge TX DISC] 0x0C: %02X %02X %02X %02X %02X %02X %02X %02X (sent=%d)\n",
+                       info_req[0], info_req[1], info_req[2], info_req[3],
+                       info_req[4], info_req[5], info_req[6], info_req[7], sent);
+                last_info_debug_disc = now;
+            }
         }
     }
 }
@@ -741,23 +741,25 @@ static void uart_debug_task(void) {
 }
 
 // ============================================================================
-// Mouse Command Protocol - Send to KMBox (Binary Fast Commands)
+// Mouse Command Protocol - Send to KMBox (Simple Text Protocol)
 // ============================================================================
 
-// Send a mouse move command to KMBox via wire protocol
-static void send_smooth_mouse_move(int16_t dx, int16_t dy) {
-    uint8_t pkt[WIRE_MAX_PACKET];
-    size_t len = wire_build_move(pkt, dx, dy);
-
+// Send a simple text command to KMBox: "M<x>,<y>\n"
+static void send_text_mouse_move(int16_t dx, int16_t dy) {
+    char cmd[24];
+    // Use fast LUT-based builder instead of snprintf (~10x faster)
+    size_t len = fast_build_move(cmd, dx, dy);
+    
     // Non-blocking LED pulse using timestamp comparison
     static uint32_t led_off_time = 0;
     gpio_put(LED_PIN, 1);
     led_off_time = time_us_32() + 50;  // Schedule LED off
-
-    send_uart_packet(pkt, len);
+    
+    send_uart_packet((const uint8_t*)cmd, len);
+    // Don't add to uart_tx_bytes_total - hw_uart tracks internally
     tft_mouse_activity_count++;  // Track mouse commands for TFT display
     injection_count++;  // Track successful injections
-
+    
     // Non-blocking LED off (check in next iteration or turn off now if time passed)
     if (time_us_32() >= led_off_time) {
         gpio_put(LED_PIN, 0);
@@ -783,15 +785,14 @@ static void send_transform_command(int16_t scale_x, int16_t scale_y, bool enable
     }
 }
 
-// Send mouse move + optional button state via wire protocol
+// Legacy binary send (keep for now)
 static void send_mouse_command(int16_t dx, int16_t dy, uint8_t buttons) {
-    send_smooth_mouse_move(dx, dy);
-
-    if (buttons) {
-        uint8_t pkt[2];
-        wire_build_buttons(pkt, buttons);
-        send_uart_packet(pkt, 2);
-    }
+    // Use simple text protocol instead of binary
+    send_text_mouse_move(dx, dy);
+    
+    // If buttons changed, could send button command
+    // For now, ignore buttons in text mode
+    (void)buttons;
 }
 
 // ============================================================================
@@ -808,7 +809,6 @@ static inline bool is_fast_cmd_byte(uint8_t b) {
 static char cmd_buffer[128];
 static uint8_t cmd_buffer_idx = 0;
 
-#if ENABLE_MAKCU_PROTOCOL
 // Makcu frame reception state
 static uint8_t makcu_frame_buffer[260];  // Header + max payload
 static uint16_t makcu_frame_idx = 0;
@@ -819,7 +819,6 @@ typedef enum {
     MAKCU_STATE_PAYLOAD
 } makcu_state_t;
 static makcu_state_t makcu_state = MAKCU_STATE_IDLE;
-#endif
 
 // Ferrum line buffer (moved from file scope for better organization)
 // Note: ferrum_line and ferrum_idx already defined at file scope above
@@ -829,19 +828,18 @@ static void handle_text_command(const char* cmd) {
     // km.move(x,y) - relative mouse movement (convert to binary for efficiency)
     int x, y;
     if (kmbox_parse_move_command(cmd, &x, &y)) {
-        input_classifier_record_move((int16_t)x, (int16_t)y);
-        uint8_t pkt[WIRE_MAX_PACKET];
-        size_t len = wire_build_move(pkt, (int16_t)x, (int16_t)y);
-        send_uart_packet(pkt, len);
+        // Send as binary packet for efficiency
+        uint8_t pkt[8] = {0x01, (uint8_t)(x & 0xFF), (uint8_t)((x >> 8) & 0xFF),
+                          (uint8_t)(y & 0xFF), (uint8_t)((y >> 8) & 0xFF), 0, 0, 0};
+        send_uart_packet(pkt, 8);
         return;
     }
-
-    // km.click(btn) - mouse click (wire protocol)
+    
+    // km.click(btn) - mouse click (convert to binary)
     int btn;
     if (kmbox_parse_click_command(cmd, &btn)) {
-        uint8_t pkt[3];
-        wire_build_click(pkt, (uint8_t)btn, 1);
-        send_uart_packet(pkt, 3);
+        uint8_t pkt[8] = {0x02, (uint8_t)btn, 1, 0, 0, 0, 0, 0};
+        send_uart_packet(pkt, 8);
         return;
     }
     
@@ -904,7 +902,6 @@ static void handle_text_command(const char* cmd) {
     }
 }
 
-#if ENABLE_COLOR_TRACKER
 static void process_cdc_byte(uint8_t b) {
     switch (rx_state) {
         case RX_STATE_IDLE:
@@ -923,7 +920,7 @@ static void process_cdc_byte(uint8_t b) {
                     pending_header.height <= ROI_MAX_SIZE &&
                     pending_header.width > 0 &&
                     pending_header.height > 0) {
-
+                    
                     rx_bytes_expected = pending_header.width * pending_header.height * 3;
                     rx_bytes_received = 0;
                     rx_state = RX_STATE_PIXELS;
@@ -946,7 +943,6 @@ static void process_cdc_byte(uint8_t b) {
             break;
     }
 }
-#endif // ENABLE_COLOR_TRACKER
 
 static void cdc_task(void) {
     static uint8_t response_buffer[256];  // Batch responses
@@ -966,12 +962,13 @@ static void cdc_task(void) {
     }
     
     // Fast-path: Check first byte for protocol hint (better branch prediction)
-    (void)buf[0];  // Suppress unused warning when protocols are disabled
-
+    uint8_t first_byte = buf[0];
+    bool likely_makcu = (first_byte == MAKCU_FRAME_START);  // 0x50
+    bool likely_frame = (first_byte == FRAME_MAGIC_0);      // 'F'
+    
     for (uint32_t i = 0; i < count; i++) {
         uint8_t b = buf[i];
-
-#if ENABLE_MAKCU_PROTOCOL
+        
         // Check for Makcu frame start (0x50)
         if (makcu_state == MAKCU_STATE_IDLE && b == MAKCU_FRAME_START) {
             makcu_state = MAKCU_STATE_HEADER;
@@ -979,16 +976,16 @@ static void cdc_task(void) {
             makcu_frame_buffer[makcu_frame_idx++] = b;
             continue;
         }
-
+        
         // Handle Makcu frame reception
         if (makcu_state != MAKCU_STATE_IDLE) {
             makcu_frame_buffer[makcu_frame_idx++] = b;
-
+            
             // Check if we have the complete header (4 bytes)
             if (makcu_state == MAKCU_STATE_HEADER && makcu_frame_idx >= 4) {
                 makcu_frame_header_t* hdr = (makcu_frame_header_t*)makcu_frame_buffer;
                 makcu_frame_expected = sizeof(makcu_frame_header_t) + hdr->len;
-
+                
                 // Validate payload length
                 if (hdr->len > 256) {
                     // Invalid frame, reset
@@ -996,13 +993,13 @@ static void cdc_task(void) {
                     makcu_frame_idx = 0;
                     continue;
                 }
-
+                
                 if (hdr->len > 0) {
                     makcu_state = MAKCU_STATE_PAYLOAD;
                 } else {
                     // No payload, process immediately
                     makcu_state = MAKCU_STATE_IDLE;
-
+                    
                     // Translate and forward
                     translated_cmd_t translated;
                     if (makcu_translate_command(hdr->cmd, NULL, 0, &translated) == TRANSLATE_OK) {
@@ -1010,7 +1007,7 @@ static void cdc_task(void) {
                             send_uart_packet(translated.buffer, translated.length);
                         }
                     }
-
+                    
                     // Send response if needed (buffered)
                     if (makcu_cmd_needs_response(hdr->cmd)) {
                         uint8_t response[8];
@@ -1023,12 +1020,12 @@ static void cdc_task(void) {
                     makcu_frame_idx = 0;
                 }
             }
-
+            
             // Check if we have the complete frame
             if (makcu_state == MAKCU_STATE_PAYLOAD && makcu_frame_idx >= makcu_frame_expected) {
                 makcu_frame_header_t* hdr = (makcu_frame_header_t*)makcu_frame_buffer;
                 uint8_t* payload = makcu_frame_buffer + sizeof(makcu_frame_header_t);
-
+                
                 // Translate and forward
                 translated_cmd_t translated;
                 if (makcu_translate_command(hdr->cmd, payload, hdr->len, &translated) == TRANSLATE_OK) {
@@ -1036,7 +1033,7 @@ static void cdc_task(void) {
                         send_uart_packet(translated.buffer, translated.length);
                     }
                 }
-
+                
                 // Send response if needed (buffered)
                 if (makcu_cmd_needs_response(hdr->cmd)) {
                     uint8_t response[8];
@@ -1052,8 +1049,7 @@ static void cdc_task(void) {
             }
             continue;
         }
-#endif // ENABLE_MAKCU_PROTOCOL
-
+        
         // Handle Ferrum text commands (km.* format)
         // Check if this is part of a km. command
         if (ferrum_idx == 0 && b == 'k') {
@@ -1078,15 +1074,6 @@ static void cdc_task(void) {
                 ferrum_translated_t translated;
                 if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
                     if (translated.length > 0) {
-                        // Record mouse moves for input classification
-                        if (translated.buffer[0] == WIRE_MOVE8 && translated.length >= 3) {
-                            input_classifier_record_move((int8_t)translated.buffer[1],
-                                                         (int8_t)translated.buffer[2]);
-                        } else if (translated.buffer[0] == WIRE_MOVE16 && translated.length >= 5) {
-                            int16_t mx = (int16_t)(translated.buffer[1] | (translated.buffer[2] << 8));
-                            int16_t my = (int16_t)(translated.buffer[3] | (translated.buffer[4] << 8));
-                            input_classifier_record_move(mx, my);
-                        }
                         send_uart_packet(translated.buffer, translated.length);
                     }
                     // Send Ferrum response (buffered)
@@ -1174,43 +1161,89 @@ static void set_status(bridge_status_t new_status) {
     }
 }
 
-/**
- * @brief Update NeoPixel status — zero CPU cost.
- *
- * This only writes a volatile enum.  All color math, breathing, and DMA
- * transfers happen inside the neopixel_dma 30 Hz timer ISR.
- */
 static void update_status_neopixel(void) {
-    // Determine the logical status
-#if ENABLE_COLOR_TRACKER
+    static uint32_t last_update = 0;
+    static uint8_t activity_countdown = 0;
+    static uint8_t brightness = 255;
+    static int8_t brightness_dir = -2;
+    uint32_t now = time_us_32();
+    
+    if (activity_countdown > 0) {
+        ws2812_put_rgb(LED_COLOR_ACTIVITY);
+        activity_countdown--;
+        return;
+    }
+    
+    if (now - last_update < 50000) return;
+    last_update = now;
+    
     if (!tracker_is_enabled()) {
         set_status(STATUS_DISABLED);
     } else if (frame_ready) {
         set_status(STATUS_TRACKING);
-        neopixel_dma_activity_flash(LED_COLOR_ACTIVITY);
-    } else
-#endif
-    if (tud_cdc_connected()) {
+        activity_countdown = 2;
+    } else if (tud_cdc_connected()) {
         set_status(STATUS_CDC_CONNECTED);
     } else {
         set_status(STATUS_IDLE);
     }
-
-    // Map bridge status → neopixel_dma status (single volatile store)
-    static const neo_status_t status_map[] = {
-        [STATUS_BOOTING]       = NEO_STATUS_BOOTING,
-        [STATUS_IDLE]          = NEO_STATUS_IDLE,
-        [STATUS_CDC_CONNECTED] = NEO_STATUS_CDC_CONNECTED,
-        [STATUS_TRACKING]      = NEO_STATUS_TRACKING,
-        [STATUS_DISABLED]      = NEO_STATUS_DISABLED,
-        [STATUS_ERROR]         = NEO_STATUS_ERROR,
-    };
-    neopixel_dma_set_status(status_map[current_status]);
+    
+    bool apply_breathing = (current_status == STATUS_BOOTING || 
+                           current_status == STATUS_IDLE ||
+                           current_status == STATUS_ERROR);
+    
+    if (apply_breathing) {
+        brightness += brightness_dir;
+        if (brightness <= 50) {
+            brightness = 50;
+            brightness_dir = 2;
+        } else if (brightness >= 255) {
+            brightness = 255;
+            brightness_dir = -2;
+        }
+    } else {
+        brightness = 255;
+    }
+    
+    uint8_t r, g, b;
+    switch (current_status) {
+        case STATUS_BOOTING:
+            r = 0; g = 0; b = 255;
+            break;
+        case STATUS_IDLE:
+            r = 255; g = 0; b = 0;
+            break;
+        case STATUS_CDC_CONNECTED:
+            r = 0; g = 255; b = 255;
+            break;
+        case STATUS_TRACKING:
+            r = 0; g = 255; b = 0;
+            break;
+        case STATUS_DISABLED:
+            r = 255; g = 255; b = 0;
+            break;
+        case STATUS_ERROR:
+        default:
+            r = 255; g = 0; b = 0;
+            break;
+    }
+    
+    if (apply_breathing) {
+        r = (r * brightness) / 255;
+        g = (g * brightness) / 255;
+        b = (b * brightness) / 255;
+    }
+    
+    ws2812_put_rgb(r, g, b);
 }
 
-#if ENABLE_TFT_DISPLAY
 // ============================================================================
 // TFT Display — Stats Gathering (runs every main-loop iteration)
+//
+// This is now very lightweight: it gathers numbers into a struct and hands
+// them to the display module.  The CPU-intensive formatting and pixel
+// drawing happen in a 100ms hardware-timer ISR inside tft_display.c,
+// so the main loop is free to service USB/UART/tracking without stalling.
 // ============================================================================
 
 static void tft_submit_stats_task(void) {
@@ -1301,16 +1334,14 @@ static void tft_submit_stats_task(void) {
     // Hand stats to display module (just a memcpy — timer ISR renders later)
     tft_display_submit_stats(&stats);
 }
-#endif // ENABLE_TFT_DISPLAY
 
 // ============================================================================
 // Main Entry Point
 // ============================================================================
 
 int main(void) {
-    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.25V
-    // (matches KMBox voltage for stable 240MHz under load with TFT+DMA+USB)
-    vreg_set_voltage(VREG_VOLTAGE_1_25);
+    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.20V
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(10);  // Let voltage stabilize
     set_sys_clock_khz(240000, true);
     
@@ -1327,33 +1358,28 @@ int main(void) {
     adc_set_temp_sensor_enabled(true);
     
     // Initialize peripherals (fast init only)
-    neopixel_dma_init(pio0, WS2812_PIN);  // DMA-driven NeoPixel (zero CPU in hot path)
+    ws2812_init();
     button_init();
     hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
     latency_tracker_init(); // Initialize latency tracking
+    protocol_luts_init();   // Initialize protocol translation LUTs
     
-#if ENABLE_MAKCU_PROTOCOL
     // Initialize Core1 translator
     core1_translator_init();
-#endif
-
-#if ENABLE_COLOR_TRACKER
+    
     // Initialize tracker
     tracker_init();
-#endif
     
-    // Initial LED state (neopixel_dma_init already shows booting blue)
+    // Initial LED state
+    ws2812_put_rgb(LED_COLOR_BOOTING);
     set_status(STATUS_BOOTING);
-    neopixel_dma_set_status(NEO_STATUS_BOOTING);
     
     // TinyUSB initialization - MUST happen early for CDC to enumerate
     tusb_init();
     
-#if ENABLE_TFT_DISPLAY
     // Now init TFT (has long delays, but USB is already initializing)
     tft_display_init();     // Initialize TFT display (SPI1)
     tft_display_splash();   // Show splash screen
-#endif
     
     // Initialize connection state
     uint32_t boot_time = to_ms_since_boot(get_absolute_time());
@@ -1376,35 +1402,50 @@ int main(void) {
         
         kmbox_connection_task();
         button_task();
-#if ENABLE_TFT_DISPLAY
         tft_display_handle_touch();  // Handle touch screen input (zone-based: view/API/humanization)
-
+        
         // Send humanization cycle command if requested by touch (bottom zone)
         if (humanization_cycle_requested) {
             humanization_cycle_requested = false;
-            uint8_t cycle_pkt[1];
-            wire_build_cycle_hum(cycle_pkt);
-            send_uart_packet(cycle_pkt, 1);
+            uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
+            send_uart_packet(cycle_pkt, 8);
             printf("[Bridge] Touch: sent humanization cycle command\n");
         }
-
+        
+        // Process menu requests (from TFT menu view)
+        if (tft_menu_request.set_humanization_mode) {
+            tft_menu_request.set_humanization_mode = false;
+            // WIRE_CONFIG: [0x0B][param=0x02][value]
+            uint8_t config_pkt[3] = {0x0B, 0x02, tft_menu_request.humanization_mode_val};
+            send_uart_packet(config_pkt, 3);
+            printf("[Bridge] Menu: set humanization mode -> %d\n", tft_menu_request.humanization_mode_val);
+        }
+        if (tft_menu_request.set_max_per_frame || tft_menu_request.set_velocity_matching) {
+            uint8_t mpf = tft_menu_request.set_max_per_frame ? tft_menu_request.max_per_frame_val : kmbox_max_per_frame;
+            uint8_t vel = tft_menu_request.set_velocity_matching ? tft_menu_request.velocity_matching_val :
+                          (kmbox_velocity_matching ? 1 : 0);
+            tft_menu_request.set_max_per_frame = false;
+            tft_menu_request.set_velocity_matching = false;
+            // WIRE_SMOOTH_CFG: [0x0C][max_per_frame][vel_match]
+            uint8_t smooth_cfg_pkt[3] = {0x0C, mpf, vel};
+            send_uart_packet(smooth_cfg_pkt, 3);
+            printf("[Bridge] Menu: smooth cfg mpf=%d vel=%d\n", mpf, vel);
+        }
+        if (tft_menu_request.set_inject_mode) {
+            tft_menu_request.set_inject_mode = false;
+            // No dedicated wire command for inject mode — use WIRE_CONFIG with a new param
+            // For now, this is informational (inject mode is per-movement in SMOOTH16)
+            printf("[Bridge] Menu: inject mode -> %d (display-only)\n", tft_menu_request.inject_mode_val);
+        }
+        
         // Cycle API mode if requested by touch (middle zone)
         if (api_cycle_requested) {
             api_cycle_requested = false;
             current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
-            // Flash NeoPixel with API-mode color (zero CPU — handled by DMA ISR)
-            switch (current_api_mode) {
-                case API_MODE_KMBOX: neopixel_dma_activity_flash_ms(LED_COLOR_API_KMBOX, 400);  break;
-#if ENABLE_MAKCU_PROTOCOL
-                case API_MODE_MAKCU: neopixel_dma_activity_flash_ms(LED_COLOR_API_MAKCU, 400);  break;
-#endif
-                case API_MODE_FERRUM: neopixel_dma_activity_flash_ms(LED_COLOR_API_FERRUM, 400); break;
-            }
             printf("[Bridge] Touch: API mode -> %d\n", (int)current_api_mode);
         }
-#endif // ENABLE_TFT_DISPLAY
         
         // Periodic UART echo test (every 2 seconds while not connected)
         static uint32_t last_echo_test = 0;
@@ -1414,19 +1455,20 @@ int main(void) {
             send_uart_echo_test();
         }
         
-#if ENABLE_MAKCU_PROTOCOL
-        // Dequeue translated wire protocol packets from Core1 and send
+        // Dequeue translated commands from Core1 and send
         uint8_t translated_packet[8];
         while (core1_has_kmbox_commands()) {
             if (core1_dequeue_kmbox_command(translated_packet)) {
-                // Core1 produces wire protocol packets directly
-                uint8_t wire_len = wire_get_packet_len(translated_packet[0]);
-                if (wire_len > 0) {
-                    send_uart_packet(translated_packet, wire_len);
-                }
+                // Translate 8-byte KMBox to optimized bridge protocol
+                // (Core1 outputs old format, we convert to new)
+                int16_t x = translated_packet[1] | (translated_packet[2] << 8);
+                int16_t y = translated_packet[3] | (translated_packet[4] << 8);
+                
+                uint8_t bridge_pkt[7];
+                size_t len = bridge_build_mouse_move(bridge_pkt, x, y);
+                send_uart_packet(bridge_pkt, len);
             }
         }
-#endif
         
         // Send startup message once CDC is connected
         if (tud_cdc_connected() && !startup_msg_sent) {
@@ -1445,26 +1487,25 @@ int main(void) {
             startup_msg_sent = true;
         }
         
-#if ENABLE_COLOR_TRACKER
         // Process frame if ready
         if (frame_ready) {
             frame_ready = false;
-
+            
             uint32_t now = time_us_32();
-
+            
             // Track command latency
             uint32_t timing_start = latency_start_timing();
-
+            
             tracker_result_t result;
             tracker_process_frame(frame_buffer, current_roi_w, current_roi_h, &result);
-
+            
             // Only send commands if KMBox is connected
             if (result.valid && tracker_is_enabled() && kmbox_state == KMBOX_CONNECTED) {
                 send_mouse_command(result.dx, result.dy, 0);
             }
-
+            
             latency_end_timing(timing_start);
-
+            
             // FPS calculation
             frame_count++;
             if (now - fps_timer >= 1000000) {
@@ -1475,16 +1516,13 @@ int main(void) {
             
             last_frame_time = now;
         }
-#endif // ENABLE_COLOR_TRACKER
-
+        
         // Update status indicators
         heartbeat_task();
         update_status_neopixel();
         uart_debug_task();
-#if ENABLE_TFT_DISPLAY
         tft_submit_stats_task();   // Gather stats for display (lightweight memcpy)
         tft_display_flush();       // Push rendered frame via SPI DMA (if ready)
-#endif
         
         tight_loop_contents();
     }

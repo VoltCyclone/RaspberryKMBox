@@ -158,6 +158,9 @@ static uint32_t last_tx_bytes = 0;
 static uint32_t last_rx_bytes = 0;
 static tft_view_mode_t current_view = TFT_VIEW_DETAILED;
 
+// Shared menu request structure (menu writes, main loop reads & clears)
+volatile tft_menu_request_t tft_menu_request = {0};
+
 // Touch handling - zone-based tap detection
 // Screen is divided into 3 horizontal zones:
 //   Top    (y 0..106):   Cycle display view
@@ -170,6 +173,35 @@ static volatile bool touch_human_requested = false;
 // Touch zone boundaries (display split into thirds, adapts to any height)
 #define TOUCH_ZONE_TOP_END     (TFT_HEIGHT / 3)
 #define TOUCH_ZONE_MID_END     (TFT_HEIGHT * 2 / 3)
+
+// ============================================================================
+// Menu System State
+// ============================================================================
+
+#define MENU_ITEM_COUNT 5
+#define MENU_ROW_H      36      // Height of each menu row (touch target)
+#define MENU_HEADER_H   40      // Height of menu header area
+#define MENU_MARGIN      8
+#define MENU_BTN_W      48      // Width of -/+ button areas
+#define MENU_HIGHLIGHT_MS 200   // Brief highlight on tap
+
+typedef enum {
+    MENU_HUMANIZATION_MODE,
+    MENU_INJECT_MODE,
+    MENU_MAX_PER_FRAME,
+    MENU_VELOCITY_MATCHING,
+    MENU_JITTER,
+} menu_item_id_t;
+
+// Cached local menu values (snapshot from stats, updated by touch)
+static uint8_t menu_humanization_mode = 0;
+static uint8_t menu_inject_mode = 1;
+static uint8_t menu_max_per_frame = 16;
+static bool    menu_velocity_matching = true;
+static bool    menu_jitter_enabled = false;
+static bool    menu_values_initialized = false;
+static int8_t  menu_highlight_item = -1;  // Item being highlighted (-1 = none)
+static uint32_t menu_highlight_time = 0;  // When highlight started
 
 // Double-buffered stats: main loop writes, timer ISR reads
 static tft_stats_t shared_stats;           // Latest stats from main loop
@@ -266,8 +298,15 @@ static inline uint8_t hmode_color(uint8_t m) {
 // ============================================================================
 
 #if TOUCH_ENABLED
+// Menu touch callback: handles taps when in menu view
+static void menu_touch_event(uint16_t x, uint16_t y);
+
 static void touch_event_callback(uint16_t x, uint16_t y) {
-    // Route tap to the correct zone flag based on Y coordinate
+    if (current_view == TFT_VIEW_MENU) {
+        menu_touch_event(x, y);
+        return;
+    }
+    // Non-menu views: route tap to the correct zone flag based on Y coordinate
     // The display is 240x320, divided into 3 horizontal bands
     if (y <= TOUCH_ZONE_TOP_END) {
         touch_view_requested = true;       // Top: cycle view
@@ -275,6 +314,81 @@ static void touch_event_callback(uint16_t x, uint16_t y) {
         touch_api_requested = true;        // Middle: cycle API protocol
     } else {
         touch_human_requested = true;      // Bottom: cycle humanization
+    }
+}
+
+// Menu touch handler — called from touch_event_callback when in MENU view
+static void menu_touch_event(uint16_t x, uint16_t y) {
+    // Header zone: tap to go back to detailed view
+    if (y < MENU_HEADER_H) {
+        touch_view_requested = true;
+        return;
+    }
+
+    // Determine which menu row was tapped
+    int row = (y - MENU_HEADER_H) / MENU_ROW_H;
+    if (row < 0 || row >= MENU_ITEM_COUNT) return;
+
+    // Left half = decrease, right half = increase
+    bool increase = (x >= TFT_WIDTH / 2);
+
+    menu_highlight_item = (int8_t)row;
+    menu_highlight_time = to_ms_since_boot(get_absolute_time());
+
+    switch ((menu_item_id_t)row) {
+        case MENU_HUMANIZATION_MODE:
+            if (increase) {
+                menu_humanization_mode = (menu_humanization_mode + 1) % 3;
+            } else {
+                menu_humanization_mode = (menu_humanization_mode + 2) % 3;
+            }
+            tft_menu_request.humanization_mode_val = menu_humanization_mode;
+            tft_menu_request.set_humanization_mode = true;
+            break;
+
+        case MENU_INJECT_MODE:
+            if (increase) {
+                menu_inject_mode = (menu_inject_mode + 1) % 4;
+            } else {
+                menu_inject_mode = (menu_inject_mode + 3) % 4;
+            }
+            // Inject mode is part of smooth config — signal both
+            tft_menu_request.inject_mode_val = menu_inject_mode;
+            tft_menu_request.set_inject_mode = true;
+            break;
+
+        case MENU_MAX_PER_FRAME:
+            if (increase) {
+                if (menu_max_per_frame < 32) menu_max_per_frame++;
+            } else {
+                if (menu_max_per_frame > 1) menu_max_per_frame--;
+            }
+            tft_menu_request.max_per_frame_val = menu_max_per_frame;
+            tft_menu_request.set_max_per_frame = true;
+            break;
+
+        case MENU_VELOCITY_MATCHING:
+            menu_velocity_matching = !menu_velocity_matching;
+            tft_menu_request.velocity_matching_val = menu_velocity_matching ? 1 : 0;
+            tft_menu_request.set_velocity_matching = true;
+            break;
+
+        case MENU_JITTER:
+            // Jitter is implicitly controlled by humanization mode
+            // (>= MICRO enables jitter), but we allow override here
+            menu_jitter_enabled = !menu_jitter_enabled;
+            // Toggling jitter is achieved by toggling humanization mode
+            // If turning on: set to MICRO, if turning off: set to OFF
+            if (menu_jitter_enabled && menu_humanization_mode == 0) {
+                menu_humanization_mode = 1;  // Enable MICRO for jitter
+                tft_menu_request.humanization_mode_val = menu_humanization_mode;
+                tft_menu_request.set_humanization_mode = true;
+            } else if (!menu_jitter_enabled && menu_humanization_mode > 0) {
+                menu_humanization_mode = 0;  // Disable humanization to stop jitter
+                tft_menu_request.humanization_mode_val = menu_humanization_mode;
+                tft_menu_request.set_humanization_mode = true;
+            }
+            break;
     }
 }
 #endif
@@ -944,6 +1058,197 @@ static void draw_gauge_view(const tft_stats_t *stats) {
 }
 
 // ============================================================================
+// Menu View — Humanization Settings
+// ============================================================================
+
+static void draw_menu_row(int y, int row_idx, const char *label,
+                          const char *value, uint8_t val_color,
+                          bool show_arrows) {
+    // Highlight row briefly after a tap
+    uint8_t bg = COL_BG;
+    if (menu_highlight_item == row_idx) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - menu_highlight_time < MENU_HIGHLIGHT_MS) {
+            bg = COL_DARK;
+        } else {
+            menu_highlight_item = -1;
+        }
+    }
+
+    // Row background
+    if (bg != COL_BG) {
+        box(MENU_MARGIN, y, TFT_WIDTH - 2 * MENU_MARGIN, MENU_ROW_H - 2, bg);
+    }
+
+    // Separator line at top of row
+    hline(y, COL_DIM_LINE);
+
+    int text_y = y + (MENU_ROW_H - FONT_H) / 2;  // Vertically centered text
+
+    // Label on left
+    tft_draw_string(MENU_MARGIN + 4, text_y, COL_GRAY, label);
+
+    // Value on right
+    int val_len = 0;
+    const char *vp = value;
+    while (*vp++) val_len++;
+    int val_x = TFT_WIDTH - MENU_MARGIN - (val_len * FONT_W) - 4;
+
+    if (show_arrows) {
+        // Draw < > arrows around value
+        tft_draw_string(val_x - 2 * FONT_W, text_y, COL_CYAN, "<");
+        tft_draw_string(val_x, text_y, val_color, value);
+        tft_draw_string(val_x + val_len * FONT_W + FONT_W, text_y, COL_CYAN, ">");
+    } else {
+        tft_draw_string(val_x, text_y, val_color, value);
+    }
+}
+
+static void draw_menu_view(const tft_stats_t *stats) {
+    // Sync local menu values from stats on first entry
+    if (!menu_values_initialized && stats->humanization_valid) {
+        menu_humanization_mode = stats->humanization_mode;
+        menu_inject_mode = stats->inject_mode;
+        menu_max_per_frame = stats->max_per_frame;
+        menu_velocity_matching = stats->velocity_matching;
+        menu_jitter_enabled = stats->jitter_enabled;
+        menu_values_initialized = true;
+    }
+
+    int y = MARGIN;
+
+    // === HEADER ===
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "Humanization");
+    y += LINE_H;
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_DARK, "Tap to adjust");
+    y += LINE_H + SEP_GAP;
+    hline(y, COL_CYAN);
+    y = MENU_HEADER_H;
+
+    // === MENU ROWS ===
+    // Row 0: Humanization Mode (Off / Micro / Full)
+    {
+        static const char *mode_names[] = { "Off", "Micro", "Full" };
+        const char *val = (menu_humanization_mode < 3) ? mode_names[menu_humanization_mode] : "?";
+        uint8_t col = hmode_color(menu_humanization_mode);
+        draw_menu_row(y, 0, "Mode", val, col, true);
+        y += MENU_ROW_H;
+    }
+
+    // Row 1: Inject Mode (Immediate / Smooth / VelMatch / Micro)
+    {
+        static const char *inject_names[] = { "Immed", "Smooth", "VelMat", "Micro" };
+        const char *val = (menu_inject_mode < 4) ? inject_names[menu_inject_mode] : "?";
+        draw_menu_row(y, 1, "Inject", val, COL_WHITE, true);
+        y += MENU_ROW_H;
+    }
+
+    // Row 2: Max Per Frame (1-32)
+    {
+        char mpf_str[8];
+        char *p = u32_to_str(mpf_str, menu_max_per_frame);
+        *p++ = ' '; *p++ = 'p'; *p++ = 'x'; *p = '\0';
+        uint8_t col = COL_WHITE;
+        if (menu_max_per_frame <= 4) col = COL_YELLOW;
+        else if (menu_max_per_frame >= 24) col = COL_RED;
+        draw_menu_row(y, 2, "MaxPF", mpf_str, col, true);
+        y += MENU_ROW_H;
+    }
+
+    // Row 3: Velocity Matching (On / Off)
+    {
+        const char *val = menu_velocity_matching ? "On" : "Off";
+        uint8_t col = menu_velocity_matching ? COL_GREEN : COL_RED;
+        draw_menu_row(y, 3, "VelMatch", val, col, false);
+        y += MENU_ROW_H;
+    }
+
+    // Row 4: Jitter/Tremor (On / Off)
+    {
+        const char *val = menu_jitter_enabled ? "On" : "Off";
+        uint8_t col = menu_jitter_enabled ? COL_GREEN : COL_RED;
+        draw_menu_row(y, 4, "Jitter", val, col, false);
+        y += MENU_ROW_H;
+    }
+
+    // Separator after last item
+    hline(y, COL_DIM_LINE);
+    y += SECTION_GAP + 4;
+
+    // === LIVE STATUS (read-only, from stats) ===
+    tft_draw_string(MENU_MARGIN, y, COL_CYAN, "Live Status");
+    y += LINE_H + 2;
+
+    // Queue depth bar
+    if (stats->humanization_valid) {
+        tft_draw_string(MENU_MARGIN, y, COL_GRAY, "Queue");
+        // Draw visual bar
+        int bar_x = MENU_MARGIN + 6 * FONT_W + 4;
+        int bar_w = TFT_WIDTH - bar_x - MENU_MARGIN - 40;
+        int bar_h = FONT_H - 2;
+        box(bar_x, y + 1, bar_w, bar_h, COL_DARK);
+        if (stats->queue_capacity > 0) {
+            int fill = (int)((float)stats->queue_depth / stats->queue_capacity * bar_w);
+            if (fill > bar_w) fill = bar_w;
+            uint8_t bar_col = COL_GREEN;
+            if (stats->queue_depth > stats->queue_capacity * 3 / 4) bar_col = COL_RED;
+            else if (stats->queue_depth > stats->queue_capacity / 2) bar_col = COL_YELLOW;
+            if (fill > 0) box(bar_x, y + 1, fill, bar_h, bar_col);
+        }
+        // Numeric value
+        char qstr[8];
+        char *qp = u32_to_str(qstr, stats->queue_depth);
+        *qp++ = '/';
+        qp = u32_to_str(qp, stats->queue_capacity);
+        *qp = '\0';
+        tft_draw_string(TFT_WIDTH - MENU_MARGIN - 5 * FONT_W, y, COL_WHITE, qstr);
+        y += LINE_H + 2;
+    }
+
+    // Total injected
+    if (stats->total_injected > 0) {
+        tft_draw_string(MENU_MARGIN, y, COL_GRAY, "Injected");
+        char inj_str[12];
+        char *ip = u32_to_str(inj_str, stats->total_injected);
+        *ip = '\0';
+        int ix = TFT_WIDTH - MENU_MARGIN - (int)(ip - inj_str) * FONT_W;
+        tft_draw_string(ix, y, COL_WHITE, inj_str);
+        y += LINE_H + 2;
+    }
+
+    // Queue overflows
+    if (stats->queue_overflows > 0) {
+        tft_draw_string(MENU_MARGIN, y, COL_GRAY, "Overflow");
+        char ovf_str[12];
+        char *op = u32_to_str(ovf_str, stats->queue_overflows);
+        *op = '\0';
+        int ox = TFT_WIDTH - MENU_MARGIN - (int)(op - ovf_str) * FONT_W;
+        tft_draw_string(ox, y, COL_RED, ovf_str);
+        y += LINE_H + 2;
+    }
+
+    // Connection + temp at bottom
+    y = TFT_HEIGHT - LINE_H * 2 - MARGIN;
+    hline(y, COL_DIM_LINE);
+    y += 4;
+    {
+        uint8_t km_col = stats->kmbox_connected ? COL_GREEN : COL_RED;
+        tft_draw_string(MENU_MARGIN, y, COL_GRAY, "KMBox");
+        tft_draw_string(MENU_MARGIN + 6 * FONT_W, y, km_col,
+                        stats->kmbox_connected ? "OK" : "--");
+        // Uptime right-aligned
+        int ux = TFT_WIDTH - MARGIN - fmt_uptime.len * FONT_W;
+        tft_draw_string(ux, y, COL_CYAN, fmt_uptime.str);
+        y += LINE_H;
+    }
+    if (fmt_br_temp.len) {
+        tft_draw_string(MENU_MARGIN, y, COL_GRAY, "Temp");
+        tft_draw_string(MENU_MARGIN + 5 * FONT_W, y, 
+                        temp_color(stats->bridge_temperature_c), fmt_br_temp.str);
+    }
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -1007,7 +1312,9 @@ static bool tft_render_timer_callback(repeating_timer_t *rt) {
     tft_fill(COL_BG);
     format_stats(&local_stats);
     
-    if (current_view == TFT_VIEW_GAUGES) {
+    if (current_view == TFT_VIEW_MENU) {
+        draw_menu_view(&local_stats);
+    } else if (current_view == TFT_VIEW_GAUGES) {
         draw_gauge_view(&local_stats);
     } else {
         draw_stats(&local_stats);
@@ -1058,7 +1365,9 @@ void tft_display_refresh(const tft_stats_t *stats) {
     tft_fill(COL_BG);
     format_stats(stats);
     
-    if (current_view == TFT_VIEW_GAUGES) {
+    if (current_view == TFT_VIEW_MENU) {
+        draw_menu_view(stats);
+    } else if (current_view == TFT_VIEW_GAUGES) {
         draw_gauge_view(stats);
     } else {
         draw_stats(stats);
@@ -1118,10 +1427,22 @@ void tft_display_set_view(tft_view_mode_t mode) {
 }
 
 void tft_display_toggle_view(void) {
-    if (current_view == TFT_VIEW_DETAILED) {
-        current_view = TFT_VIEW_GAUGES;
-    } else {
-        current_view = TFT_VIEW_DETAILED;
+    switch (current_view) {
+        case TFT_VIEW_DETAILED:
+            current_view = TFT_VIEW_GAUGES;
+            break;
+        case TFT_VIEW_GAUGES:
+#if TOUCH_ENABLED
+            current_view = TFT_VIEW_MENU;
+            menu_values_initialized = false;  // Re-sync from live stats
+            break;
+        case TFT_VIEW_MENU:
+#endif
+            current_view = TFT_VIEW_DETAILED;
+            break;
+        default:
+            current_view = TFT_VIEW_DETAILED;
+            break;
     }
 }
 
