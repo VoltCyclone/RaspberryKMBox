@@ -1013,7 +1013,7 @@ static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
     // Ensure data structure is properly aligned and sized for flash
     static_assert(sizeof(humanization_persist_t) <= FLASH_SECTOR_SIZE, "Data too large for flash sector");
     static_assert((sizeof(humanization_persist_t) % 4) == 0, "Data must be 4-byte aligned for flash");
-    
+
     flash_save_param_t param = {
         .data = {
             .magic = HUMANIZATION_MAGIC,
@@ -1021,8 +1021,10 @@ static void __not_in_flash_func(smooth_save_humanization_mode_internal)(void) {
             .checksum = HUMANIZATION_MAGIC ^ g_smooth.humanization.mode
         }
     };
-    
-    int result = flash_safe_execute(flash_write_callback, &param, 500);
+
+    // Increased timeout from 500ms to 2000ms to handle busy Core1
+    // Core1 may be processing intensive USB host operations
+    int result = flash_safe_execute(flash_write_callback, &param, 2000);
     if (result != PICO_OK) {
         // flash_safe_execute handles all the multicore coordination;
         // if it fails, increment our failure counter
