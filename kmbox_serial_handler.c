@@ -439,21 +439,14 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             return true;
         }
         
-        case FAST_CMD_KEY_PRESS: {
-            const fast_cmd_key_t *k = (const fast_cmd_key_t *)pkt;
-            hid_keyboard_report_t report = {.modifier = k->modifiers, .keycode = {k->keycode}};
-            process_kbd_report(&report);
-            memset(&report, 0, sizeof(report));
-            process_kbd_report(&report);
-            fast_cmd_count++;
-            return true;
-        }
-        
         case FAST_CMD_KEY_COMBO: {
+            // Handles both KEY_PRESS and KEY_COMBO (same command ID 0x0C)
             const fast_cmd_combo_t *c = (const fast_cmd_combo_t *)pkt;
             hid_keyboard_report_t report = {.modifier = c->modifiers};
             uint8_t n = 0;
-            for (int i = 0; i < 4 && c->keys[i]; i++) report.keycode[n++] = c->keys[i];
+            // Use keycode field for single key, or keys array for combo
+            if (c->keycode) report.keycode[n++] = c->keycode;
+            for (int i = 0; i < 4 && c->keys[i] && n < 6; i++) report.keycode[n++] = c->keys[i];
             process_kbd_report(&report);
             memset(&report, 0, sizeof(report));
             process_kbd_report(&report);
@@ -555,7 +548,7 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             uint8_t flags = 0;
             humanization_mode_t hm = smooth_get_humanization_mode();
             // Jitter is enabled for LOW/MEDIUM/HIGH modes
-            if (hm >= HUMANIZATION_LOW) flags |= 0x01;
+            if (hm >= HUMANIZATION_MICRO) flags |= 0x01;
             if (smooth_get_velocity_matching()) flags |= 0x02;
             // Queue depth as 3-bit value (0-7, clamped from 0-32)
             uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
@@ -606,9 +599,8 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             uint32_t mode_color;
             switch (new_mode) {
                 case HUMANIZATION_OFF:    mode_color = COLOR_HUMANIZATION_OFF;    break;
-                case HUMANIZATION_LOW:    mode_color = COLOR_HUMANIZATION_LOW;    break;
-                case HUMANIZATION_MEDIUM: mode_color = COLOR_HUMANIZATION_MEDIUM; break;
-                case HUMANIZATION_HIGH:   mode_color = COLOR_HUMANIZATION_HIGH;   break;
+                case HUMANIZATION_MICRO:  mode_color = COLOR_HUMANIZATION_MICRO;  break;
+                case HUMANIZATION_FULL:   mode_color = COLOR_HUMANIZATION_FULL;   break;
                 default:                  mode_color = COLOR_ERROR;               break;
             }
             neopixel_set_color(mode_color);
@@ -1143,7 +1135,7 @@ void kmbox_send_info_to_bridge(void) {
     // Pack flags byte: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
     humanization_mode_t hm = smooth_get_humanization_mode();
     uint8_t flags = 0;
-    if (hm >= HUMANIZATION_LOW) flags |= 0x01;
+    if (hm >= HUMANIZATION_MICRO) flags |= 0x01;
     if (smooth_get_velocity_matching()) flags |= 0x02;
     uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
     flags |= (q3 & 0x07) << 2;
