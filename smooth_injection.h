@@ -28,7 +28,7 @@
 #define SMOOTH_MAX_PER_FRAME        16
 
 // Movement queue size (number of pending inject operations)
-#define SMOOTH_QUEUE_SIZE           32
+#define SMOOTH_QUEUE_SIZE           64
 
 // Velocity tracking window (in frames, ~8ms each)
 #define SMOOTH_VELOCITY_WINDOW      8

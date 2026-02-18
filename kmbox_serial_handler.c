@@ -393,7 +393,10 @@ extern void process_mouse_report(const hid_mouse_report_t *report);
 extern void process_kbd_report(const hid_keyboard_report_t *report);
 
 static __force_inline bool is_fast_cmd_start(uint8_t byte) {
-    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;  // Exclude line terminators
+    // Exclude 0x0A (\n) and 0x0D (\r) — these overlap with FAST_CMD_TIMED_MOVE
+    // and FAST_CMD_INFO but the text protocol uses them as line terminators.
+    // TODO: Reassign FAST_CMD_TIMED_MOVE to 0x10+ to avoid this conflict.
+    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;
     return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) || byte == FAST_CMD_PING;
 }
 
@@ -1068,17 +1071,40 @@ void kmbox_serial_task(void) {
             rx_consume(1);
             continue;
         }
-        
-        // Not binary - fall through to text processing
+
+        // Not a binary command start — fall through to text processing.
+        // But if the first byte is non-printable (<0x20, excluding \r\n),
+        // it's likely a corrupted/partial binary packet byte.  Skip it
+        // to prevent the text parser from consuming binary data that
+        // happens to contain 0x0A (\n) and destroying framing.
+        if (first < 0x20 && first != '\r' && first != '\n') {
+            rx_consume(1);
+            continue;
+        }
+
         break;
     }
-    
+
     //------------------------------------------------------------------
-    // Text command processing
+    // Text command processing — only runs when the buffer does NOT start
+    // with a binary packet leader.  If the binary loop exited because of
+    // an incomplete fast command (< 8 bytes available), the partial packet
+    // bytes are still in the ring buffer.  Running the text parser on them
+    // would corrupt framing: any binary data byte equaling 0x0A (\n) gets
+    // treated as a line terminator, consuming and destroying the partial
+    // packet.  The remaining bytes arrive within ~27µs at 3 Mbaud, so the
+    // next kmbox_serial_task() call will process the completed packet.
     //------------------------------------------------------------------
+    bool buffer_starts_with_binary = false;
+    if (rx_available() > 0) {
+        uint8_t peek = rx_peek_at(0);
+        buffer_starts_with_binary = is_fast_cmd_start(peek) ||
+                                    peek == BRIDGE_SYNC_BYTE;
+    }
+
     char line[KMBOX_CMD_BUFFER_SIZE];
     size_t len;
-    while (parse_text_line(line, sizeof(line), &len)) {
+    while (!buffer_starts_with_binary && parse_text_line(line, sizeof(line), &len)) {
         if (len > 0) {
             mark_activity(now_ms);
             if (!handle_text_command(line, len, now_ms)) {

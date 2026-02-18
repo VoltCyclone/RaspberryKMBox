@@ -53,16 +53,17 @@ static inject_mode_t g_last_inject_mode = INJECT_MODE_SMOOTH;
 typedef struct active_queue_node {
     uint8_t index;  // Index into g_smooth.queue[]
     struct active_queue_node *next;
+    struct active_queue_node *prev;  // O(1) doubly-linked list unlink
 } active_queue_node_t;
 
 static active_queue_node_t g_active_nodes[SMOOTH_QUEUE_SIZE];
 static active_queue_node_t *g_active_head = NULL;
-static uint32_t g_active_node_bitmap = 0;  // Single uint32_t instead of byte array
+static uint64_t g_active_node_bitmap = 0;  // 64-bit bitmap for 64-entry queue
 
 //--------------------------------------------------------------------+
 // Fast PRNG for Humanization (xorshift32)
 //--------------------------------------------------------------------+
-static uint32_t g_free_bitmap = 0xFFFFFFFF;
+static uint64_t g_free_bitmap = 0xFFFFFFFFFFFFFFFFULL;
 
 static uint32_t g_rng_state = 0;
 
@@ -199,31 +200,35 @@ static smooth_queue_entry_t* queue_alloc(void) {
         g_free_bitmap = 0;
         for (int i = 0; i < SMOOTH_QUEUE_SIZE; i++) {
             if (!g_smooth.queue[i].active) {
-                g_free_bitmap |= (1u << i);
+                g_free_bitmap |= (1ULL << i);
             }
         }
         if (g_free_bitmap == 0) return NULL;
     }
-    
-    // Find first free slot using count trailing zeros (CTZ)
-    int idx = __builtin_ctz(g_free_bitmap);
-    g_free_bitmap &= ~(1u << idx);
+
+    // Find first free slot using count trailing zeros (CTZ) - 64-bit
+    int idx = __builtin_ctzll(g_free_bitmap);
+    g_free_bitmap &= ~(1ULL << idx);
     
     g_smooth.queue_count++;
     
     // Add to active linked list for fast iteration - O(1) using CTZ
-    if (g_active_node_bitmap == 0xFFFFFFFF) {
+    if (g_active_node_bitmap == 0xFFFFFFFFFFFFFFFFULL) {
         // Shouldn't happen since we check queue_count, but handle gracefully
         return &g_smooth.queue[idx];
     }
-    
-    // O(1) node allocation using count trailing zeros
-    int node_idx = __builtin_ctz(~g_active_node_bitmap);
-    g_active_node_bitmap |= (1u << node_idx);
-    
-    // Link node
+
+    // O(1) node allocation using count trailing zeros - 64-bit
+    int node_idx = __builtin_ctzll(~g_active_node_bitmap);
+    g_active_node_bitmap |= (1ULL << node_idx);
+
+    // Link node (doubly-linked for O(1) free)
     g_active_nodes[node_idx].index = idx;
     g_active_nodes[node_idx].next = g_active_head;
+    g_active_nodes[node_idx].prev = NULL;
+    if (g_active_head) {
+        g_active_head->prev = &g_active_nodes[node_idx];
+    }
     g_active_head = &g_active_nodes[node_idx];
     
     // Cache node index in queue entry for O(1) free (Fix #11)
@@ -241,24 +246,26 @@ static void queue_free(smooth_queue_entry_t *entry) {
         // Restore bit in free bitmap for reallocation
         int idx = entry - g_smooth.queue;
         if (idx >= 0 && idx < SMOOTH_QUEUE_SIZE) {
-            g_free_bitmap |= (1u << idx);
-            
-            // O(1) removal from active linked list using cached node_idx (Fix #11)
+            g_free_bitmap |= (1ULL << idx);
+
+            // O(1) removal from active doubly-linked list
             int8_t node_idx = entry->active_node_idx;
             if (node_idx >= 0 && node_idx < SMOOTH_QUEUE_SIZE) {
                 active_queue_node_t *target = &g_active_nodes[node_idx];
-                
-                // Unlink from list: find previous pointer
-                active_queue_node_t **current = &g_active_head;
-                while (*current && *current != target) {
-                    current = &(*current)->next;
+
+                // Direct O(1) unlink via prev/next pointers
+                if (target->prev) {
+                    target->prev->next = target->next;
+                } else {
+                    // target is the head
+                    g_active_head = target->next;
                 }
-                if (*current == target) {
-                    *current = target->next;
+                if (target->next) {
+                    target->next->prev = target->prev;
                 }
-                
+
                 // Mark node as free in bitmap
-                g_active_node_bitmap &= ~(1u << node_idx);
+                g_active_node_bitmap &= ~(1ULL << node_idx);
             }
             entry->active_node_idx = -1;
         }
@@ -273,7 +280,7 @@ void smooth_injection_init(void) {
     memset(&g_smooth, 0, sizeof(g_smooth));
     
     // Reset global state that's outside g_smooth structure
-    g_free_bitmap = 0xFFFFFFFF;  // All slots free
+    g_free_bitmap = 0xFFFFFFFFFFFFFFFFULL;  // All 64 slots free
     g_velocity_sum_x_fp = 0;     // Reset velocity accumulators
     g_velocity_sum_y_fp = 0;
     
@@ -692,8 +699,8 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
     // Safety: if queue_count > 0 but linked list is empty, reset to prevent hang
     if (g_active_head == NULL) {
         g_smooth.queue_count = 0;
-        g_free_bitmap = 0xFFFFFFFF;
-        g_active_node_bitmap = 0;
+        g_free_bitmap = 0xFFFFFFFFFFFFFFFFULL;
+        g_active_node_bitmap = 0ULL;
         goto apply_accumulator;
     }
     
@@ -715,9 +722,13 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
         
         if (entry->frames_left > 0) {
             // Calculate progress using FPU (faster than LUT on M33)
+            // Offset by +1 so the first frame (frames_elapsed=0) produces
+            // non-zero output.  Without this, progress_delta is always 0 on
+            // the first frame, which means no HID report is sent when the
+            // physical mouse is idle — the cursor won't move until frame 2.
             uint8_t frames_elapsed = entry->total_frames - entry->frames_left;
-            float progress_flt = (float)frames_elapsed / (float)entry->total_frames;
-            float prev_progress = (frames_elapsed > 0) ? (float)(frames_elapsed - 1) / (float)entry->total_frames : 0.0f;
+            float progress_flt = (float)(frames_elapsed + 1) / (float)(entry->total_frames + 1);
+            float prev_progress = (float)frames_elapsed / (float)(entry->total_frames + 1);
             
             // Apply easing curve using FPU (3 cycles for multiply on M33)
             float eased_progress = apply_easing_fpu(progress_flt, entry->easing);
@@ -790,9 +801,9 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
             g_smooth.queue[i].active = false;
         }
         g_smooth.queue_count = 0;
-        g_free_bitmap = 0xFFFFFFFF;
+        g_free_bitmap = 0xFFFFFFFFFFFFFFFFULL;
         g_active_head = NULL;
-        g_active_node_bitmap = 0;
+        g_active_node_bitmap = 0ULL;
         frame_x_fp = 0;
         frame_y_fp = 0;
     }
@@ -873,7 +884,7 @@ void smooth_clear_queue(void) {
     g_smooth.queue_count = 0;
     g_smooth.x_accumulator_fp = 0;
     g_smooth.y_accumulator_fp = 0;
-    g_free_bitmap = 0xFFFFFFFF;
+    g_free_bitmap = 0xFFFFFFFFFFFFFFFFULL;
     // Reset active linked list to prevent stale pointer traversal
     g_active_head = NULL;
     g_active_node_bitmap = 0;
@@ -954,7 +965,9 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(8, 14));
             g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 50;  // ±2%
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(3);        // ±3px
+            g_smooth.humanization.accum_clamp_fp = int_to_fp(16);       // ±16px — matches max_per_frame,
+                                                                        // lets accumulator drain naturally
+                                                                        // when queue overflow dumps to accum
             g_smooth.humanization.onset_jitter_min = 1;                 // 1-4 frames
             g_smooth.humanization.onset_jitter_max = 4;
             break;

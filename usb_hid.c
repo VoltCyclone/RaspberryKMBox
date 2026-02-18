@@ -1592,11 +1592,17 @@ void hid_device_task(void)
     }
     start_us = current_us;
 
-    // Remote wakeup handling
-    if (tud_suspended() && !gpio_get(PIN_BUTTON))
+    // Remote wakeup handling — wake on button press OR pending injection data.
+    // Without this, USB suspend blocks all smooth injection output until the
+    // physical mouse moves (which prevents suspend in the first place).
+    if (tud_suspended())
     {
-        // Wake up host if we are in suspend mode and button is pressed
-        tud_remote_wakeup();
+        bool has_data = !gpio_get(PIN_BUTTON) ||
+                        smooth_has_pending() ||
+                        kmbox_has_pending_movement();
+        if (has_data) {
+            tud_remote_wakeup();
+        }
         return;
     }
 

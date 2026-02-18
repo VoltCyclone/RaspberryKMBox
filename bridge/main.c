@@ -66,6 +66,27 @@ volatile bool api_cycle_requested = false;
 static char ferrum_line[256];
 static uint8_t ferrum_idx = 0;
 
+// ============================================================================
+// Movement Coalescer — accumulates rapid moves, flushes at controlled rate
+//
+// Solves queue overflow under HUMANIZATION_FULL: each smooth_move expands
+// into 4-7 queue entries, but at >200 moves/sec the 64-entry queue can't
+// keep up. Coalescing sums rapid deltas and sends one FAST_CMD_SMOOTH_MOVE
+// per COALESCE_INTERVAL_US, capping the KMBox-side queue rate at ~250Hz.
+//
+// Properties:
+//   - Zero data loss (mouse deltas are purely additive)
+//   - Max added latency: 4ms (matches HID frame rate)
+//   - First move after idle gap: immediate (no added latency)
+//   - Non-move commands (buttons, wheel, clicks, keys): sent immediately
+// ============================================================================
+
+static int32_t move_accum_x = 0, move_accum_y = 0;
+static uint32_t last_move_flush_us = 0;
+static bool move_pending = false;
+#define COALESCE_INTERVAL_US  4000   // 4ms = 250Hz max send rate
+#define COALESCE_IDLE_US      20000  // 20ms = send immediately after idle gap
+
 // Button config already in config.h (MODE_BUTTON_PIN)
 #define BUTTON_DEBOUNCE_MS 50
 #define BUTTON_LONG_PRESS_MS 2000
@@ -743,20 +764,73 @@ static void uart_debug_task(void) {
 // Mouse Command Protocol - Send to KMBox (Binary Fast Commands)
 // ============================================================================
 
-// Send a binary mouse move command to KMBox (direct accumulator + output-stage humanization)
-static void send_smooth_mouse_move(int16_t dx, int16_t dy) {
+// Coalesce a move delta into the accumulator, flushing immediately if idle
+static void coalesce_move(int16_t x, int16_t y) {
+    uint32_t now = time_us_32();
+    move_accum_x += x;
+    move_accum_y += y;
+
+    if (!move_pending) {
+        // First move — check if we've been idle long enough to send immediately
+        uint32_t elapsed = now - last_move_flush_us;
+        if (elapsed >= COALESCE_IDLE_US) {
+            // Idle gap: flush immediately for zero-latency first move
+            uint8_t pkt[FAST_CMD_PACKET_SIZE];
+            fast_build_smooth_move(pkt, (int16_t)move_accum_x, (int16_t)move_accum_y,
+                                   INJECT_MODE_SMOOTH);
+            if (send_uart_packet(pkt, FAST_CMD_PACKET_SIZE)) {
+                tft_mouse_activity_count++;
+                injection_count++;
+                move_accum_x = 0;
+                move_accum_y = 0;
+                last_move_flush_us = now;
+                // move_pending stays false — data was sent
+                return;
+            }
+            // Send failed (DMA busy) — fall through to set move_pending
+            // so coalesce_flush_task retries on next main loop iteration
+        }
+    }
+    move_pending = true;
+}
+
+// Periodic flush of coalesced moves — call from main loop
+static void coalesce_flush_task(void) {
+    if (!move_pending) return;
+
+    uint32_t now = time_us_32();
+    uint32_t elapsed = now - last_move_flush_us;
+    if (elapsed < COALESCE_INTERVAL_US) return;
+
+    // Flush accumulated movement as a single FAST_CMD_SMOOTH_MOVE (0x07)
     uint8_t pkt[FAST_CMD_PACKET_SIZE];
-    size_t len = fast_build_mouse_move(pkt, dx, dy, 0, 0);
-    
+    fast_build_smooth_move(pkt, (int16_t)move_accum_x, (int16_t)move_accum_y,
+                           INJECT_MODE_SMOOTH);
+    if (!send_uart_packet(pkt, FAST_CMD_PACKET_SIZE)) {
+        // DMA busy — don't reset accumulators, retry next iteration.
+        // Update timestamp so we don't busy-spin; retry after 1ms.
+        last_move_flush_us = now - COALESCE_INTERVAL_US + 1000;
+        return;
+    }
+    tft_mouse_activity_count++;
+    injection_count++;
+
+    move_accum_x = 0;
+    move_accum_y = 0;
+    last_move_flush_us = now;
+    move_pending = false;
+}
+
+// Send a binary mouse move command to KMBox (via coalescer for smooth humanization)
+static void send_smooth_mouse_move(int16_t dx, int16_t dy) {
     // Non-blocking LED pulse using timestamp comparison
     static uint32_t led_off_time = 0;
     gpio_put(LED_PIN, 1);
     led_off_time = time_us_32() + 50;  // Schedule LED off
-    
-    send_uart_packet(pkt, len);
-    tft_mouse_activity_count++;  // Track mouse commands for TFT display
-    injection_count++;  // Track successful injections
-    
+
+    // Route through coalescer → FAST_CMD_SMOOTH_MOVE (0x07)
+    coalesce_move(dx, dy);
+
     // Non-blocking LED off (check in next iteration or turn off now if time passed)
     if (time_us_32() >= led_off_time) {
         gpio_put(LED_PIN, 0);
@@ -825,13 +899,10 @@ static makcu_state_t makcu_state = MAKCU_STATE_IDLE;
 
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
-    // km.move(x,y) - relative mouse movement (convert to binary for efficiency)
+    // km.move(x,y) - relative mouse movement (route through coalescer for humanization)
     int x, y;
     if (kmbox_parse_move_command(cmd, &x, &y)) {
-        // Send as binary packet for efficiency
-        uint8_t pkt[8] = {0x01, (uint8_t)(x & 0xFF), (uint8_t)((x >> 8) & 0xFF),
-                          (uint8_t)(y & 0xFF), (uint8_t)((y >> 8) & 0xFF), 0, 0, 0};
-        send_uart_packet(pkt, 8);
+        coalesce_move((int16_t)x, (int16_t)y);
         return;
     }
     
@@ -1074,7 +1145,19 @@ static void cdc_task(void) {
                 ferrum_translated_t translated;
                 if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
                     if (translated.length > 0) {
-                        send_uart_packet(translated.buffer, translated.length);
+                        // Intercept move packets (0x01 with non-zero x/y) → coalescer
+                        if (translated.buffer[0] == FAST_CMD_MOUSE_MOVE) {
+                            int16_t mx = (int16_t)(translated.buffer[1] | (translated.buffer[2] << 8));
+                            int16_t my = (int16_t)(translated.buffer[3] | (translated.buffer[4] << 8));
+                            if (mx != 0 || my != 0) {
+                                coalesce_move(mx, my);
+                            } else {
+                                // Button-only or wheel-only: send immediately
+                                send_uart_packet(translated.buffer, translated.length);
+                            }
+                        } else {
+                            send_uart_packet(translated.buffer, translated.length);
+                        }
                     }
                     // Send Ferrum response (buffered)
                     if (translated.needs_response && tud_cdc_connected()) {
@@ -1398,6 +1481,7 @@ int main(void) {
         tud_task();
         cdc_task();
         uart_rx_task();
+        coalesce_flush_task();
         
         kmbox_connection_task();
         button_task();
@@ -1459,8 +1543,19 @@ int main(void) {
         while (core1_has_kmbox_commands()) {
             if (core1_dequeue_kmbox_command(translated_packet)) {
                 // Core1 translator outputs 8-byte fast command packets
-                // Send directly to KMBox (no conversion needed)
-                send_uart_packet(translated_packet, 8);
+                // Intercept 0x01 move packets → coalescer for humanization
+                if (translated_packet[0] == FAST_CMD_MOUSE_MOVE) {
+                    int16_t mx = (int16_t)(translated_packet[1] | (translated_packet[2] << 8));
+                    int16_t my = (int16_t)(translated_packet[3] | (translated_packet[4] << 8));
+                    if (mx != 0 || my != 0) {
+                        coalesce_move(mx, my);
+                    } else {
+                        // Button-only or wheel-only: send immediately
+                        send_uart_packet(translated_packet, 8);
+                    }
+                } else {
+                    send_uart_packet(translated_packet, 8);
+                }
             }
         }
         
