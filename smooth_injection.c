@@ -123,12 +123,13 @@ static __force_inline int32_t int_to_fp(int16_t val) {
 }
 
 static __force_inline int16_t fp_to_int(int32_t fp_val) {
-    // Round to nearest integer
-    if (fp_val >= 0) {
-        return (int16_t)((fp_val + SMOOTH_FP_HALF) >> SMOOTH_FP_SHIFT);
-    } else {
-        return (int16_t)((fp_val - SMOOTH_FP_HALF) >> SMOOTH_FP_SHIFT);
-    }
+    // Round to nearest integer (ties toward +inf).
+    // Using a single formula for both positive and negative values prevents
+    // an accumulator oscillation bug: the old negative path (fp_val - HALF)
+    // rounded values in (-0.5, 0) to -1, so a residual like 0.6px would
+    // output +1, leave -0.4px, which rounded to -1, leaving +0.6px → repeat
+    // forever, causing an infinite ±1 wiggle at 1kHz after injection stops.
+    return (int16_t)((fp_val + SMOOTH_FP_HALF) >> SMOOTH_FP_SHIFT);
 }
 
 static __force_inline int8_t clamp_i8(int32_t val) {
