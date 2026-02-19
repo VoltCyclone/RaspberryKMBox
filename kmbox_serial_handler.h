@@ -77,6 +77,9 @@ void kmbox_send_ping_to_bridge(void);
 // Send info packet to bridge (humanization settings, temperature, etc.)
 void kmbox_send_info_to_bridge(void);
 
+// Send Xbox console mode status to bridge (gamepad state summary)
+void kmbox_send_xbox_status_to_bridge(void);
+
 // Get TX buffer stats (for debugging/monitoring)
 uint32_t kmbox_get_tx_dropped_bytes(void);
 

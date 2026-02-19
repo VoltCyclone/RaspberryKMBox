@@ -26,6 +26,9 @@
 #include "kmbox_serial_handler.h"
 #include "smooth_injection.h"
 #include "peri_clock.h"
+#include "xbox_gip.h"
+#include "xbox_device.h"
+#include "xbox_host.h"
 
 #if PIO_USB_AVAILABLE
 #include "pio_usb.h"
@@ -161,7 +164,12 @@ static void core1_task_loop(void) {
         // when Core0 calls flash_safe_execute(), so no manual polling needed.
         
         tuh_task();
-        
+
+        // Xbox host task: forward console commands to controller, keepalive
+        if (g_xbox_mode) {
+            xbox_host_task();
+        }
+
         // Heartbeat check optimization - much less frequent timing calls
         if (++heartbeat_counter >= heartbeat_check_threshold) {
             const uint32_t current_time = to_ms_since_boot(get_absolute_time());
@@ -378,7 +386,17 @@ static void main_application_loop(void) {
         kmbox_serial_task();
         
         // HID device task - processes physical mouse/keyboard and sends combined reports
-        hid_device_task();
+        // Xbox mode: run Xbox device task instead of HID device task
+        if (g_xbox_mode) {
+            xbox_device_task();
+        } else {
+            // Check if Xbox controller was just unplugged — re-enumerate
+            // so the console/PC sees updated descriptors (HID instead of Xbox)
+            if (xbox_host_check_and_clear_reenum()) {
+                force_usb_reenumeration();
+            }
+            hid_device_task();
+        }
         
         // Sample time less frequently to reduce overhead
         if (++loop_counter >= MAIN_LOOP_TIME_SAMPLE_INTERVAL) {
@@ -431,6 +449,10 @@ static void main_application_loop(void) {
         
         if (task_flags & STATUS_FLAG) {
             report_watchdog_status(current_time, &state->watchdog_status_timer);
+            // Send Xbox console mode status to bridge for TFT display
+            if (g_xbox_mode) {
+                kmbox_send_xbox_status_to_bridge();
+            }
         }
     }
 }

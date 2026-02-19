@@ -41,6 +41,12 @@
 #define WIRE_CLICK       0x10  // [cmd][button_num][count]              = 3 bytes
 #define WIRE_BIN_INFO    0x11  // [cmd][hm][im][mpf][qc][tlo][thi][fl] = 8 bytes
 #define WIRE_BIN_EXT     0x12  // [cmd][qc][cap][hm][tlo][thi][olo][ohi] = 8 bytes
+// Xbox gamepad injection commands
+#define WIRE_XBOX_INPUT  0x20  // [cmd][btn_lo][btn_hi][tl_lo][tl_hi][tr_lo][tr_hi][pad] = 8 bytes
+#define WIRE_XBOX_STICKL 0x22  // [cmd][xl][xh][yl][yh][pad][pad][pad]                  = 8 bytes
+#define WIRE_XBOX_STICKR 0x23  // [cmd][xl][xh][yl][yh][pad][pad][pad]                  = 8 bytes
+#define WIRE_XBOX_RELEASE 0x27 // [cmd][pad*7]                                           = 8 bytes
+#define WIRE_XBOX_STATUS 0x28  // [cmd][mode][auth][btns_lo][btns_hi][stk_lx_lo][stk_lx_hi][trigs] = 8 bytes
 #define WIRE_PING        0xFE  // [cmd]                                 = 1 byte
 #define WIRE_RESPONSE    0xFF  // [cmd][status][d0][d1][d2][d3]         = 6 bytes
 
@@ -94,7 +100,13 @@ static const uint8_t wire_cmd_len[256] = {
     [WIRE_CLICK]      = 3,
     [WIRE_BIN_INFO]   = 8,
     [WIRE_BIN_EXT]    = 8,
-    // 0x13-0xFD = 0 (invalid)
+    // Xbox gamepad commands
+    [WIRE_XBOX_INPUT]  = 8,
+    [WIRE_XBOX_STICKL] = 8,
+    [WIRE_XBOX_STICKR] = 8,
+    [WIRE_XBOX_RELEASE] = 8,
+    [WIRE_XBOX_STATUS] = 8,
+    // 0x29-0xFD = 0 (invalid)
     [WIRE_PING]       = 1,
     [WIRE_RESPONSE]   = 6,
 };
@@ -236,6 +248,68 @@ static inline size_t wire_build_click(uint8_t *buf, uint8_t button, uint8_t coun
     buf[1] = button;
     buf[2] = count;
     return 3;
+}
+
+// Xbox gamepad input (buttons + triggers)
+static inline size_t wire_build_xbox_input(uint8_t *buf, uint16_t buttons,
+                                            uint16_t trig_l, uint16_t trig_r) {
+    buf[0] = WIRE_XBOX_INPUT;
+    buf[1] = (uint8_t)(buttons & 0xFF);
+    buf[2] = (uint8_t)((buttons >> 8) & 0xFF);
+    buf[3] = (uint8_t)(trig_l & 0xFF);
+    buf[4] = (uint8_t)((trig_l >> 8) & 0xFF);
+    buf[5] = (uint8_t)(trig_r & 0xFF);
+    buf[6] = (uint8_t)((trig_r >> 8) & 0xFF);
+    buf[7] = 0;
+    return 8;
+}
+
+// Xbox left stick
+static inline size_t wire_build_xbox_stickl(uint8_t *buf, int16_t x, int16_t y) {
+    buf[0] = WIRE_XBOX_STICKL;
+    buf[1] = (uint8_t)(x & 0xFF);
+    buf[2] = (uint8_t)((x >> 8) & 0xFF);
+    buf[3] = (uint8_t)(y & 0xFF);
+    buf[4] = (uint8_t)((y >> 8) & 0xFF);
+    buf[5] = 0; buf[6] = 0; buf[7] = 0;
+    return 8;
+}
+
+// Xbox right stick
+static inline size_t wire_build_xbox_stickr(uint8_t *buf, int16_t x, int16_t y) {
+    buf[0] = WIRE_XBOX_STICKR;
+    buf[1] = (uint8_t)(x & 0xFF);
+    buf[2] = (uint8_t)((x >> 8) & 0xFF);
+    buf[3] = (uint8_t)(y & 0xFF);
+    buf[4] = (uint8_t)((y >> 8) & 0xFF);
+    buf[5] = 0; buf[6] = 0; buf[7] = 0;
+    return 8;
+}
+
+// Xbox release all injection
+static inline size_t wire_build_xbox_release(uint8_t *buf) {
+    buf[0] = WIRE_XBOX_RELEASE;
+    buf[1] = 0; buf[2] = 0; buf[3] = 0;
+    buf[4] = 0; buf[5] = 0; buf[6] = 0; buf[7] = 0;
+    return 8;
+}
+
+// Xbox status report (KMBox -> Bridge)
+// [cmd][mode][auth][btns_lo][btns_hi][stk_lx_hi][stk_ly_hi][trigs]
+static inline size_t wire_build_xbox_status(uint8_t *buf, uint8_t console_mode,
+                                             uint8_t auth_complete,
+                                             uint16_t buttons,
+                                             int16_t stick_lx, int16_t stick_ly,
+                                             uint8_t trig_summary) {
+    buf[0] = WIRE_XBOX_STATUS;
+    buf[1] = console_mode;
+    buf[2] = auth_complete;
+    buf[3] = (uint8_t)(buttons & 0xFF);
+    buf[4] = (uint8_t)((buttons >> 8) & 0xFF);
+    buf[5] = (uint8_t)((stick_lx >> 8) & 0xFF);  // High byte only (summary)
+    buf[6] = (uint8_t)((stick_ly >> 8) & 0xFF);
+    buf[7] = trig_summary;
+    return 8;
 }
 
 // Keepalive ping

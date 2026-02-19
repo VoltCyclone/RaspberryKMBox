@@ -596,6 +596,66 @@ static void draw_row_lr(int y, const char *label, uint8_t lbl_col,
     tft_draw_string(rx, y, val_col, value);
 }
 
+// ============================================================================
+// Console Mode View (Xbox Passthrough)
+// ============================================================================
+
+static void draw_console_view(const tft_stats_t *stats) {
+    int y = MARGIN;
+
+    // Header in Xbox green
+    tft_draw_string_center(TFT_WIDTH / 2, y, COL_GREEN, "CONSOLE MODE");
+    y += LINE_H + SEP_GAP;
+    hline(y, COL_DIM_LINE);
+    y += SEP_GAP + 2;
+
+    // Auth status
+    tft_draw_string(MARGIN, y, COL_GRAY, "Auth:");
+    tft_draw_string(MARGIN + 6 * FONT_W, y,
+                    stats->console_auth_complete ? COL_GREEN : COL_YELLOW,
+                    stats->console_auth_complete ? "OK" : "...");
+    y += LINE_H;
+
+    // Buttons (hex display)
+    tft_draw_string(MARGIN, y, COL_GRAY, "Btn:");
+    char btn_buf[8];
+    btn_buf[0] = '0'; btn_buf[1] = 'x';
+    // Simple hex format for 16-bit value
+    static const char hex_chars[] = "0123456789ABCDEF";
+    btn_buf[2] = hex_chars[(stats->gamepad_buttons >> 12) & 0xF];
+    btn_buf[3] = hex_chars[(stats->gamepad_buttons >> 8) & 0xF];
+    btn_buf[4] = hex_chars[(stats->gamepad_buttons >> 4) & 0xF];
+    btn_buf[5] = hex_chars[stats->gamepad_buttons & 0xF];
+    btn_buf[6] = '\0';
+    tft_draw_string(MARGIN + 5 * FONT_W, y, COL_WHITE, btn_buf);
+    y += LINE_H;
+
+    // Left stick
+    tft_draw_string(MARGIN, y, COL_GRAY, "LS:");
+    char stick_buf[16];
+    snprintf(stick_buf, sizeof(stick_buf), "%6d %6d",
+             stats->gamepad_sticks[0], stats->gamepad_sticks[1]);
+    tft_draw_string(MARGIN + 4 * FONT_W, y, COL_CYAN, stick_buf);
+    y += LINE_H;
+
+    // Right stick
+    tft_draw_string(MARGIN, y, COL_GRAY, "RS:");
+    snprintf(stick_buf, sizeof(stick_buf), "%6d %6d",
+             stats->gamepad_sticks[2], stats->gamepad_sticks[3]);
+    tft_draw_string(MARGIN + 4 * FONT_W, y, COL_CYAN, stick_buf);
+    y += LINE_H;
+
+    // Triggers
+    tft_draw_string(MARGIN, y, COL_GRAY, "LT:");
+    char trig_buf[8];
+    snprintf(trig_buf, sizeof(trig_buf), "%4u", stats->gamepad_triggers[0]);
+    tft_draw_string(MARGIN + 4 * FONT_W, y, COL_WHITE, trig_buf);
+    tft_draw_string(MARGIN + 9 * FONT_W, y, COL_GRAY, "RT:");
+    snprintf(trig_buf, sizeof(trig_buf), "%4u", stats->gamepad_triggers[1]);
+    tft_draw_string(MARGIN + 13 * FONT_W, y, COL_WHITE, trig_buf);
+    y += LINE_H;
+}
+
 static void draw_stats(const tft_stats_t *stats) {
     int y = MARGIN;
     
@@ -1312,14 +1372,16 @@ static bool tft_render_timer_callback(repeating_timer_t *rt) {
     tft_fill(COL_BG);
     format_stats(&local_stats);
     
-    if (current_view == TFT_VIEW_MENU) {
+    if (local_stats.console_mode) {
+        draw_console_view(&local_stats);
+    } else if (current_view == TFT_VIEW_MENU) {
         draw_menu_view(&local_stats);
     } else if (current_view == TFT_VIEW_GAUGES) {
         draw_gauge_view(&local_stats);
     } else {
         draw_stats(&local_stats);
     }
-    
+
     // Track activity for next frame
     last_tx_bytes = local_stats.tx_bytes;
     last_rx_bytes = local_stats.rx_bytes;
@@ -1365,7 +1427,9 @@ void tft_display_refresh(const tft_stats_t *stats) {
     tft_fill(COL_BG);
     format_stats(stats);
     
-    if (current_view == TFT_VIEW_MENU) {
+    if (stats->console_mode) {
+        draw_console_view(stats);
+    } else if (current_view == TFT_VIEW_MENU) {
         draw_menu_view(stats);
     } else if (current_view == TFT_VIEW_GAUGES) {
         draw_gauge_view(stats);

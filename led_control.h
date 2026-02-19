@@ -39,7 +39,11 @@ typedef enum {
     STATUS_BRIDGE_CONNECTING,
     STATUS_BRIDGE_CONNECTED,
     STATUS_BRIDGE_ACTIVE,
-    STATUS_BRIDGE_DISCONNECTED
+    STATUS_BRIDGE_DISCONNECTED,
+    // Console Mode (Xbox Passthrough)
+    STATUS_CONSOLE_MODE,
+    STATUS_CONSOLE_AUTH,
+    STATUS_CONSOLE_READY
 } system_status_t;
 
 // Bridge Connection state (for serial handler)

@@ -195,7 +195,11 @@ static const status_config_t g_status_configs[] = {
     [STATUS_BRIDGE_CONNECTING]    = {COLOR_BRIDGE_CONNECTING,    false, "BRIDGE_CONNECTING"},
     [STATUS_BRIDGE_CONNECTED]     = {COLOR_BRIDGE_CONNECTED,     false, "BRIDGE_CONNECTED"},
     [STATUS_BRIDGE_ACTIVE]        = {COLOR_BRIDGE_ACTIVE,        false, "BRIDGE_ACTIVE"},
-    [STATUS_BRIDGE_DISCONNECTED]  = {COLOR_BRIDGE_DISCONNECTED,  true,  "BRIDGE_DISCONNECTED"}
+    [STATUS_BRIDGE_DISCONNECTED]  = {COLOR_BRIDGE_DISCONNECTED,  true,  "BRIDGE_DISCONNECTED"},
+    // Console mode (Xbox passthrough)
+    [STATUS_CONSOLE_MODE]         = {COLOR_CONSOLE_MODE,         false, "CONSOLE_MODE"},
+    [STATUS_CONSOLE_AUTH]         = {COLOR_CONSOLE_AUTH,          true,  "CONSOLE_AUTH"},
+    [STATUS_CONSOLE_READY]        = {COLOR_CONSOLE_READY,        false, "CONSOLE_READY"}
 };
 
 //--------------------------------------------------------------------+

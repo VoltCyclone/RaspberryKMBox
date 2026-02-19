@@ -73,6 +73,8 @@ add_executable(PIOKMbox
     smooth_injection.c
     humanization_fpu.c
     dcp_helpers.S
+    xbox_host.c
+    xbox_device.c
 )
 
 # generate the header file into the source tree as it is included in the RP2040 datasheet
@@ -149,6 +151,7 @@ target_compile_definitions(PIOKMbox PRIVATE
         PIN_LED=${LED_PIN}
         PIN_NEOPIXEL=${NEOPIXEL_PIN}
         NEOPIXEL_POWER=${NEOPIXEL_POWER_PIN}
+        ENABLE_XBOX_PASSTHROUGH=1
 )
 
 # Link PIO USB library

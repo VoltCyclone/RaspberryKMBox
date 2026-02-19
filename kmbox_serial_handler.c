@@ -10,6 +10,9 @@
 #include "usb_hid.h"
 #include "led_control.h"
 #include "smooth_injection.h"
+#include "xbox_gip.h"
+#include "xbox_device.h"
+#include "xbox_host.h"
 #include "uart_buffers.h"
 #include "dcp_helpers.h"
 #include "pico/stdlib.h"
@@ -397,7 +400,9 @@ static __force_inline bool is_fast_cmd_start(uint8_t byte) {
     // and FAST_CMD_INFO but the text protocol uses them as line terminators.
     // TODO: Reassign FAST_CMD_TIMED_MOVE to 0x10+ to avoid this conflict.
     if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;
-    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) || byte == FAST_CMD_PING;
+    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) ||
+           (byte >= FAST_CMD_XBOX_INPUT && byte <= FAST_CMD_XBOX_STATUS) ||
+           byte == FAST_CMD_PING;
 }
 
 static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
@@ -615,6 +620,42 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             return true;
         }
         
+        // Xbox gamepad injection commands
+        case FAST_CMD_XBOX_INPUT: {
+            // [0x20][btn_lo][btn_hi][trig_l_lo][trig_l_hi][trig_r_lo][trig_r_hi][pad]
+            uint16_t buttons = (uint16_t)(pkt[1] | (pkt[2] << 8));
+            uint16_t trig_l  = (uint16_t)(pkt[3] | (pkt[4] << 8));
+            uint16_t trig_r  = (uint16_t)(pkt[5] | (pkt[6] << 8));
+            xbox_inject_buttons(buttons, trig_l, trig_r);
+            fast_cmd_count++;
+            return true;
+        }
+
+        case FAST_CMD_XBOX_STICK_L: {
+            // [0x22][x_lo][x_hi][y_lo][y_hi][pad][pad][pad]
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            xbox_inject_stick_left(x, y);
+            fast_cmd_count++;
+            return true;
+        }
+
+        case FAST_CMD_XBOX_STICK_R: {
+            // [0x23][x_lo][x_hi][y_lo][y_hi][pad][pad][pad]
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            xbox_inject_stick_right(x, y);
+            fast_cmd_count++;
+            return true;
+        }
+
+        case FAST_CMD_XBOX_RELEASE: {
+            // [0x27][pad*7] - clear all injection overrides
+            xbox_inject_clear();
+            fast_cmd_count++;
+            return true;
+        }
+
         default:
             fast_cmd_errors++;
             return false;
@@ -1177,4 +1218,35 @@ void kmbox_send_info_to_bridge(void) {
         flags
     };
     uart_send_bytes(info_pkt, 8);
+}
+
+void kmbox_send_xbox_status_to_bridge(void) {
+    if (!g_xbox_mode) return;
+
+    xbox_gamepad_state_t *gs = xbox_host_get_gamepad();
+    uint32_t save = spin_lock_blocking(gs->lock);
+    uint16_t buttons = gs->physical.buttons;
+    int16_t  lx = gs->physical.stick_lx;
+    int16_t  ly = gs->physical.stick_ly;
+    uint16_t tl = gs->physical.trigger_left;
+    uint16_t tr = gs->physical.trigger_right;
+    spin_unlock(gs->lock, save);
+
+    // Pack triggers into a single summary byte: high 4 bits = left, low 4 = right
+    // Each scaled from 0-1023 down to 0-15
+    uint8_t trig_summary = (uint8_t)(((tl >> 6) & 0x0F) << 4) | ((tr >> 6) & 0x0F);
+
+    uint8_t auth_complete = (xbox_host_get_auth_state() == XBOX_AUTH_COMPLETE) ? 1 : 0;
+
+    uint8_t status_pkt[8] = {
+        FAST_CMD_XBOX_STATUS,
+        1,                                      // console_mode = true
+        auth_complete,
+        (uint8_t)(buttons & 0xFF),
+        (uint8_t)((buttons >> 8) & 0xFF),
+        (uint8_t)((lx >> 8) & 0xFF),           // stick LX high byte
+        (uint8_t)((ly >> 8) & 0xFF),           // stick LY high byte
+        trig_summary
+    };
+    uart_send_bytes(status_pkt, 8);
 }

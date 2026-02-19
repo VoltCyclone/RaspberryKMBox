@@ -88,6 +88,13 @@ typedef struct {
     // Temperatures (Celsius, use <-50 or >150 to indicate invalid)
     float bridge_temperature_c;
     float kmbox_temperature_c;
+
+    // Console mode (Xbox passthrough)
+    bool console_mode;
+    bool console_auth_complete;
+    uint16_t gamepad_buttons;
+    int16_t gamepad_sticks[4];     // LX, LY, RX, RY
+    uint16_t gamepad_triggers[2];  // Left, Right
 } tft_stats_t;
 
 // ============================================================================

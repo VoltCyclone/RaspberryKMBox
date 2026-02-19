@@ -116,6 +116,11 @@
 #define FAST_CMD_INFO           0x0D    // Request system info
 #define FAST_CMD_INFO_EXT       0x0E    // Request extended stats
 #define FAST_CMD_CYCLE_HUMAN    0x0F    // Cycle humanization mode
+#define FAST_CMD_XBOX_INPUT     0x20    // Xbox gamepad: buttons + triggers
+#define FAST_CMD_XBOX_STICK_L   0x22    // Xbox left stick X/Y
+#define FAST_CMD_XBOX_STICK_R   0x23    // Xbox right stick X/Y
+#define FAST_CMD_XBOX_RELEASE   0x27    // Xbox clear all injection overrides
+#define FAST_CMD_XBOX_STATUS    0x28    // Xbox console mode status report
 #define FAST_CMD_SYNC           0xFC    // Clock synchronization
 #define FAST_CMD_RESPONSE       0xFD    // Generic response
 #define FAST_CMD_PING           0xFE    // Keepalive ping
@@ -385,6 +390,11 @@ typedef struct __attribute__((packed)) {
 #define COLOR_USB_RESET_PENDING         0xFF6600  // Orange-red for USB reset pending
 #define COLOR_USB_RESET_SUCCESS         0x00FF00  // Green flash for successful reset
 #define COLOR_USB_RESET_FAILED          0xFF0000  // Red flash for failed reset
+
+// Console mode (Xbox passthrough) colors
+#define COLOR_CONSOLE_MODE              0x107C10  // Xbox green
+#define COLOR_CONSOLE_AUTH              0xFF8000  // Orange (auth in progress)
+#define COLOR_CONSOLE_READY             0x00FF00  // Green (auth complete, ready)
 
 // Activity colors
 #define COLOR_ACTIVITY_FLASH            0xFFFFFF  // White flash for activity

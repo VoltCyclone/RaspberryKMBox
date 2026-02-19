@@ -177,6 +177,13 @@ static uint8_t kmbox_queue_depth = 0;
 static uint8_t kmbox_queue_capacity = 32;
 static uint16_t kmbox_total_injected = 0;
 static uint16_t kmbox_queue_overflows = 0;
+
+// Console mode (Xbox passthrough) state from KMBox
+static bool kmbox_console_mode = false;
+static bool kmbox_console_auth_complete = false;
+static uint16_t kmbox_gamepad_buttons = 0;
+static int16_t kmbox_gamepad_sticks[4] = {0};
+static uint16_t kmbox_gamepad_triggers[2] = {0};
 static bool kmbox_humanization_valid = false;
 static uint32_t last_humanization_request_ms = 0;
 #define HUMANIZATION_REQUEST_INTERVAL_MS 2000  // Request humanization info every 2 seconds (was 3s)
@@ -554,10 +561,17 @@ static void uart_rx_task(void) {
                     }
                     kmbox_total_injected = (uint16_t)(binary_packet[4] | (binary_packet[5] << 8));
                     kmbox_queue_overflows = (uint16_t)(binary_packet[6] | (binary_packet[7] << 8));
-                    
+
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
                     }
+                } else if (binary_packet[0] == 0x28) {
+                    // Xbox console status: [0x28][mode][auth][btns_lo][btns_hi][stk_lx_lo][stk_lx_hi][trigs]
+                    kmbox_console_mode = (binary_packet[1] != 0);
+                    kmbox_console_auth_complete = (binary_packet[2] != 0);
+                    kmbox_gamepad_buttons = (uint16_t)(binary_packet[3] | (binary_packet[4] << 8));
+                    kmbox_gamepad_sticks[0] = (int16_t)(binary_packet[5] | (binary_packet[6] << 8));
+                    // Remaining stick/trigger data comes from extended packets
                 }
                 in_binary_packet = false;
                 binary_idx = 0;
@@ -1413,7 +1427,14 @@ static void tft_submit_stats_task(void) {
     }
     stats.bridge_temperature_c = cached_temp;
     stats.kmbox_temperature_c = kmbox_temperature_c;
-    
+
+    // Console mode (Xbox passthrough)
+    stats.console_mode = kmbox_console_mode;
+    stats.console_auth_complete = kmbox_console_auth_complete;
+    stats.gamepad_buttons = kmbox_gamepad_buttons;
+    memcpy(stats.gamepad_sticks, kmbox_gamepad_sticks, sizeof(stats.gamepad_sticks));
+    memcpy(stats.gamepad_triggers, kmbox_gamepad_triggers, sizeof(stats.gamepad_triggers));
+
     // Hand stats to display module (just a memcpy — timer ISR renders later)
     tft_display_submit_stats(&stats);
 }
