@@ -34,14 +34,12 @@
 #include "hw_uart.h"
 #include "latency_tracker.h"
 #include "tft_display.h"
-#include "bridge_protocol.h"
 #include "makcu_protocol.h"
 #include "makcu_translator.h"
 #include "ferrum_protocol.h"
 #include "ferrum_translator.h"
 #include "fast_commands.h"
 #include "core1_translator.h"
-#include "neopixel_dma.h"
 #include "../lib/kmbox-commands/kmbox_commands.h"
 
 // Hardware UART is now used instead of PIO UART
@@ -67,6 +65,27 @@ volatile bool api_cycle_requested = false;
 // Ferrum line buffer (file scope for mode change reset)
 static char ferrum_line[256];
 static uint8_t ferrum_idx = 0;
+
+// ============================================================================
+// Movement Coalescer — accumulates rapid moves, flushes at controlled rate
+//
+// Solves queue overflow under HUMANIZATION_FULL: each smooth_move expands
+// into 4-7 queue entries, but at >200 moves/sec the 64-entry queue can't
+// keep up. Coalescing sums rapid deltas and sends one FAST_CMD_SMOOTH_MOVE
+// per COALESCE_INTERVAL_US, capping the KMBox-side queue rate at ~250Hz.
+//
+// Properties:
+//   - Zero data loss (mouse deltas are purely additive)
+//   - Max added latency: 4ms (matches HID frame rate)
+//   - First move after idle gap: immediate (no added latency)
+//   - Non-move commands (buttons, wheel, clicks, keys): sent immediately
+// ============================================================================
+
+static int32_t move_accum_x = 0, move_accum_y = 0;
+static uint32_t last_move_flush_us = 0;
+static bool move_pending = false;
+#define COALESCE_INTERVAL_US  4000   // 4ms = 250Hz max send rate
+#define COALESCE_IDLE_US      20000  // 20ms = send immediately after idle gap
 
 // Button config already in config.h (MODE_BUTTON_PIN)
 #define BUTTON_DEBOUNCE_MS 50
@@ -158,6 +177,13 @@ static uint8_t kmbox_queue_depth = 0;
 static uint8_t kmbox_queue_capacity = 32;
 static uint16_t kmbox_total_injected = 0;
 static uint16_t kmbox_queue_overflows = 0;
+
+// Console mode (Xbox passthrough) state from KMBox
+static bool kmbox_console_mode = false;
+static bool kmbox_console_auth_complete = false;
+static uint16_t kmbox_gamepad_buttons = 0;
+static int16_t kmbox_gamepad_sticks[4] = {0};
+static uint16_t kmbox_gamepad_triggers[2] = {0};
 static bool kmbox_humanization_valid = false;
 static uint32_t last_humanization_request_ms = 0;
 #define HUMANIZATION_REQUEST_INTERVAL_MS 2000  // Request humanization info every 2 seconds (was 3s)
@@ -185,13 +211,33 @@ typedef struct __attribute__((packed)) {
 static frame_header_t pending_header;
 static uint8_t header_bytes_received = 0;
 
-// WS2812 NeoPixel — now handled entirely by neopixel_dma module
-// (DMA + 30 Hz timer; zero CPU on the hot path)
+// WS2812 NeoPixel state (using SDK PIO program)
+static PIO ws2812_pio = pio0;
+static uint ws2812_sm = 0;
+static uint ws2812_offset = 0;
 
-// Legacy compatibility shim — delegates to the DMA-backed module.
-// Existing call sites can use this until fully migrated.
-static inline void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
-    neopixel_dma_set_rgb(r, g, b);
+// ============================================================================
+// WS2812 NeoPixel Control (using SDK ws2812.pio)
+// ============================================================================
+
+static void ws2812_init(void) {
+    // Add the SDK ws2812 program to PIO
+    ws2812_offset = pio_add_program(ws2812_pio, &ws2812_program);
+    
+    // Claim a state machine
+    ws2812_sm = pio_claim_unused_sm(ws2812_pio, true);
+    
+    // Initialize using SDK helper function (800kHz, RGB not RGBW)
+    ws2812_program_init(ws2812_pio, ws2812_sm, ws2812_offset, WS2812_PIN, 800000, false);
+}
+
+void ws2812_put_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    // WS2812 expects GRB order, shifted left 8 bits for 24-bit mode
+    uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+    // Non-blocking: skip update if PIO FIFO is full (LED is cosmetic, not critical)
+    if (!pio_sm_is_tx_fifo_full(ws2812_pio, ws2812_sm)) {
+        pio_sm_put(ws2812_pio, ws2812_sm, grb << 8);
+    }
 }
 
 // ============================================================================
@@ -214,7 +260,6 @@ static void sync_uart_stats(void) {
 
 // Read internal temperature sensor (RP2040/RP2350)
 // Returns temperature in Celsius
-// Optimized: pre-computed constants use FPU multiply instead of divide
 static float read_temperature_c(void) {
     // Select ADC input 4 (internal temperature sensor)
     adc_select_input(4);
@@ -223,16 +268,12 @@ static float read_temperature_c(void) {
     uint16_t raw = adc_read();
     
     // Convert to voltage (ADC reference is 3.3V)
-    // Pre-computed: 3.3 / 4096 = 0.000806640625
-    static const float ADC_TO_VOLTAGE = 3.3f / 4096.0f;
-    float voltage = (float)raw * ADC_TO_VOLTAGE;
+    const float conversion_factor = 3.3f / (1 << 12);
+    float voltage = raw * conversion_factor;
     
     // Convert voltage to temperature (formula from RP2040 datasheet)
-    // T = 27 - (V - 0.706) / 0.001721
-    // Rewritten as: T = 27 - (V - 0.706) * (1/0.001721)
-    // Pre-computed: 1/0.001721 = 581.057...
-    static const float INV_SLOPE = 1.0f / 0.001721f;
-    float temperature = 27.0f - (voltage - 0.706f) * INV_SLOPE;
+    // T = 27 - (ADC_voltage - 0.706) / 0.001721
+    float temperature = 27.0f - (voltage - 0.706f) / 0.001721f;
     
     return temperature;
 }
@@ -297,12 +338,6 @@ static void button_task(void) {
             // Reset ferrum line buffer on mode change
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
-            // Flash NeoPixel with API-mode color (zero CPU — handled by DMA ISR)
-            switch (current_api_mode) {
-                case API_MODE_KMBOX: neopixel_dma_activity_flash_ms(LED_COLOR_API_KMBOX, 400);  break;
-                case API_MODE_MAKCU: neopixel_dma_activity_flash_ms(LED_COLOR_API_MAKCU, 400);  break;
-                case API_MODE_FERRUM: neopixel_dma_activity_flash_ms(LED_COLOR_API_FERRUM, 400); break;
-            }
         } else {
             // Long press: cycle humanization mode on KMBox
             uint8_t cycle_pkt[8] = {0x0F, 0, 0, 0, 0, 0, 0, 0};
@@ -444,9 +479,8 @@ static void uart_rx_task(void) {
     // Cache timestamp ONCE at start, not per-byte (saves ~50 cycles per byte)
     const uint32_t now = to_ms_since_boot(get_absolute_time());
     
-    // Batch read up to 128 bytes at once from DMA ring buffer (single memcpy)
-    // At 3 Mbaud / 240MHz, larger batches reduce per-byte overhead
-    uint8_t rx_batch[128];
+    // Batch read up to 64 bytes at once from DMA ring buffer (single memcpy)
+    uint8_t rx_batch[64];
     size_t batch_count = hw_uart_read(rx_batch, sizeof(rx_batch));
     if (batch_count == 0) return;
     
@@ -527,10 +561,17 @@ static void uart_rx_task(void) {
                     }
                     kmbox_total_injected = (uint16_t)(binary_packet[4] | (binary_packet[5] << 8));
                     kmbox_queue_overflows = (uint16_t)(binary_packet[6] | (binary_packet[7] << 8));
-                    
+
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
                     }
+                } else if (binary_packet[0] == 0x28) {
+                    // Xbox console status: [0x28][mode][auth][btns_lo][btns_hi][stk_lx_lo][stk_lx_hi][trigs]
+                    kmbox_console_mode = (binary_packet[1] != 0);
+                    kmbox_console_auth_complete = (binary_packet[2] != 0);
+                    kmbox_gamepad_buttons = (uint16_t)(binary_packet[3] | (binary_packet[4] << 8));
+                    kmbox_gamepad_sticks[0] = (int16_t)(binary_packet[5] | (binary_packet[6] << 8));
+                    // Remaining stick/trigger data comes from extended packets
                 }
                 in_binary_packet = false;
                 binary_idx = 0;
@@ -737,20 +778,73 @@ static void uart_debug_task(void) {
 // Mouse Command Protocol - Send to KMBox (Binary Fast Commands)
 // ============================================================================
 
-// Send a binary mouse move command to KMBox (direct accumulator + output-stage humanization)
-static void send_smooth_mouse_move(int16_t dx, int16_t dy) {
+// Coalesce a move delta into the accumulator, flushing immediately if idle
+static void coalesce_move(int16_t x, int16_t y) {
+    uint32_t now = time_us_32();
+    move_accum_x += x;
+    move_accum_y += y;
+
+    if (!move_pending) {
+        // First move — check if we've been idle long enough to send immediately
+        uint32_t elapsed = now - last_move_flush_us;
+        if (elapsed >= COALESCE_IDLE_US) {
+            // Idle gap: flush immediately for zero-latency first move
+            uint8_t pkt[FAST_CMD_PACKET_SIZE];
+            fast_build_smooth_move(pkt, (int16_t)move_accum_x, (int16_t)move_accum_y,
+                                   INJECT_MODE_SMOOTH);
+            if (send_uart_packet(pkt, FAST_CMD_PACKET_SIZE)) {
+                tft_mouse_activity_count++;
+                injection_count++;
+                move_accum_x = 0;
+                move_accum_y = 0;
+                last_move_flush_us = now;
+                // move_pending stays false — data was sent
+                return;
+            }
+            // Send failed (DMA busy) — fall through to set move_pending
+            // so coalesce_flush_task retries on next main loop iteration
+        }
+    }
+    move_pending = true;
+}
+
+// Periodic flush of coalesced moves — call from main loop
+static void coalesce_flush_task(void) {
+    if (!move_pending) return;
+
+    uint32_t now = time_us_32();
+    uint32_t elapsed = now - last_move_flush_us;
+    if (elapsed < COALESCE_INTERVAL_US) return;
+
+    // Flush accumulated movement as a single FAST_CMD_SMOOTH_MOVE (0x07)
     uint8_t pkt[FAST_CMD_PACKET_SIZE];
-    size_t len = fast_build_mouse_move(pkt, dx, dy, 0, 0);
-    
+    fast_build_smooth_move(pkt, (int16_t)move_accum_x, (int16_t)move_accum_y,
+                           INJECT_MODE_SMOOTH);
+    if (!send_uart_packet(pkt, FAST_CMD_PACKET_SIZE)) {
+        // DMA busy — don't reset accumulators, retry next iteration.
+        // Update timestamp so we don't busy-spin; retry after 1ms.
+        last_move_flush_us = now - COALESCE_INTERVAL_US + 1000;
+        return;
+    }
+    tft_mouse_activity_count++;
+    injection_count++;
+
+    move_accum_x = 0;
+    move_accum_y = 0;
+    last_move_flush_us = now;
+    move_pending = false;
+}
+
+// Send a binary mouse move command to KMBox (via coalescer for smooth humanization)
+static void send_smooth_mouse_move(int16_t dx, int16_t dy) {
     // Non-blocking LED pulse using timestamp comparison
     static uint32_t led_off_time = 0;
     gpio_put(LED_PIN, 1);
     led_off_time = time_us_32() + 50;  // Schedule LED off
-    
-    send_uart_packet(pkt, len);
-    tft_mouse_activity_count++;  // Track mouse commands for TFT display
-    injection_count++;  // Track successful injections
-    
+
+    // Route through coalescer → FAST_CMD_SMOOTH_MOVE (0x07)
+    coalesce_move(dx, dy);
+
     // Non-blocking LED off (check in next iteration or turn off now if time passed)
     if (time_us_32() >= led_off_time) {
         gpio_put(LED_PIN, 0);
@@ -819,13 +913,10 @@ static makcu_state_t makcu_state = MAKCU_STATE_IDLE;
 
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
-    // km.move(x,y) - relative mouse movement (convert to binary for efficiency)
+    // km.move(x,y) - relative mouse movement (route through coalescer for humanization)
     int x, y;
     if (kmbox_parse_move_command(cmd, &x, &y)) {
-        // Send as binary packet for efficiency
-        uint8_t pkt[8] = {0x01, (uint8_t)(x & 0xFF), (uint8_t)((x >> 8) & 0xFF),
-                          (uint8_t)(y & 0xFF), (uint8_t)((y >> 8) & 0xFF), 0, 0, 0};
-        send_uart_packet(pkt, 8);
+        coalesce_move((int16_t)x, (int16_t)y);
         return;
     }
     
@@ -1068,7 +1159,19 @@ static void cdc_task(void) {
                 ferrum_translated_t translated;
                 if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
                     if (translated.length > 0) {
-                        send_uart_packet(translated.buffer, translated.length);
+                        // Intercept move packets (0x01 with non-zero x/y) → coalescer
+                        if (translated.buffer[0] == FAST_CMD_MOUSE_MOVE) {
+                            int16_t mx = (int16_t)(translated.buffer[1] | (translated.buffer[2] << 8));
+                            int16_t my = (int16_t)(translated.buffer[3] | (translated.buffer[4] << 8));
+                            if (mx != 0 || my != 0) {
+                                coalesce_move(mx, my);
+                            } else {
+                                // Button-only or wheel-only: send immediately
+                                send_uart_packet(translated.buffer, translated.length);
+                            }
+                        } else {
+                            send_uart_packet(translated.buffer, translated.length);
+                        }
                     }
                     // Send Ferrum response (buffered)
                     if (translated.needs_response && tud_cdc_connected()) {
@@ -1155,36 +1258,80 @@ static void set_status(bridge_status_t new_status) {
     }
 }
 
-/**
- * @brief Update NeoPixel status — zero CPU cost.
- *
- * This only writes a volatile enum.  All color math, breathing, and DMA
- * transfers happen inside the neopixel_dma 30 Hz timer ISR.
- */
 static void update_status_neopixel(void) {
-    // Determine the logical status (same logic as before)
+    static uint32_t last_update = 0;
+    static uint8_t activity_countdown = 0;
+    static uint8_t brightness = 255;
+    static int8_t brightness_dir = -2;
+    uint32_t now = time_us_32();
+    
+    if (activity_countdown > 0) {
+        ws2812_put_rgb(LED_COLOR_ACTIVITY);
+        activity_countdown--;
+        return;
+    }
+    
+    if (now - last_update < 50000) return;
+    last_update = now;
+    
     if (!tracker_is_enabled()) {
         set_status(STATUS_DISABLED);
     } else if (frame_ready) {
         set_status(STATUS_TRACKING);
-        // Brief activity flash on new frame (handled entirely in ISR)
-        neopixel_dma_activity_flash(LED_COLOR_ACTIVITY);
+        activity_countdown = 2;
     } else if (tud_cdc_connected()) {
         set_status(STATUS_CDC_CONNECTED);
     } else {
         set_status(STATUS_IDLE);
     }
-
-    // Map bridge status → neopixel_dma status (single volatile store)
-    static const neo_status_t status_map[] = {
-        [STATUS_BOOTING]       = NEO_STATUS_BOOTING,
-        [STATUS_IDLE]          = NEO_STATUS_IDLE,
-        [STATUS_CDC_CONNECTED] = NEO_STATUS_CDC_CONNECTED,
-        [STATUS_TRACKING]      = NEO_STATUS_TRACKING,
-        [STATUS_DISABLED]      = NEO_STATUS_DISABLED,
-        [STATUS_ERROR]         = NEO_STATUS_ERROR,
-    };
-    neopixel_dma_set_status(status_map[current_status]);
+    
+    bool apply_breathing = (current_status == STATUS_BOOTING || 
+                           current_status == STATUS_IDLE ||
+                           current_status == STATUS_ERROR);
+    
+    if (apply_breathing) {
+        brightness += brightness_dir;
+        if (brightness <= 50) {
+            brightness = 50;
+            brightness_dir = 2;
+        } else if (brightness >= 255) {
+            brightness = 255;
+            brightness_dir = -2;
+        }
+    } else {
+        brightness = 255;
+    }
+    
+    uint8_t r, g, b;
+    switch (current_status) {
+        case STATUS_BOOTING:
+            r = 0; g = 0; b = 255;
+            break;
+        case STATUS_IDLE:
+            r = 255; g = 0; b = 0;
+            break;
+        case STATUS_CDC_CONNECTED:
+            r = 0; g = 255; b = 255;
+            break;
+        case STATUS_TRACKING:
+            r = 0; g = 255; b = 0;
+            break;
+        case STATUS_DISABLED:
+            r = 255; g = 255; b = 0;
+            break;
+        case STATUS_ERROR:
+        default:
+            r = 255; g = 0; b = 0;
+            break;
+    }
+    
+    if (apply_breathing) {
+        r = (r * brightness) / 255;
+        g = (g * brightness) / 255;
+        b = (b * brightness) / 255;
+    }
+    
+    ws2812_put_rgb(r, g, b);
 }
 
 // ============================================================================
@@ -1280,7 +1427,14 @@ static void tft_submit_stats_task(void) {
     }
     stats.bridge_temperature_c = cached_temp;
     stats.kmbox_temperature_c = kmbox_temperature_c;
-    
+
+    // Console mode (Xbox passthrough)
+    stats.console_mode = kmbox_console_mode;
+    stats.console_auth_complete = kmbox_console_auth_complete;
+    stats.gamepad_buttons = kmbox_gamepad_buttons;
+    memcpy(stats.gamepad_sticks, kmbox_gamepad_sticks, sizeof(stats.gamepad_sticks));
+    memcpy(stats.gamepad_triggers, kmbox_gamepad_triggers, sizeof(stats.gamepad_triggers));
+
     // Hand stats to display module (just a memcpy — timer ISR renders later)
     tft_display_submit_stats(&stats);
 }
@@ -1290,9 +1444,8 @@ static void tft_submit_stats_task(void) {
 // ============================================================================
 
 int main(void) {
-    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.25V
-    // (matches KMBox voltage for stable 240MHz under load with TFT+DMA+USB)
-    vreg_set_voltage(VREG_VOLTAGE_1_25);
+    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.20V
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(10);  // Let voltage stabilize
     set_sys_clock_khz(240000, true);
     
@@ -1309,7 +1462,7 @@ int main(void) {
     adc_set_temp_sensor_enabled(true);
     
     // Initialize peripherals (fast init only)
-    neopixel_dma_init(pio0, WS2812_PIN);  // DMA-driven NeoPixel (zero CPU in hot path)
+    ws2812_init();
     button_init();
     hw_uart_bridge_init();  // Hardware UART with DMA (replaces PIO UART)
     latency_tracker_init(); // Initialize latency tracking
@@ -1320,9 +1473,9 @@ int main(void) {
     // Initialize tracker
     tracker_init();
     
-    // Initial LED state (neopixel_dma_init already shows booting blue)
+    // Initial LED state
+    ws2812_put_rgb(LED_COLOR_BOOTING);
     set_status(STATUS_BOOTING);
-    neopixel_dma_set_status(NEO_STATUS_BOOTING);
     
     // TinyUSB initialization - MUST happen early for CDC to enumerate
     tusb_init();
@@ -1349,6 +1502,7 @@ int main(void) {
         tud_task();
         cdc_task();
         uart_rx_task();
+        coalesce_flush_task();
         
         kmbox_connection_task();
         button_task();
@@ -1362,18 +1516,38 @@ int main(void) {
             printf("[Bridge] Touch: sent humanization cycle command\n");
         }
         
+        // Process menu requests (from TFT menu view)
+        if (tft_menu_request.set_humanization_mode) {
+            tft_menu_request.set_humanization_mode = false;
+            // WIRE_CONFIG: [0x0B][param=0x02][value]
+            uint8_t config_pkt[3] = {0x0B, 0x02, tft_menu_request.humanization_mode_val};
+            send_uart_packet(config_pkt, 3);
+            printf("[Bridge] Menu: set humanization mode -> %d\n", tft_menu_request.humanization_mode_val);
+        }
+        if (tft_menu_request.set_max_per_frame || tft_menu_request.set_velocity_matching) {
+            uint8_t mpf = tft_menu_request.set_max_per_frame ? tft_menu_request.max_per_frame_val : kmbox_max_per_frame;
+            uint8_t vel = tft_menu_request.set_velocity_matching ? tft_menu_request.velocity_matching_val :
+                          (kmbox_velocity_matching ? 1 : 0);
+            tft_menu_request.set_max_per_frame = false;
+            tft_menu_request.set_velocity_matching = false;
+            // WIRE_SMOOTH_CFG: [0x0C][max_per_frame][vel_match]
+            uint8_t smooth_cfg_pkt[3] = {0x0C, mpf, vel};
+            send_uart_packet(smooth_cfg_pkt, 3);
+            printf("[Bridge] Menu: smooth cfg mpf=%d vel=%d\n", mpf, vel);
+        }
+        if (tft_menu_request.set_inject_mode) {
+            tft_menu_request.set_inject_mode = false;
+            // No dedicated wire command for inject mode — use WIRE_CONFIG with a new param
+            // For now, this is informational (inject mode is per-movement in SMOOTH16)
+            printf("[Bridge] Menu: inject mode -> %d (display-only)\n", tft_menu_request.inject_mode_val);
+        }
+        
         // Cycle API mode if requested by touch (middle zone)
         if (api_cycle_requested) {
             api_cycle_requested = false;
             current_api_mode = (api_mode_t)((current_api_mode + 1) % 3);
             ferrum_idx = 0;
             ferrum_line[0] = '\0';
-            // Flash NeoPixel with API-mode color (zero CPU — handled by DMA ISR)
-            switch (current_api_mode) {
-                case API_MODE_KMBOX: neopixel_dma_activity_flash_ms(LED_COLOR_API_KMBOX, 400);  break;
-                case API_MODE_MAKCU: neopixel_dma_activity_flash_ms(LED_COLOR_API_MAKCU, 400);  break;
-                case API_MODE_FERRUM: neopixel_dma_activity_flash_ms(LED_COLOR_API_FERRUM, 400); break;
-            }
             printf("[Bridge] Touch: API mode -> %d\n", (int)current_api_mode);
         }
         
@@ -1389,14 +1563,20 @@ int main(void) {
         uint8_t translated_packet[8];
         while (core1_has_kmbox_commands()) {
             if (core1_dequeue_kmbox_command(translated_packet)) {
-                // Translate 8-byte KMBox to optimized bridge protocol
-                // (Core1 outputs old format, we convert to new)
-                int16_t x = translated_packet[1] | (translated_packet[2] << 8);
-                int16_t y = translated_packet[3] | (translated_packet[4] << 8);
-                
-                uint8_t bridge_pkt[7];
-                size_t len = bridge_build_mouse_move(bridge_pkt, x, y);
-                send_uart_packet(bridge_pkt, len);
+                // Core1 translator outputs 8-byte fast command packets
+                // Intercept 0x01 move packets → coalescer for humanization
+                if (translated_packet[0] == FAST_CMD_MOUSE_MOVE) {
+                    int16_t mx = (int16_t)(translated_packet[1] | (translated_packet[2] << 8));
+                    int16_t my = (int16_t)(translated_packet[3] | (translated_packet[4] << 8));
+                    if (mx != 0 || my != 0) {
+                        coalesce_move(mx, my);
+                    } else {
+                        // Button-only or wheel-only: send immediately
+                        send_uart_packet(translated_packet, 8);
+                    }
+                } else {
+                    send_uart_packet(translated_packet, 8);
+                }
             }
         }
         

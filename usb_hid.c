@@ -14,6 +14,8 @@
 #include "watchdog.h"           // Include the header for watchdog management
 #include "smooth_injection.h"   // Include the header for smooth mouse injection
 #include "humanization_fpu.h"   // Include for tremor generation
+#include "xbox_gip.h"           // Xbox mode flag
+#include "xbox_device.h"        // Xbox device descriptors
 #include <string.h>             // For strcpy, strlen, memset
 #include <math.h>                // For sqrtf
 
@@ -311,9 +313,6 @@ static inline int8_t clamp_i8(int32_t val);
 static const uint8_t desc_hid_keyboard[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD))};
 
-static const uint8_t desc_hid_mouse_default[] = {
-    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE))};
-
 // 16-bit mouse descriptor for gaming mice (G703, G Pro Wireless, etc.)
 // Matches the G703 Lightspeed structure: 16-bit buttons, 16-bit X/Y, 8-bit wheel/pan
 static const uint8_t desc_hid_mouse_16bit[] = {
@@ -577,14 +576,11 @@ static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x
     // Mode-dependent intensity scaling
     float mode_scale = 1.0f;
     switch (mode) {
-        case HUMANIZATION_LOW:
+        case HUMANIZATION_MICRO:
             mode_scale = 0.5f;
             break;
-        case HUMANIZATION_MEDIUM:
+        case HUMANIZATION_FULL:
             mode_scale = 1.0f;
-            break;
-        case HUMANIZATION_HIGH:
-            mode_scale = 1.5f;
             break;
         default:
             break;
@@ -1587,6 +1583,9 @@ bool find_key_in_report(const hid_keyboard_report_t *report, uint8_t keycode)
 
 void hid_device_task(void)
 {
+    // Xbox mode: skip HID device task entirely, xbox_device_task handles it
+    if (g_xbox_mode) return;
+
     // Use cheap microsecond timer for 1ms precision polling
     static uint32_t start_us = 0;
     uint32_t current_us = time_us_32();
@@ -1598,11 +1597,17 @@ void hid_device_task(void)
     }
     start_us = current_us;
 
-    // Remote wakeup handling
-    if (tud_suspended() && !gpio_get(PIN_BUTTON))
+    // Remote wakeup handling — wake on button press OR pending injection data.
+    // Without this, USB suspend blocks all smooth injection output until the
+    // physical mouse moves (which prevents suspend in the first place).
+    if (tud_suspended())
     {
-        // Wake up host if we are in suspend mode and button is pressed
-        tud_remote_wakeup();
+        bool has_data = !gpio_get(PIN_BUTTON) ||
+                        smooth_has_pending() ||
+                        kmbox_has_pending_movement();
+        if (has_data) {
+            tud_remote_wakeup();
+        }
         return;
     }
 
@@ -2420,6 +2425,11 @@ void usb_stack_error_check(void)
 // Application return pointer to descriptor — clones host mouse fields when available
 uint8_t const * tud_descriptor_device_cb(void)
 {
+    // Xbox mode: return Xbox controller device descriptor
+    if (g_xbox_mode) {
+        return xbox_get_device_descriptor();
+    }
+
     static tusb_desc_device_t desc_device;
 
     desc_device = (tusb_desc_device_t) {
@@ -2585,6 +2595,12 @@ uint8_t const desc_configuration[] =
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 {
     (void)index; // for multiple configurations
+
+    // Xbox mode: return Xbox controller configuration descriptor
+    if (g_xbox_mode) {
+        return xbox_get_config_descriptor();
+    }
+
     if (desc_config_runtime_valid) {
         return desc_configuration_runtime;
     }
@@ -2629,6 +2645,11 @@ static uint8_t convert_string_to_utf16(const char *str, uint16_t *desc_str)
 // Invoked when received GET STRING DESCRIPTOR request
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 {
+    // Xbox mode: return Xbox controller string descriptors
+    if (g_xbox_mode) {
+        return xbox_get_string_descriptor(index, langid);
+    }
+
     (void)langid;
 
     uint8_t chr_count;

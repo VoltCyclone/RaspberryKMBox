@@ -1,0 +1,3 @@
+add_library(dma_uart INTERFACE)
+target_include_directories(dma_uart INTERFACE include)
+target_link_libraries(dma_uart INTERFACE hardware_dma)

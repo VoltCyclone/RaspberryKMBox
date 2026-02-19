@@ -5,11 +5,12 @@
  * 8-byte binary fast command packets.  The KMBox processes these
  * directly without any string parsing.
  *
- * All commands → FAST_CMD_MOUSE_MOVE (0x01) — direct accumulator
- *   path.  Output-stage humanization (tremor) is applied by
- *   apply_output_humanization() in usb_hid.c.  The smooth injection
- *   queue (0x07) is reserved for large one-shot moves, not streaming
- *   deltas — its 32-slot queue overflows at high Ferrum rates.
+ * All commands → FAST_CMD_MOUSE_MOVE (0x01) — the translator still
+ *   outputs 0x01 packets.  The movement coalescer in main.c intercepts
+ *   move packets (0x01 with non-zero x/y) and re-routes them through
+ *   FAST_CMD_SMOOTH_MOVE (0x07) at a controlled rate (≤250Hz) so the
+ *   KMBox smooth injection queue can apply full humanization without
+ *   overflowing.
  */
 
 #include "ferrum_translator.h"
@@ -95,9 +96,9 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (!parse_int(&p, &y)) return false;
         if (*p != ')') return false;
 
-        // Direct accumulator — output-stage humanization applies tremor.
-        // Do NOT use smooth queue (0x07) for streaming deltas; 32-slot
-        // queue overflows at high Ferrum command rates.
+        // Direct accumulator (0x01) — the coalescer in main.c intercepts
+        // move packets and re-routes through smooth queue (0x07) at a
+        // controlled rate for full humanization.
         out->length = (uint16_t)fast_build_mouse_move(
             out->buffer, (int16_t)x, (int16_t)y, g_button_state, 0);
         out->needs_response = true;

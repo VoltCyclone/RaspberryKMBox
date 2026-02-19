@@ -16,7 +16,8 @@
 
 typedef enum {
     TFT_VIEW_DETAILED,   // Full detailed statistics view
-    TFT_VIEW_GAUGES      // Large gauge/visualization view
+    TFT_VIEW_GAUGES,     // Large gauge/visualization view
+    TFT_VIEW_MENU        // Humanization settings menu
 } tft_view_mode_t;
 
 // ============================================================================
@@ -87,7 +88,35 @@ typedef struct {
     // Temperatures (Celsius, use <-50 or >150 to indicate invalid)
     float bridge_temperature_c;
     float kmbox_temperature_c;
+
+    // Console mode (Xbox passthrough)
+    bool console_mode;
+    bool console_auth_complete;
+    uint16_t gamepad_buttons;
+    int16_t gamepad_sticks[4];     // LX, LY, RX, RY
+    uint16_t gamepad_triggers[2];  // Left, Right
 } tft_stats_t;
+
+// ============================================================================
+// Menu Command Requests (set by TFT menu, consumed by main loop)
+// ============================================================================
+
+typedef struct {
+    bool set_humanization_mode;      // Request to set humanization mode
+    uint8_t humanization_mode_val;   // 0=Off, 1=Micro, 2=Full
+
+    bool set_inject_mode;            // Request to set injection mode
+    uint8_t inject_mode_val;         // 0=Immediate, 1=Smooth, 2=VelMatch, 3=Micro
+
+    bool set_max_per_frame;          // Request to set max pixels per frame
+    uint8_t max_per_frame_val;       // 1-32
+
+    bool set_velocity_matching;      // Request to toggle velocity matching
+    uint8_t velocity_matching_val;   // 0=Off, 1=On
+} tft_menu_request_t;
+
+// Shared request structure — menu writes, main loop reads & clears
+extern volatile tft_menu_request_t tft_menu_request;
 
 // ============================================================================
 // Public API

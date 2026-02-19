@@ -4,6 +4,7 @@
 
 
 #include "led_control.h"
+#include "led_color.h"
 #include "usb_hid.h"
 #include "defines.h"
 #include "dcp_helpers.h"
@@ -194,7 +195,11 @@ static const status_config_t g_status_configs[] = {
     [STATUS_BRIDGE_CONNECTING]    = {COLOR_BRIDGE_CONNECTING,    false, "BRIDGE_CONNECTING"},
     [STATUS_BRIDGE_CONNECTED]     = {COLOR_BRIDGE_CONNECTED,     false, "BRIDGE_CONNECTED"},
     [STATUS_BRIDGE_ACTIVE]        = {COLOR_BRIDGE_ACTIVE,        false, "BRIDGE_ACTIVE"},
-    [STATUS_BRIDGE_DISCONNECTED]  = {COLOR_BRIDGE_DISCONNECTED,  true,  "BRIDGE_DISCONNECTED"}
+    [STATUS_BRIDGE_DISCONNECTED]  = {COLOR_BRIDGE_DISCONNECTED,  true,  "BRIDGE_DISCONNECTED"},
+    // Console mode (Xbox passthrough)
+    [STATUS_CONSOLE_MODE]         = {COLOR_CONSOLE_MODE,         false, "CONSOLE_MODE"},
+    [STATUS_CONSOLE_AUTH]         = {COLOR_CONSOLE_AUTH,          true,  "CONSOLE_AUTH"},
+    [STATUS_CONSOLE_READY]        = {COLOR_CONSOLE_READY,        false, "CONSOLE_READY"}
 };
 
 //--------------------------------------------------------------------+
@@ -421,10 +426,7 @@ uint32_t neopixel_apply_brightness_u8(uint32_t color, uint8_t brightness)
     if (!validate_color(color)) {
         return 0;
     }
-    const uint8_t r = (uint8_t)((((color >> 16) & 0xFF) * (uint16_t)brightness) >> 8);
-    const uint8_t g = (uint8_t)((((color >> 8)  & 0xFF) * (uint16_t)brightness) >> 8);
-    const uint8_t b = (uint8_t)((( color        & 0xFF) * (uint16_t)brightness) >> 8);
-    return (r << 16) | (g << 8) | b;
+    return led_apply_brightness_packed(color, brightness);
 }
 
 void neopixel_set_color(uint32_t color)
@@ -840,31 +842,10 @@ void neopixel_clear_status_override(void)
 // RAINBOW EFFECT FUNCTIONS
 //--------------------------------------------------------------------+
 
-/**
- * @brief Convert HSV color to RGB
- * @param hue Hue value (0-360)
- * @param saturation Saturation value (0-255)
- * @param value Brightness value (0-255)
- * @return RGB color as 24-bit value
- */
-static uint32_t hsv_to_rgb(uint16_t hue, uint8_t saturation, uint8_t value)
-{
+// HSV→RGB provided by shared lib/led-utils/led_color.h
+static inline uint32_t hsv_to_rgb(uint16_t hue, uint8_t saturation, uint8_t value) {
     if (hue >= 360) hue = (uint16_t)(hue - 360);
-    uint8_t region = (uint8_t)(hue / 60);
-    uint8_t remainder = (uint8_t)(((hue - (region * 60)) * 255) / 60);
-    uint8_t p = (uint8_t)((value * (uint16_t)(255 - saturation)) >> 8);
-    uint8_t q = (uint8_t)((value * (uint16_t)(255 - ((saturation * remainder) >> 8))) >> 8);
-    uint8_t t = (uint8_t)((value * (uint16_t)(255 - ((saturation * (255 - remainder)) >> 8))) >> 8);
-    uint8_t r, g, b;
-    switch (region) {
-        case 0: r = value; g = t;     b = p;     break;
-        case 1: r = q;     g = value; b = p;     break;
-        case 2: r = p;     g = value; b = t;     break;
-        case 3: r = p;     g = q;     b = value; break;
-        case 4: r = t;     g = p;     b = value; break;
-        default:r = value; g = p;     b = q;     break;
-    }
-    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    return led_hsv_to_rgb_packed(hue, saturation, value);
 }
 
 static void handle_rainbow_effect(void)

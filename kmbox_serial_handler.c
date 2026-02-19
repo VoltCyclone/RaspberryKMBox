@@ -7,10 +7,12 @@
 
 #include "kmbox_serial_handler.h"
 #include "lib/kmbox-commands/kmbox_commands.h"
-#include "bridge_protocol.h"
 #include "usb_hid.h"
 #include "led_control.h"
 #include "smooth_injection.h"
+#include "xbox_gip.h"
+#include "xbox_device.h"
+#include "xbox_host.h"
 #include "uart_buffers.h"
 #include "dcp_helpers.h"
 #include "pico/stdlib.h"
@@ -394,8 +396,13 @@ extern void process_mouse_report(const hid_mouse_report_t *report);
 extern void process_kbd_report(const hid_keyboard_report_t *report);
 
 static __force_inline bool is_fast_cmd_start(uint8_t byte) {
-    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;  // Exclude line terminators
-    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) || byte == FAST_CMD_PING;
+    // Exclude 0x0A (\n) and 0x0D (\r) — these overlap with FAST_CMD_TIMED_MOVE
+    // and FAST_CMD_INFO but the text protocol uses them as line terminators.
+    // TODO: Reassign FAST_CMD_TIMED_MOVE to 0x10+ to avoid this conflict.
+    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;
+    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) ||
+           (byte >= FAST_CMD_XBOX_INPUT && byte <= FAST_CMD_XBOX_STATUS) ||
+           byte == FAST_CMD_PING;
 }
 
 static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
@@ -440,21 +447,14 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             return true;
         }
         
-        case FAST_CMD_KEY_PRESS: {
-            const fast_cmd_key_t *k = (const fast_cmd_key_t *)pkt;
-            hid_keyboard_report_t report = {.modifier = k->modifiers, .keycode = {k->keycode}};
-            process_kbd_report(&report);
-            memset(&report, 0, sizeof(report));
-            process_kbd_report(&report);
-            fast_cmd_count++;
-            return true;
-        }
-        
         case FAST_CMD_KEY_COMBO: {
+            // Handles both KEY_PRESS and KEY_COMBO (same command ID 0x0C)
             const fast_cmd_combo_t *c = (const fast_cmd_combo_t *)pkt;
             hid_keyboard_report_t report = {.modifier = c->modifiers};
             uint8_t n = 0;
-            for (int i = 0; i < 4 && c->keys[i]; i++) report.keycode[n++] = c->keys[i];
+            // Use keycode field for single key, or keys array for combo
+            if (c->keycode) report.keycode[n++] = c->keycode;
+            for (int i = 0; i < 4 && c->keys[i] && n < 6; i++) report.keycode[n++] = c->keys[i];
             process_kbd_report(&report);
             memset(&report, 0, sizeof(report));
             process_kbd_report(&report);
@@ -556,7 +556,7 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             uint8_t flags = 0;
             humanization_mode_t hm = smooth_get_humanization_mode();
             // Jitter is enabled for LOW/MEDIUM/HIGH modes
-            if (hm >= HUMANIZATION_LOW) flags |= 0x01;
+            if (hm >= HUMANIZATION_MICRO) flags |= 0x01;
             if (smooth_get_velocity_matching()) flags |= 0x02;
             // Queue depth as 3-bit value (0-7, clamped from 0-32)
             uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
@@ -607,9 +607,8 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             uint32_t mode_color;
             switch (new_mode) {
                 case HUMANIZATION_OFF:    mode_color = COLOR_HUMANIZATION_OFF;    break;
-                case HUMANIZATION_LOW:    mode_color = COLOR_HUMANIZATION_LOW;    break;
-                case HUMANIZATION_MEDIUM: mode_color = COLOR_HUMANIZATION_MEDIUM; break;
-                case HUMANIZATION_HIGH:   mode_color = COLOR_HUMANIZATION_HIGH;   break;
+                case HUMANIZATION_MICRO:  mode_color = COLOR_HUMANIZATION_MICRO;  break;
+                case HUMANIZATION_FULL:   mode_color = COLOR_HUMANIZATION_FULL;   break;
                 default:                  mode_color = COLOR_ERROR;               break;
             }
             neopixel_set_color(mode_color);
@@ -621,6 +620,42 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             return true;
         }
         
+        // Xbox gamepad injection commands
+        case FAST_CMD_XBOX_INPUT: {
+            // [0x20][btn_lo][btn_hi][trig_l_lo][trig_l_hi][trig_r_lo][trig_r_hi][pad]
+            uint16_t buttons = (uint16_t)(pkt[1] | (pkt[2] << 8));
+            uint16_t trig_l  = (uint16_t)(pkt[3] | (pkt[4] << 8));
+            uint16_t trig_r  = (uint16_t)(pkt[5] | (pkt[6] << 8));
+            xbox_inject_buttons(buttons, trig_l, trig_r);
+            fast_cmd_count++;
+            return true;
+        }
+
+        case FAST_CMD_XBOX_STICK_L: {
+            // [0x22][x_lo][x_hi][y_lo][y_hi][pad][pad][pad]
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            xbox_inject_stick_left(x, y);
+            fast_cmd_count++;
+            return true;
+        }
+
+        case FAST_CMD_XBOX_STICK_R: {
+            // [0x23][x_lo][x_hi][y_lo][y_hi][pad][pad][pad]
+            int16_t x = read_i16_le(pkt + 1);
+            int16_t y = read_i16_le(pkt + 3);
+            xbox_inject_stick_right(x, y);
+            fast_cmd_count++;
+            return true;
+        }
+
+        case FAST_CMD_XBOX_RELEASE: {
+            // [0x27][pad*7] - clear all injection overrides
+            xbox_inject_clear();
+            fast_cmd_count++;
+            return true;
+        }
+
         default:
             fast_cmd_errors++;
             return false;
@@ -1077,17 +1112,40 @@ void kmbox_serial_task(void) {
             rx_consume(1);
             continue;
         }
-        
-        // Not binary - fall through to text processing
+
+        // Not a binary command start — fall through to text processing.
+        // But if the first byte is non-printable (<0x20, excluding \r\n),
+        // it's likely a corrupted/partial binary packet byte.  Skip it
+        // to prevent the text parser from consuming binary data that
+        // happens to contain 0x0A (\n) and destroying framing.
+        if (first < 0x20 && first != '\r' && first != '\n') {
+            rx_consume(1);
+            continue;
+        }
+
         break;
     }
-    
+
     //------------------------------------------------------------------
-    // Text command processing
+    // Text command processing — only runs when the buffer does NOT start
+    // with a binary packet leader.  If the binary loop exited because of
+    // an incomplete fast command (< 8 bytes available), the partial packet
+    // bytes are still in the ring buffer.  Running the text parser on them
+    // would corrupt framing: any binary data byte equaling 0x0A (\n) gets
+    // treated as a line terminator, consuming and destroying the partial
+    // packet.  The remaining bytes arrive within ~27µs at 3 Mbaud, so the
+    // next kmbox_serial_task() call will process the completed packet.
     //------------------------------------------------------------------
+    bool buffer_starts_with_binary = false;
+    if (rx_available() > 0) {
+        uint8_t peek = rx_peek_at(0);
+        buffer_starts_with_binary = is_fast_cmd_start(peek) ||
+                                    peek == BRIDGE_SYNC_BYTE;
+    }
+
     char line[KMBOX_CMD_BUFFER_SIZE];
     size_t len;
-    while (parse_text_line(line, sizeof(line), &len)) {
+    while (!buffer_starts_with_binary && parse_text_line(line, sizeof(line), &len)) {
         if (len > 0) {
             mark_activity(now_ms);
             if (!handle_text_command(line, len, now_ms)) {
@@ -1144,7 +1202,7 @@ void kmbox_send_info_to_bridge(void) {
     // Pack flags byte: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
     humanization_mode_t hm = smooth_get_humanization_mode();
     uint8_t flags = 0;
-    if (hm >= HUMANIZATION_LOW) flags |= 0x01;
+    if (hm >= HUMANIZATION_MICRO) flags |= 0x01;
     if (smooth_get_velocity_matching()) flags |= 0x02;
     uint8_t q3 = (queue_count > 28) ? 7 : (queue_count / 4);
     flags |= (q3 & 0x07) << 2;
@@ -1160,4 +1218,35 @@ void kmbox_send_info_to_bridge(void) {
         flags
     };
     uart_send_bytes(info_pkt, 8);
+}
+
+void kmbox_send_xbox_status_to_bridge(void) {
+    if (!g_xbox_mode) return;
+
+    xbox_gamepad_state_t *gs = xbox_host_get_gamepad();
+    uint32_t save = spin_lock_blocking(gs->lock);
+    uint16_t buttons = gs->physical.buttons;
+    int16_t  lx = gs->physical.stick_lx;
+    int16_t  ly = gs->physical.stick_ly;
+    uint16_t tl = gs->physical.trigger_left;
+    uint16_t tr = gs->physical.trigger_right;
+    spin_unlock(gs->lock, save);
+
+    // Pack triggers into a single summary byte: high 4 bits = left, low 4 = right
+    // Each scaled from 0-1023 down to 0-15
+    uint8_t trig_summary = (uint8_t)(((tl >> 6) & 0x0F) << 4) | ((tr >> 6) & 0x0F);
+
+    uint8_t auth_complete = (xbox_host_get_auth_state() == XBOX_AUTH_COMPLETE) ? 1 : 0;
+
+    uint8_t status_pkt[8] = {
+        FAST_CMD_XBOX_STATUS,
+        1,                                      // console_mode = true
+        auth_complete,
+        (uint8_t)(buttons & 0xFF),
+        (uint8_t)((buttons >> 8) & 0xFF),
+        (uint8_t)((lx >> 8) & 0xFF),           // stick LX high byte
+        (uint8_t)((ly >> 8) & 0xFF),           // stick LY high byte
+        trig_summary
+    };
+    uart_send_bytes(status_pkt, 8);
 }

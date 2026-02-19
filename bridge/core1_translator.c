@@ -41,20 +41,16 @@ static void __not_in_flash_func(core1_main)(void) {
             translated_cmd_t result;
             makcu_translate_command(frame->cmd, frame->payload, frame->payload_len, &result);
             
-            // Queue translated command(s) if successful
+            // Queue translated wire protocol packet (max 7 bytes, fits in 8-byte slot)
             if (result.result == TRANSLATE_OK && result.length > 0) {
-                // Support multi-packet translations
-                for (uint16_t i = 0; i < result.length; i += 8) {
-                    uint8_t next_kmbox_head = (kmbox_head + 1) & (KMBOX_CMD_QUEUE_SIZE - 1);
-                    
-                    if (next_kmbox_head != kmbox_tail) {
-                        memcpy(kmbox_queue[kmbox_head].packet, result.buffer + i, 8);
-                        kmbox_head = next_kmbox_head;
-                        __atomic_add_fetch(&cmds_produced, 1, __ATOMIC_RELAXED);
-                    } else {
-                        __atomic_add_fetch(&queue_overflows, 1, __ATOMIC_RELAXED);
-                        break;
-                    }
+                uint8_t next_kmbox_head = (kmbox_head + 1) & (KMBOX_CMD_QUEUE_SIZE - 1);
+
+                if (next_kmbox_head != kmbox_tail) {
+                    memcpy(kmbox_queue[kmbox_head].packet, result.buffer, result.length);
+                    kmbox_head = next_kmbox_head;
+                    __atomic_add_fetch(&cmds_produced, 1, __ATOMIC_RELAXED);
+                } else {
+                    __atomic_add_fetch(&queue_overflows, 1, __ATOMIC_RELAXED);
                 }
             }
             

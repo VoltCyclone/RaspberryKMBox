@@ -50,6 +50,9 @@ else()
     message(STATUS "Configuring for ${PICO_BOARD} - USB Host on GPIO16/17")
 endif()
 
+# UART instance: 0 = uart0 (GPIO 0/1), 1 = uart1 (GPIO 8/9)
+set(KMBOX_UART_INSTANCE 0 CACHE STRING "UART instance for bridge communication (0 or 1)")
+
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
@@ -70,6 +73,8 @@ add_executable(PIOKMbox
     smooth_injection.c
     humanization_fpu.c
     dcp_helpers.S
+    xbox_host.c
+    xbox_device.c
 )
 
 # generate the header file into the source tree as it is included in the RP2040 datasheet
@@ -121,6 +126,12 @@ add_subdirectory(lib/Pico-PIO-USB)
 # Add KMBox Commands library
 add_subdirectory(lib/kmbox-commands)
 
+# Shared libraries
+add_subdirectory(lib/wire-protocol)
+add_subdirectory(lib/peri-clock)
+add_subdirectory(lib/dma-uart)
+add_subdirectory(lib/led-utils)
+
 # PIO USB library support (now enabled)
 message(STATUS "PIO USB library support enabled")
 # Add compile definitions for TinyUSB and pin configurations
@@ -133,12 +144,14 @@ target_compile_definitions(PIOKMbox PRIVATE
         PIO_USB_AVAILABLE=1
         CFG_TUH_RPI_PIO_USB=1
         CPU_FREQ=240000
+        KMBOX_UART_INSTANCE=${KMBOX_UART_INSTANCE}
         PIN_USB_HOST_DP=${USB_HOST_DP_PIN}
         PIN_USB_HOST_DM=${USB_HOST_DM_PIN}
         PIN_USB_5V=${USB_HOST_5V_PIN}
         PIN_LED=${LED_PIN}
         PIN_NEOPIXEL=${NEOPIXEL_PIN}
         NEOPIXEL_POWER=${NEOPIXEL_POWER_PIN}
+        ENABLE_XBOX_PASSTHROUGH=1
 )
 
 # Link PIO USB library
@@ -146,6 +159,9 @@ target_link_libraries(PIOKMbox pico_pio_usb)
 
 # Link KMBox Commands library
 target_link_libraries(PIOKMbox kmbox_commands)
+
+# Link shared libraries
+target_link_libraries(PIOKMbox wire_protocol peri_clock dma_uart led_utils)
 
 # Add PIO USB HCD implementation directly
 target_sources(PIOKMbox PRIVATE

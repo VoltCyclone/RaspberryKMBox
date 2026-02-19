@@ -15,3 +15,5 @@ tools/out.txt
 out2.txt
 tools/mouse_counteract
 tools/tmp/*.html
+.claude/
+.cache/

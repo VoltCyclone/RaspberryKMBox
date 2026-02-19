@@ -25,6 +25,10 @@
 #include "state_management.h"
 #include "kmbox_serial_handler.h"
 #include "smooth_injection.h"
+#include "peri_clock.h"
+#include "xbox_gip.h"
+#include "xbox_device.h"
+#include "xbox_host.h"
 
 #if PIO_USB_AVAILABLE
 #include "pio_usb.h"
@@ -160,7 +164,12 @@ static void core1_task_loop(void) {
         // when Core0 calls flash_safe_execute(), so no manual polling needed.
         
         tuh_task();
-        
+
+        // Xbox host task: forward console commands to controller, keepalive
+        if (g_xbox_mode) {
+            xbox_host_task();
+        }
+
         // Heartbeat check optimization - much less frequent timing calls
         if (++heartbeat_counter >= heartbeat_check_threshold) {
             const uint32_t current_time = to_ms_since_boot(get_absolute_time());
@@ -177,34 +186,6 @@ static void core1_task_loop(void) {
 //--------------------------------------------------------------------+
 // System Initialization Functions
 //--------------------------------------------------------------------+
-
-/**
- * Configure peripheral clock for stable UART operation at overclock speeds
- * 
- * MUST be called BEFORE uart_init() when running at 240MHz!
- * Switches clk_peri from clk_sys (240MHz) to USB PLL (48MHz) for stability.
- * 
- * CRITICAL: Must be called AFTER set_sys_clock_khz() and BEFORE uart_init()!
- */
-static void configure_stable_peri_clock(void) {
-    uint32_t sys_freq = clock_get_hz(clk_sys);
-    
-    printf("[UART] clk_sys = %lu Hz\n", sys_freq);
-    
-    // If overclocked (>133MHz), switch clk_peri to 48MHz USB PLL
-    if (sys_freq > 133000000) {
-        printf("[UART] Overclock detected! Switching clk_peri to 48MHz USB PLL\n");
-        
-        clock_configure(clk_peri,
-                        0,  // No glitchless mux for clk_peri
-                        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-                        48000000,
-                        48000000);
-        
-        uint32_t peri_freq = clock_get_hz(clk_peri);
-        printf("[UART] clk_peri now = %lu Hz\n", peri_freq);
-    }
-}
 
 static bool initialize_system(void) {
     // Initialize stdio first for early debug output
@@ -223,7 +204,7 @@ static bool initialize_system(void) {
     
     // CRITICAL: Configure stable peripheral clock BEFORE UART init
     // This must happen before kmbox_serial_init() so uart_init() calculates correct divisor
-    configure_stable_peri_clock();
+    peri_clock_configure_stable();
     
     // Re-initialize stdio after clock change with proper delay
     sleep_ms(100);  // Allow clock to stabilize
@@ -314,17 +295,13 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
                     mode_color = COLOR_HUMANIZATION_OFF;
                     
                     break;
-                case HUMANIZATION_LOW:
-                    mode_color = COLOR_HUMANIZATION_LOW;
-                    
+                case HUMANIZATION_MICRO:
+                    mode_color = COLOR_HUMANIZATION_MICRO;
+
                     break;
-                case HUMANIZATION_MEDIUM:
-                    mode_color = COLOR_HUMANIZATION_MEDIUM;
-                    
-                    break;
-                case HUMANIZATION_HIGH:
-                    mode_color = COLOR_HUMANIZATION_HIGH;
-                    
+                case HUMANIZATION_FULL:
+                    mode_color = COLOR_HUMANIZATION_FULL;
+
                     break;
                 default:
                     mode_color = COLOR_ERROR;
@@ -409,7 +386,17 @@ static void main_application_loop(void) {
         kmbox_serial_task();
         
         // HID device task - processes physical mouse/keyboard and sends combined reports
-        hid_device_task();
+        // Xbox mode: run Xbox device task instead of HID device task
+        if (g_xbox_mode) {
+            xbox_device_task();
+        } else {
+            // Check if Xbox controller was just unplugged — re-enumerate
+            // so the console/PC sees updated descriptors (HID instead of Xbox)
+            if (xbox_host_check_and_clear_reenum()) {
+                force_usb_reenumeration();
+            }
+            hid_device_task();
+        }
         
         // Sample time less frequently to reduce overhead
         if (++loop_counter >= MAIN_LOOP_TIME_SAMPLE_INTERVAL) {
@@ -441,6 +428,11 @@ static void main_application_loop(void) {
         if (task_flags & WATCHDOG_FLAG) {
             watchdog_task();
             watchdog_core0_heartbeat();
+            // Process deferred flash saves at watchdog interval (~100ms)
+            // so saves happen ~2s after mode change (SAVE_DEFER_MS),
+            // not at the 60s status boundary where the surprise 100ms
+            // interrupt blackout from flash_safe_execute kills USB.
+            smooth_process_deferred_save();
             state->last_watchdog_time = current_time;
         }
         
@@ -457,10 +449,10 @@ static void main_application_loop(void) {
         
         if (task_flags & STATUS_FLAG) {
             report_watchdog_status(current_time, &state->watchdog_status_timer);
-            
-            // Process deferred flash saves (checks internally if needed)
-            // Run at status report interval (~10s) since flash save is deferred anyway
-            smooth_process_deferred_save();
+            // Send Xbox console mode status to bridge for TFT display
+            if (g_xbox_mode) {
+                kmbox_send_xbox_status_to_bridge();
+            }
         }
     }
 }
