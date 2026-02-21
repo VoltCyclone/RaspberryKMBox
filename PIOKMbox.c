@@ -40,30 +40,6 @@
 #endif
 
 //--------------------------------------------------------------------+
-// Type Definitions and Structures
-//--------------------------------------------------------------------+
-
-typedef struct {
-    uint32_t watchdog_status_timer;
-    uint32_t last_button_press_time;
-    bool button_pressed_last;
-    bool usb_reset_cooldown;
-    uint32_t usb_reset_cooldown_start;
-} main_loop_state_t;
-
-// Remove unused structures
-//typedef struct {
-//    bool button_pressed;
-//    uint32_t current_time;
-//    uint32_t hold_duration;
-//} button_state_t;
-
-//--------------------------------------------------------------------+
-// Constants and Configuration
-//--------------------------------------------------------------------+
-static const uint32_t WATCHDOG_STATUS_INTERVAL_MS = WATCHDOG_STATUS_REPORT_INTERVAL_MS;
-
-//--------------------------------------------------------------------+
 // Global state for flash operation coordination
 //--------------------------------------------------------------------+
 volatile bool g_flash_operation_in_progress = false;
@@ -85,8 +61,6 @@ static void main_application_loop(void);
 // Button handling functions
 static void process_button_input(system_state_t* state, uint32_t current_time);
 
-// Reporting functions
-static void report_watchdog_status(uint32_t current_time, uint32_t* watchdog_status_timer);
 
 // Utility functions
 static inline bool is_time_elapsed(uint32_t current_time, uint32_t last_time, uint32_t interval);
@@ -96,26 +70,6 @@ static inline bool is_time_elapsed(uint32_t current_time, uint32_t last_time, ui
 //--------------------------------------------------------------------+
 
 #if PIO_USB_AVAILABLE
-// Separate initialization concerns into focused functions
-
-typedef enum {
-    INIT_SUCCESS,
-    INIT_FAILURE,
-    INIT_RETRY_NEEDED
-} init_result_t;
-
-typedef struct {
-    int attempt;
-    int max_attempts;
-    uint32_t base_delay_ms;
-    uint32_t last_heartbeat_time;
-} init_context_t;
-
-typedef struct {
-    uint32_t last_heartbeat_ms;
-    uint32_t heartbeat_counter;
-} core1_state_t;
-
 
 static void core1_main(void) {
     // Small delay to let core0 stabilize
@@ -245,8 +199,6 @@ static bool initialize_usb_device(void) {
     return device_init_success;
 }
 
-
-
 //--------------------------------------------------------------------+
 // Button Handling Functions
 //--------------------------------------------------------------------+
@@ -271,11 +223,11 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
             state->last_button_press_time = current_time;
         } else {
             // Button being held - check for reset trigger
-                if (is_time_elapsed(current_time, state->last_button_press_time, BUTTON_HOLD_TRIGGER_MS)) {
-                    usb_stacks_reset();
-                    state->usb_reset_cooldown = true;
-                    state->usb_reset_cooldown_start = current_time;
-                }
+            if (is_time_elapsed(current_time, state->last_button_press_time, BUTTON_HOLD_TRIGGER_MS)) {
+                usb_stacks_reset();
+                state->usb_reset_cooldown = true;
+                state->usb_reset_cooldown_start = current_time;
+            }
         }
     } else if (state->button_pressed_last) {
         // Button just released - check if it was a short press
@@ -291,22 +243,10 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
             // Show mode with LED flash
             uint32_t mode_color;
             switch (new_mode) {
-                case HUMANIZATION_OFF:
-                    mode_color = COLOR_HUMANIZATION_OFF;
-                    
-                    break;
-                case HUMANIZATION_MICRO:
-                    mode_color = COLOR_HUMANIZATION_MICRO;
-
-                    break;
-                case HUMANIZATION_FULL:
-                    mode_color = COLOR_HUMANIZATION_FULL;
-
-                    break;
-                default:
-                    mode_color = COLOR_ERROR;
-                    
-                    break;
+                case HUMANIZATION_OFF:   mode_color = COLOR_HUMANIZATION_OFF;   break;
+                case HUMANIZATION_MICRO: mode_color = COLOR_HUMANIZATION_MICRO; break;
+                case HUMANIZATION_FULL:  mode_color = COLOR_HUMANIZATION_FULL;  break;
+                default:                 mode_color = COLOR_ERROR;              break;
             }
             
             neopixel_set_color(mode_color);
@@ -315,20 +255,6 @@ static void process_button_input(system_state_t* state, uint32_t current_time) {
     }
 
     state->button_pressed_last = button_currently_pressed;
-}
-
-//--------------------------------------------------------------------+
-// Reporting Functions
-//--------------------------------------------------------------------+
-
-static void report_watchdog_status(uint32_t current_time, uint32_t* watchdog_status_timer) {
-    if (!is_time_elapsed(current_time, *watchdog_status_timer, WATCHDOG_STATUS_INTERVAL_MS)) {
-        return;
-    }
-
-    *watchdog_status_timer = current_time;
-    
-    
 }
 
 //--------------------------------------------------------------------+
@@ -343,7 +269,6 @@ static __force_inline bool is_time_elapsed(uint32_t current_time, uint32_t last_
 // Main Application Loop
 //--------------------------------------------------------------------+
 
-
 static void main_application_loop(void) {
     system_state_t* state = get_system_state();
     system_state_init(state);
@@ -353,7 +278,7 @@ static void main_application_loop(void) {
     const uint32_t visual_interval = VISUAL_TASK_INTERVAL_MS;
     const uint32_t error_interval = ERROR_CHECK_INTERVAL_MS;
     const uint32_t button_interval = BUTTON_DEBOUNCE_MS;
-    const uint32_t status_report_interval = WATCHDOG_STATUS_REPORT_INTERVAL_MS;
+    const uint32_t status_interval = WATCHDOG_STATUS_REPORT_INTERVAL_MS;
 
     // Performance optimization: reduce time sampling frequency
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
@@ -414,7 +339,7 @@ static void main_application_loop(void) {
             if ((current_time - state->last_button_time) >= button_interval) {
                 task_flags |= BUTTON_FLAG;
             }
-            if ((current_time - state->watchdog_status_timer) >= status_report_interval) {
+            if ((current_time - state->watchdog_status_timer) >= status_interval) {
                 task_flags |= STATUS_FLAG;
             }
             
@@ -448,7 +373,7 @@ static void main_application_loop(void) {
         }
         
         if (task_flags & STATUS_FLAG) {
-            report_watchdog_status(current_time, &state->watchdog_status_timer);
+            state->watchdog_status_timer = current_time;
             // Send Xbox console mode status to bridge for TFT display
             if (g_xbox_mode) {
                 kmbox_send_xbox_status_to_bridge();

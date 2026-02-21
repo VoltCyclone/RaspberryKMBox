@@ -43,13 +43,5 @@ void system_state_init(system_state_t* state);
 // Get current system state (singleton pattern)
 system_state_t* get_system_state(void);
 
-// State update helpers
-void system_state_update_timing(system_state_t* state, uint32_t current_time);
-bool system_state_should_run_task(const system_state_t* state, uint32_t current_time, 
-                                  uint32_t last_run_time, uint32_t interval_ms);
-
-// Performance optimization: batch timer updates
-void system_state_batch_update_timers(system_state_t* state, uint32_t current_time,
-                                     uint8_t update_flags);
 
 #endif // STATE_MANAGEMENT_H
