@@ -12,6 +12,7 @@
  *   -p, --port PORT     UDP listen port (default: 9346)
  *   -b, --baud RATE     Serial baud rate (default: 3000000)
  *   -m, --mac MAC       Expected MAC for auth (default: accept any)
+ *   -w, --web PORT      Enable web dashboard on PORT (default: 8080)
  *   -v, --verbose       Log all commands
  *   -h, --help          Show help
  *
@@ -380,6 +381,16 @@ typedef struct {
     uint64_t cmds_translated;
     uint64_t serial_errors;
     uint64_t encrypted_cmds;
+
+    /* Web UI */
+    sock_t   http;           /* TCP listener */
+    sock_t   http_client;    /* Current HTTP connection (or INVALID_SOCK) */
+    int      http_port;      /* CLI configurable, default 8080 */
+    double   start_time;     /* For uptime */
+    double   last_rate_time; /* For cmd/s calculation */
+    uint64_t cmds_at_last_rate;
+    double   cmds_per_sec;
+    char     last_cmd_name[32];
 } relay_t;
 
 static relay_t g_relay;
@@ -627,6 +638,8 @@ static void handle_packet(relay_t *r, uint8_t *buf, int len,
     memcpy(&head, buf, KMNET_HEAD_SIZE);
 
     r->cmds_received++;
+    strncpy(r->last_cmd_name, cmd_name(head.cmd), sizeof(r->last_cmd_name) - 1);
+    r->last_cmd_name[sizeof(r->last_cmd_name) - 1] = '\0';
 
     /* Handle connect — always process regardless of MAC filter */
     if (head.cmd == KMNET_CMD_CONNECT) {
@@ -740,6 +753,260 @@ static void handle_packet(relay_t *r, uint8_t *buf, int len,
 }
 
 /* ========================================================================== */
+/* Embedded Web Dashboard                                                     */
+/* ========================================================================== */
+
+static const char dashboard_html[] =
+"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>KMBox Relay</title><style>"
+"*{margin:0;padding:0;box-sizing:border-box}"
+"body{background:#1a1a2e;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"
+"'Segoe UI',Roboto,sans-serif;padding:20px}"
+"h1{color:#00d4ff;margin-bottom:20px;font-size:1.5em}"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}"
+".card{background:#16213e;border-radius:12px;padding:20px;border:1px solid #0f3460}"
+".card h2{font-size:.9em;color:#888;text-transform:uppercase;letter-spacing:1px;"
+"margin-bottom:12px}"
+".stat{font-size:2em;font-weight:700;color:#fff}"
+".stat-label{font-size:.85em;color:#888;margin-top:4px}"
+".dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}"
+".dot.green{background:#00ff88;box-shadow:0 0 8px #00ff88}"
+".dot.red{background:#ff4444;box-shadow:0 0 8px #ff4444}"
+".row{display:flex;justify-content:space-between;padding:6px 0;"
+"border-bottom:1px solid #0f3460}"
+".row:last-child{border-bottom:none}"
+".btn-row{display:flex;gap:12px;margin-top:8px}"
+".btn{width:48px;height:36px;border-radius:8px;display:flex;align-items:center;"
+"justify-content:center;font-size:.8em;font-weight:700;border:2px solid #333;"
+"background:#222;color:#666;transition:all .15s}"
+".btn.active{background:#00d4ff;color:#000;border-color:#00d4ff}"
+"#error{display:none;background:#ff4444;color:#fff;padding:10px;border-radius:8px;"
+"margin-bottom:16px;text-align:center}"
+"</style></head><body>"
+"<h1>KMBox Relay Dashboard</h1>"
+"<div id=\"error\">Connection lost — retrying...</div>"
+"<div class=\"grid\">"
+"<div class=\"card\"><h2>Serial Connection</h2>"
+"<div><span class=\"dot green\" id=\"ser-dot\"></span>"
+"<span id=\"ser-port\">--</span></div>"
+"<div class=\"row\"><span>Baud Rate</span><span id=\"baud\">--</span></div>"
+"<div class=\"row\"><span>Uptime</span><span id=\"uptime\">--</span></div></div>"
+"<div class=\"card\"><h2>Client Connection</h2>"
+"<div><span class=\"dot red\" id=\"cli-dot\"></span>"
+"<span id=\"cli-status\">Disconnected</span></div>"
+"<div class=\"row\"><span>IP:Port</span><span id=\"cli-addr\">--</span></div>"
+"<div class=\"row\"><span>MAC</span><span id=\"cli-mac\">--</span></div></div>"
+"<div class=\"card\"><h2>Throughput</h2>"
+"<div class=\"stat\" id=\"cps\">0</div>"
+"<div class=\"stat-label\">commands/sec</div>"
+"<div class=\"row\"><span>Received</span><span id=\"recv\">0</span></div>"
+"<div class=\"row\"><span>Translated</span><span id=\"trans\">0</span></div>"
+"<div class=\"row\"><span>Encrypted</span><span id=\"enc\">0</span></div>"
+"<div class=\"row\"><span>Serial Errors</span><span id=\"serr\">0</span></div></div>"
+"<div class=\"card\"><h2>Last Command</h2>"
+"<div class=\"stat\" id=\"last-cmd\" style=\"font-size:1.2em\">--</div>"
+"<h2 style=\"margin-top:16px\">Mouse Buttons</h2>"
+"<div class=\"btn-row\">"
+"<div class=\"btn\" id=\"btn-l\">L</div>"
+"<div class=\"btn\" id=\"btn-m\">M</div>"
+"<div class=\"btn\" id=\"btn-r\">R</div></div></div>"
+"</div>"
+"<script>"
+"function fmt(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';"
+"var h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m'}"
+"function update(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){"
+"document.getElementById('error').style.display='none';"
+"document.getElementById('ser-port').textContent=d.serial_port;"
+"document.getElementById('baud').textContent=d.baud_rate.toLocaleString();"
+"document.getElementById('uptime').textContent=fmt(d.uptime_sec);"
+"var cd=document.getElementById('cli-dot');"
+"var cs=document.getElementById('cli-status');"
+"if(d.client_connected){cd.className='dot green';cs.textContent='Connected'}"
+"else{cd.className='dot red';cs.textContent='Waiting...'}"
+"document.getElementById('cli-addr').textContent="
+"d.client_connected?d.client_ip+':'+d.client_port:'--';"
+"document.getElementById('cli-mac').textContent="
+"d.client_connected?d.client_mac:'--';"
+"document.getElementById('cps').textContent=d.cmds_per_sec.toFixed(1);"
+"document.getElementById('recv').textContent=d.cmds_received.toLocaleString();"
+"document.getElementById('trans').textContent=d.cmds_translated.toLocaleString();"
+"document.getElementById('enc').textContent=d.encrypted_cmds.toLocaleString();"
+"document.getElementById('serr').textContent=d.serial_errors.toLocaleString();"
+"document.getElementById('last-cmd').textContent=d.last_cmd||'--';"
+"var b=d.buttons;"
+"document.getElementById('btn-l').className='btn'+(b&1?' active':'');"
+"document.getElementById('btn-m').className='btn'+(b&4?' active':'');"
+"document.getElementById('btn-r').className='btn'+(b&2?' active':'');"
+"}).catch(function(){document.getElementById('error').style.display='block'})}"
+"setInterval(update,500);update();"
+"</script></body></html>";
+
+/* ========================================================================== */
+/* HTTP Server Helpers                                                        */
+/* ========================================================================== */
+
+static sock_t http_listen(int port) {
+    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCK) return INVALID_SOCK;
+
+    int reuse = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons((uint16_t)port);
+
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        sock_close(s);
+        return INVALID_SOCK;
+    }
+    if (listen(s, 4) != 0) {
+        sock_close(s);
+        return INVALID_SOCK;
+    }
+    set_nonblocking(s);
+    return s;
+}
+
+static void http_send(sock_t s, const char *data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, data + sent, len - sent, 0);
+        if (n <= 0) break;
+        sent += n;
+    }
+}
+
+static void http_send_response(sock_t s, const char *status,
+                                const char *content_type,
+                                const char *body, int body_len) {
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n",
+        status, content_type, body_len);
+    http_send(s, hdr, hlen);
+    http_send(s, body, body_len);
+}
+
+static void http_send_status_json(relay_t *r, sock_t s) {
+    char json[1024];
+    double uptime = time_sec() - r->start_time;
+    char client_ip[64] = "";
+    int client_port = 0;
+    char client_mac[16] = "";
+
+    if (r->client_connected) {
+        snprintf(client_ip, sizeof(client_ip), "%s",
+                 inet_ntoa(r->client_addr.sin_addr));
+        client_port = ntohs(r->client_addr.sin_port);
+        snprintf(client_mac, sizeof(client_mac), "%08X", r->client_mac);
+    }
+
+    int len = snprintf(json, sizeof(json),
+        "{\"serial_port\":\"%s\","
+        "\"baud_rate\":%d,"
+        "\"udp_port\":%d,"
+        "\"client_connected\":%s,"
+        "\"client_ip\":\"%s\","
+        "\"client_port\":%d,"
+        "\"client_mac\":\"%s\","
+        "\"uptime_sec\":%d,"
+        "\"cmds_received\":%llu,"
+        "\"cmds_translated\":%llu,"
+        "\"encrypted_cmds\":%llu,"
+        "\"serial_errors\":%llu,"
+        "\"cmds_per_sec\":%.1f,"
+        "\"last_cmd\":\"%s\","
+        "\"buttons\":%u,"
+        "\"verbose\":%s}",
+        r->serial_port,
+        r->baud_rate,
+        r->udp_port,
+        r->client_connected ? "true" : "false",
+        client_ip,
+        client_port,
+        client_mac,
+        (int)uptime,
+        (unsigned long long)r->cmds_received,
+        (unsigned long long)r->cmds_translated,
+        (unsigned long long)r->encrypted_cmds,
+        (unsigned long long)r->serial_errors,
+        r->cmds_per_sec,
+        r->last_cmd_name,
+        (unsigned)r->last_buttons,
+        r->verbose ? "true" : "false");
+
+    http_send_response(s, "200 OK", "application/json", json, len);
+}
+
+static void http_send_dashboard(sock_t s) {
+    http_send_response(s, "200 OK", "text/html; charset=utf-8",
+                       dashboard_html, (int)(sizeof(dashboard_html) - 1));
+}
+
+static void http_send_404(sock_t s) {
+    const char *body = "404 Not Found";
+    http_send_response(s, "404 Not Found", "text/plain", body, 13);
+}
+
+static void http_handle_request(relay_t *r, sock_t s) {
+    char buf[2048];
+    int total = 0;
+
+    /* Non-blocking read until we get \r\n\r\n or fill buffer */
+    for (int attempt = 0; attempt < 50; attempt++) {
+        int n = recv(s, buf + total, (int)(sizeof(buf) - 1 - total), 0);
+        if (n > 0) {
+            total += n;
+            buf[total] = '\0';
+            if (strstr(buf, "\r\n\r\n")) break;
+        } else if (n == 0) {
+            break; /* Connection closed */
+        } else {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#endif
+                /* No data yet, brief spin */
+                continue;
+            }
+            break; /* Real error */
+        }
+    }
+
+    if (total == 0) return;
+
+    /* Parse request line: GET /path HTTP/1.x */
+    if (strncmp(buf, "GET ", 4) != 0) {
+        http_send_404(s);
+        return;
+    }
+
+    char *path = buf + 4;
+    char *end = strchr(path, ' ');
+    if (!end) { http_send_404(s); return; }
+    *end = '\0';
+
+    /* Route */
+    if (strcmp(path, "/") == 0) {
+        http_send_dashboard(s);
+    } else if (strcmp(path, "/api/status") == 0) {
+        http_send_status_json(r, s);
+    } else {
+        http_send_404(s);
+    }
+}
+
+/* ========================================================================== */
 /* Main Poll Loop                                                             */
 /* ========================================================================== */
 
@@ -755,6 +1022,8 @@ static void run_relay(relay_t *r) {
 
     LOG_BRIDGE("Relay running — UDP port %d, serial %s @ %d baud",
                r->udp_port, r->serial_port, r->baud_rate);
+    if (r->http != INVALID_SOCK)
+        LOG_BRIDGE("[WEB] Dashboard at http://localhost:%d", r->http_port);
     LOG_BRIDGE("Waiting for KMBox Net client connection...");
 
     while (r->running) {
@@ -766,12 +1035,22 @@ static void run_relay(relay_t *r) {
 
 #ifdef _WIN32
         FD_SET(r->udp, &rfds);
+        if (r->http != INVALID_SOCK) FD_SET(r->http, &rfds);
+        if (r->http_client != INVALID_SOCK) FD_SET(r->http_client, &rfds);
         maxfd = 0; /* Windows ignores nfds in select() */
 #else
         FD_SET(r->udp, &rfds);
         if (r->udp > maxfd) maxfd = r->udp;
         FD_SET(r->ser, &rfds);
         if (r->ser > maxfd) maxfd = r->ser;
+        if (r->http != INVALID_SOCK) {
+            FD_SET(r->http, &rfds);
+            if (r->http > maxfd) maxfd = r->http;
+        }
+        if (r->http_client != INVALID_SOCK) {
+            FD_SET(r->http_client, &rfds);
+            if (r->http_client > maxfd) maxfd = r->http_client;
+        }
 #endif
 
         tv.tv_sec = 0;
@@ -814,16 +1093,51 @@ static void run_relay(relay_t *r) {
         }
 #endif
 
-        /* Periodic stats (every 30s) */
+        /* HTTP: accept new connection */
+        if (r->http != INVALID_SOCK && FD_ISSET(r->http, &rfds)) {
+            sock_t client = accept(r->http, NULL, NULL);
+            if (client != INVALID_SOCK) {
+                /* Close any existing connection first */
+                if (r->http_client != INVALID_SOCK)
+                    sock_close(r->http_client);
+                r->http_client = client;
+                set_nonblocking(client);
+            }
+        }
+
+        /* HTTP: handle request from connected client */
+        if (r->http_client != INVALID_SOCK && FD_ISSET(r->http_client, &rfds)) {
+            http_handle_request(r, r->http_client);
+            sock_close(r->http_client);
+            r->http_client = INVALID_SOCK;
+        }
+
+        /* Update rate tracking (once per second) */
         double now = time_sec();
+        double rate_dt = now - r->last_rate_time;
+        if (rate_dt >= 1.0) {
+            uint64_t delta = r->cmds_received - r->cmds_at_last_rate;
+            r->cmds_per_sec = (double)delta / rate_dt;
+            r->cmds_at_last_rate = r->cmds_received;
+            r->last_rate_time = now;
+        }
+
+        /* Periodic stats (every 30s) */
         if (now - last_stats > 30.0) {
-            LOG_BRIDGE("Stats: %llu cmds recv, %llu translated, %llu encrypted, %llu serial errors",
+            LOG_BRIDGE("Stats: %llu cmds recv, %llu translated, %llu encrypted, %llu serial errors (%.1f cmd/s)",
                        (unsigned long long)r->cmds_received,
                        (unsigned long long)r->cmds_translated,
                        (unsigned long long)r->encrypted_cmds,
-                       (unsigned long long)r->serial_errors);
+                       (unsigned long long)r->serial_errors,
+                       r->cmds_per_sec);
             last_stats = now;
         }
+    }
+
+    /* Clean up HTTP client */
+    if (r->http_client != INVALID_SOCK) {
+        sock_close(r->http_client);
+        r->http_client = INVALID_SOCK;
     }
 
     LOG_BRIDGE("Shutting down...");
@@ -843,6 +1157,7 @@ static void usage(const char *prog) {
         "  -p, --port PORT     UDP listen port (default: 9346)\n"
         "  -b, --baud RATE     Serial baud rate (default: 3000000)\n"
         "  -m, --mac MAC       Expected MAC for auth (hex, default: accept any)\n"
+        "  -w, --web PORT      Enable web dashboard (default port: 8080)\n"
         "  -v, --verbose       Log all commands\n"
         "  -h, --help          Show help\n"
         "\n"
@@ -874,6 +1189,7 @@ static int parse_args(relay_t *r, int argc, char **argv) {
     r->baud_rate    = 3000000;
     r->expected_mac = 0;
     r->verbose      = false;
+    r->http_port    = 0; /* 0 = disabled */
     r->serial_port[0] = '\0';
 
     for (int i = 1; i < argc; i++) {
@@ -888,6 +1204,11 @@ static int parse_args(relay_t *r, int argc, char **argv) {
             r->baud_rate = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mac") == 0) && i + 1 < argc) {
             r->expected_mac = parse_mac(argv[++i]);
+        } else if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--web") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                r->http_port = atoi(argv[++i]);
+            else
+                r->http_port = 8080;
         } else if (argv[i][0] != '-') {
             strncpy(r->serial_port, argv[i], sizeof(r->serial_port) - 1);
             r->serial_port[sizeof(r->serial_port) - 1] = '\0';
@@ -916,6 +1237,8 @@ int main(int argc, char **argv) {
     memset(r, 0, sizeof(*r));
     r->ser = INVALID_SER;
     r->udp = INVALID_SOCK;
+    r->http = INVALID_SOCK;
+    r->http_client = INVALID_SOCK;
 
     if (parse_args(r, argc, argv) != 0)
         return 1;
@@ -966,6 +1289,23 @@ int main(int argc, char **argv) {
 
     set_nonblocking(r->udp);
 
+    /* Start HTTP server if requested */
+    if (r->http_port > 0) {
+        r->http = http_listen(r->http_port);
+        if (r->http == INVALID_SOCK) {
+            fprintf(stderr, "Failed to bind HTTP port %d: %s\n",
+                    r->http_port, strerror(errno));
+            sock_close(r->udp);
+            serial_close(r->ser);
+            platform_cleanup();
+            return 1;
+        }
+    }
+
+    /* Initialize timing */
+    r->start_time = time_sec();
+    r->last_rate_time = r->start_time;
+
     /* Install signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -974,6 +1314,7 @@ int main(int argc, char **argv) {
     run_relay(r);
 
     /* Cleanup */
+    if (r->http != INVALID_SOCK) sock_close(r->http);
     sock_close(r->udp);
     serial_close(r->ser);
     platform_cleanup();

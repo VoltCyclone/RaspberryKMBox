@@ -1,0 +1,220 @@
+name: Build CI
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+jobs:
+  build-kmbox:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [metro, pico2]
+        include:
+          - target: metro
+            board: adafruit_metro_rp2350
+            platform: rp2350-arm-s
+            artifact_name: PIOKMbox-MetroRP2350
+          - target: pico2
+            board: pico2
+            platform: rp2350-arm-s
+            artifact_name: PIOKMbox-Pico2
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up ARM toolchain
+      uses: carlosperate/arm-none-eabi-gcc-action@v1
+      with:
+        release: '14.2.Rel1'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+    - name: Cache Pico SDK
+      id: cache-pico-sdk
+      uses: actions/cache@v4
+      with:
+        path: ~/pico-sdk
+        key: pico-sdk-2.2.0
+
+    - name: Install Pico SDK
+      if: steps.cache-pico-sdk.outputs.cache-hit != 'true'
+      run: |
+        cd ~
+        git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git
+        cd pico-sdk
+        git submodule update --init
+
+    - name: Configure and build
+      env:
+        PICO_SDK_PATH: ${{ github.workspace }}/../../pico-sdk
+      run: |
+        export PICO_SDK_PATH=$HOME/pico-sdk
+        mkdir -p build-${{ matrix.target }}
+        cd build-${{ matrix.target }}
+        cmake .. \
+          -DPICO_SDK_PATH=$PICO_SDK_PATH \
+          -DPICO_BOARD=${{ matrix.board }} \
+          -DPICO_PLATFORM=${{ matrix.platform }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -G Ninja
+        ninja
+
+    - name: Verify build outputs
+      run: |
+        cd build-${{ matrix.target }}
+        if [ ! -f "PIOKMbox.uf2" ]; then
+          echo "ERROR: PIOKMbox.uf2 not found!"
+          exit 1
+        fi
+        echo "Build successful for ${{ matrix.board }}:"
+        ls -la PIOKMbox.uf2 PIOKMbox.elf 2>/dev/null
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}-${{ github.sha }}
+        path: |
+          build-${{ matrix.target }}/PIOKMbox.uf2
+          build-${{ matrix.target }}/PIOKMbox.elf
+        retention-days: 7
+
+  build-bridge:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [metro, feather]
+        include:
+          - target: metro
+            board: adafruit_metro_rp2350
+            artifact_name: KMBox-Bridge-MetroRP2350
+          - target: feather
+            board: adafruit_feather_rp2350
+            artifact_name: KMBox-Bridge-FeatherRP2350
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up ARM toolchain
+      uses: carlosperate/arm-none-eabi-gcc-action@v1
+      with:
+        release: '14.2.Rel1'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+    - name: Cache Pico SDK
+      id: cache-pico-sdk
+      uses: actions/cache@v4
+      with:
+        path: ~/pico-sdk
+        key: pico-sdk-2.2.0
+
+    - name: Install Pico SDK
+      if: steps.cache-pico-sdk.outputs.cache-hit != 'true'
+      run: |
+        cd ~
+        git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git
+        cd pico-sdk
+        git submodule update --init
+
+    - name: Configure and build bridge
+      run: |
+        export PICO_SDK_PATH=$HOME/pico-sdk
+        mkdir -p bridge/build-${{ matrix.target }}
+        cd bridge/build-${{ matrix.target }}
+        cmake .. \
+          -DPICO_SDK_PATH=$PICO_SDK_PATH \
+          -DPICO_BOARD=${{ matrix.board }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -G Ninja
+        ninja
+
+    - name: Verify bridge build outputs
+      run: |
+        cd bridge/build-${{ matrix.target }}
+        if [ ! -f "kmbox_bridge.uf2" ]; then
+          echo "ERROR: kmbox_bridge.uf2 not found!"
+          exit 1
+        fi
+        echo "Build successful for Bridge (${{ matrix.board }}):"
+        ls -la kmbox_bridge.uf2 kmbox_bridge.elf 2>/dev/null
+
+    - name: Upload bridge artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}-${{ github.sha }}
+        path: |
+          bridge/build-${{ matrix.target }}/kmbox_bridge.uf2
+          bridge/build-${{ matrix.target }}/kmbox_bridge.elf
+        retention-days: 7
+
+  build-tools:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install mingw-w64
+      run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+    - name: Build kmbox_relay for Windows
+      run: |
+        cd tools
+        x86_64-w64-mingw32-gcc -Wall -Wextra -O2 \
+          -I../lib/wire-protocol/include \
+          -o kmbox_relay.exe kmbox_relay.c -lws2_32
+        echo "Build successful:"
+        ls -la kmbox_relay.exe
+
+    - name: Build kmbox_relay for Linux
+      run: |
+        cd tools
+        gcc -Wall -Wextra -O2 \
+          -I../lib/wire-protocol/include \
+          -o kmbox_relay kmbox_relay.c
+        echo "Build successful:"
+        ls -la kmbox_relay
+
+    - name: Upload Windows binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmbox-relay-windows-${{ github.sha }}
+        path: tools/kmbox_relay.exe
+        retention-days: 7
+
+    - name: Upload Linux binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmbox-relay-linux-${{ github.sha }}
+        path: tools/kmbox_relay
+        retention-days: 7
+
+  summary:
+    if: always()
+    needs: [build-kmbox, build-bridge, build-tools]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Build Summary
+      run: |
+        echo "## CI Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Target | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| KMBox Metro RP2350 | ${{ needs.build-kmbox.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| KMBox Pico 2 | ${{ needs.build-kmbox.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Bridge Metro RP2350 | ${{ needs.build-bridge.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Bridge Feather RP2350 | ${{ needs.build-bridge.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| KMBox Relay (Windows) | ${{ needs.build-tools.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| KMBox Relay (Linux) | ${{ needs.build-tools.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
