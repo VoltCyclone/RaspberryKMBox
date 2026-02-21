@@ -241,6 +241,12 @@ if [ -z "$TARGET" ]; then
     TARGET="flash-metros"
 fi
 
+# Ensure submodules are initialized
+if [ ! -f "$SCRIPT_DIR/lib/Pico-PIO-USB/CMakeLists.txt" ]; then
+    echo -e "${YELLOW}Initializing git submodules...${NC}"
+    git -C "$SCRIPT_DIR" submodule update --init --recursive
+fi
+
 # Execute build
 cd "$SCRIPT_DIR"
 

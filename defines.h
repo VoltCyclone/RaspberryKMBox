@@ -412,10 +412,7 @@ typedef struct __attribute__((packed)) {
 
 // Humanization mode colors (for button mode switching)
 #define COLOR_HUMANIZATION_OFF          0xFF0000  // Red - no humanization
-#define COLOR_HUMANIZATION_LOW          0xFFAA00  // Orange - low humanization (deprecated, use MICRO)
 #define COLOR_HUMANIZATION_MICRO        0xFFFF00  // Yellow - micro-noise only (pre-humanized input)
-#define COLOR_HUMANIZATION_MEDIUM       0xAAFF00  // Yellow-green - medium (deprecated, use FULL)
-#define COLOR_HUMANIZATION_HIGH         0x00FF00  // Green - high (deprecated, use FULL)
 #define COLOR_HUMANIZATION_FULL         0x00FF00  // Green - full humanization (raw input)
 
 // Brightness constants
@@ -509,22 +506,12 @@ typedef struct __attribute__((packed)) {
 // LOGGING CONFIGURATION
 //--------------------------------------------------------------------+
 
-#if BUILD_CONFIG == BUILD_CONFIG_PRODUCTION
-    #define ENABLE_VERBOSE_LOGGING      0
-    #define ENABLE_INIT_LOGGING         0
-    #define ENABLE_ERROR_LOGGING        0
-    #define ENABLE_STATS_LOGGING        0
-#elif BUILD_CONFIG == BUILD_CONFIG_TESTING
-    #define ENABLE_VERBOSE_LOGGING      0
-    #define ENABLE_INIT_LOGGING         0
-    #define ENABLE_ERROR_LOGGING        0
-    #define ENABLE_STATS_LOGGING        0
-#else // Development and Debug
-    #define ENABLE_VERBOSE_LOGGING      0
-    #define ENABLE_INIT_LOGGING         0
-    #define ENABLE_ERROR_LOGGING        0
-    #define ENABLE_STATS_LOGGING        0
-#endif
+// Logging flags — set to 1 to enable per-category printf output.
+// All disabled by default to minimize code size and UART noise.
+#define ENABLE_VERBOSE_LOGGING      0
+#define ENABLE_INIT_LOGGING         0
+#define ENABLE_ERROR_LOGGING        0
+#define ENABLE_STATS_LOGGING        0
 
 //--------------------------------------------------------------------+
 // CONDITIONAL COMPILATION MACROS

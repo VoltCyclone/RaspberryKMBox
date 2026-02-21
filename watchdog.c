@@ -7,9 +7,6 @@
 #include "defines.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
-#include "hardware/gpio.h"
-#include "pico/multicore.h"
-#include "pico/time.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -38,14 +35,11 @@ static uint32_t get_time_ms(void) {
     return to_ms_since_boot(get_absolute_time());
 }
 
-/**
- * Update hardware watchdog timer
- */
-static void update_hardware_watchdog(void) {
+static void update_hardware_watchdog(uint32_t current_time) {
     if (WATCHDOG_ENABLE_HARDWARE) {
         watchdog_update();
         g_watchdog_status.hardware_updates++;
-        g_last_hardware_update_ms = get_time_ms();
+        g_last_hardware_update_ms = current_time;
     }
 }
 
@@ -62,27 +56,17 @@ static bool is_core_responsive(uint32_t last_heartbeat_ms, uint32_t current_time
     return time_since_heartbeat <= WATCHDOG_CORE_TIMEOUT_MS;
 }
 
-/**
- * Handle timeout warning
- */
-static void handle_timeout_warning(int core_num, uint32_t time_since_heartbeat) {
-    (void)core_num;
+static void handle_timeout_warning(void) {
     g_watchdog_status.timeout_warnings++;
-
-    if (time_since_heartbeat > WATCHDOG_CORE_TIMEOUT_MS * 2) {
-        // System is severely unresponsive, prepare for reset
-    }
 }
 
 /**
  * Check inter-core health and update status
  */
-static void check_inter_core_health(void) {
+static void check_inter_core_health(uint32_t current_time) {
     if (!WATCHDOG_ENABLE_INTER_CORE) {
         return;
     }
-    
-    uint32_t current_time = get_time_ms();
     
     // Update heartbeat times from volatile variables
     g_watchdog_status.core0_last_heartbeat_ms = g_core0_heartbeat_timestamp;
@@ -94,8 +78,7 @@ static void check_inter_core_health(void) {
         g_watchdog_status.core0_last_heartbeat_ms, current_time);
     
     if (!g_watchdog_status.core0_responsive && core0_was_responsive) {
-        uint32_t time_since = current_time - g_watchdog_status.core0_last_heartbeat_ms;
-        handle_timeout_warning(0, time_since);
+        handle_timeout_warning();
     }
     
     // Check core 1 responsiveness
@@ -104,8 +87,7 @@ static void check_inter_core_health(void) {
         g_watchdog_status.core1_last_heartbeat_ms, current_time);
     
     if (!g_watchdog_status.core1_responsive && core1_was_responsive) {
-        uint32_t time_since = current_time - g_watchdog_status.core1_last_heartbeat_ms;
-        handle_timeout_warning(1, time_since);
+        handle_timeout_warning();
     }
     
     // Update overall system health
@@ -172,63 +154,22 @@ void watchdog_start(void) {
         return;
     }
     
-    // Extended delay to ensure system is fully stable before starting watchdog
-    // This is critical for cold boot scenarios where initialization takes longer
-    printf("Watchdog: Waiting for extended system stabilization (cold boot safety)...\n");
-    printf("Extended stabilization progress:\n");
-    for (int i = 0; i < 30; i++) {
-        printf("Stabilization: %d/30 (%.1fs remaining)\n", i+1, (30-i-1) * 0.1f);
-        watchdog_core0_heartbeat();  // Send heartbeat during wait
-        // Blink LED during extended stabilization - very slow blink
-        gpio_put(PIN_LED, (i % 4 < 2) ? 1 : 0);  // 2 on, 2 off pattern
-        sleep_ms(100);
-    }
-    gpio_put(PIN_LED, 1);  // LED on after stabilization
-    printf("Extended stabilization complete\n");
-    
+    // Brief stabilization delay for cold boot scenarios
+    sleep_ms(200);
+    watchdog_core0_heartbeat();
+
     if (WATCHDOG_ENABLE_HARDWARE) {
-        // Enable hardware watchdog with specified timeout
-        printf("Watchdog: Enabling hardware watchdog with %d ms timeout...\n",
-               WATCHDOG_HARDWARE_TIMEOUT_MS);
-        
-        // Try enabling watchdog with retry logic for cold boot robustness
-        bool watchdog_enabled = false;
-        for (int attempt = 0; attempt < 3; attempt++) {
-            watchdog_enable(WATCHDOG_HARDWARE_TIMEOUT_MS, true);
-            sleep_ms(100);  // Small delay to let it settle
-            watchdog_enabled = true;  // Assume success since watchdog_enable doesn't return status
-            printf("Watchdog: Hardware watchdog enabled (attempt %d)\n", attempt + 1);
-            break;
-        }
-        
-        if (!watchdog_enabled) {
-            printf("Watchdog: WARNING - Failed to enable hardware watchdog\n");
-        }
+        watchdog_enable(WATCHDOG_HARDWARE_TIMEOUT_MS, true);
     }
-    
+
     g_watchdog_started = true;
     g_last_hardware_update_ms = get_time_ms();
-    
-    // Send initial heartbeats to establish baseline with delay
+
+    // Send initial heartbeat to establish baseline
     watchdog_core0_heartbeat();
-    sleep_ms(100);
-    
-    // Give cores time to start sending regular heartbeats
-    printf("Watchdog: Allowing cores to establish heartbeat rhythm...\n");
-    for (int i = 0; i < 20; i++) {
-        printf("Heartbeat rhythm establishment: %d/20 (%.1fs remaining)\n", i+1, (20-i-1) * 0.1f);
-        watchdog_core0_heartbeat();  // Send heartbeat during wait
-        // Blink LED during heartbeat establishment - medium blink
-        gpio_put(PIN_LED, (i % 3 < 1) ? 1 : 0);  // 1 on, 2 off pattern
-        sleep_ms(100);
-    }
-    gpio_put(PIN_LED, 1);  // LED on after heartbeat establishment
-    printf("Heartbeat rhythm established\n");
-    
+
     if (g_debug_enabled) {
-        printf("Watchdog: Started successfully with enhanced cold boot protection\n");
-    } else {
-        printf("Watchdog: Started successfully\n");
+        printf("Watchdog: Started (hardware timeout: %d ms)\n", WATCHDOG_HARDWARE_TIMEOUT_MS);
     }
 }
 
@@ -288,14 +229,14 @@ void watchdog_task(void) {
     }
     
     uint32_t current_time = get_time_ms();
-    
+
     // Update hardware watchdog at regular intervals
     if (current_time - g_last_hardware_update_ms >= WATCHDOG_UPDATE_INTERVAL_MS) {
-        update_hardware_watchdog();
+        update_hardware_watchdog(current_time);
     }
-    
+
     // Check inter-core health
-    check_inter_core_health();
+    check_inter_core_health(current_time);
 }
 
 watchdog_status_t watchdog_get_status(void) {

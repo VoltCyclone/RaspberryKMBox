@@ -78,8 +78,11 @@ This allows bidirectional communication for KMBox commands and display data.
 ### 1. Clone and Build
 
 ```bash
-git clone https://github.com/ramseymcgrath/RaspberryKMBox.git
+git clone --recursive https://github.com/ramseymcgrath/RaspberryKMBox.git
 cd RaspberryKMBox
+
+# If you already cloned without --recursive:
+git submodule update --init --recursive
 
 # Build options:
 ./build.sh metro          # Main KMBox for Metro RP2350

@@ -1,0 +1,288 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - production
+          - testing
+
+jobs:
+  build-kmbox:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [metro, pico2]
+        include:
+          - target: metro
+            board: adafruit_metro_rp2350
+            platform: rp2350-arm-s
+            label: MetroRP2350
+          - target: pico2
+            board: pico2
+            platform: rp2350-arm-s
+            label: Pico2
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up ARM toolchain
+      uses: carlosperate/arm-none-eabi-gcc-action@v1
+      with:
+        release: '14.2.Rel1'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+    - name: Cache Pico SDK
+      id: cache-pico-sdk
+      uses: actions/cache@v4
+      with:
+        path: ~/pico-sdk
+        key: pico-sdk-2.2.0
+
+    - name: Install Pico SDK
+      if: steps.cache-pico-sdk.outputs.cache-hit != 'true'
+      run: |
+        cd ~
+        git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git
+        cd pico-sdk
+        git submodule update --init
+
+    - name: Determine build config
+      id: config
+      run: |
+        if [ "${{ github.event.inputs.release_type }}" = "production" ]; then
+          echo "build_config=BUILD_CONFIG_PRODUCTION" >> $GITHUB_OUTPUT
+        elif [ "${{ github.event.inputs.release_type }}" = "testing" ]; then
+          echo "build_config=BUILD_CONFIG_TESTING" >> $GITHUB_OUTPUT
+        else
+          echo "build_config=BUILD_CONFIG_DEVELOPMENT" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Configure and build
+      run: |
+        export PICO_SDK_PATH=$HOME/pico-sdk
+        mkdir -p build-${{ matrix.target }}
+        cd build-${{ matrix.target }}
+        cmake .. \
+          -DPICO_SDK_PATH=$PICO_SDK_PATH \
+          -DPICO_BOARD=${{ matrix.board }} \
+          -DPICO_PLATFORM=${{ matrix.platform }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_FLAGS="-D${{ steps.config.outputs.build_config }}" \
+          -G Ninja
+        ninja
+
+    - name: Verify build outputs
+      run: |
+        cd build-${{ matrix.target }}
+        if [ ! -f "PIOKMbox.uf2" ]; then
+          echo "ERROR: PIOKMbox.uf2 not found!"
+          exit 1
+        fi
+        echo "Build successful for ${{ matrix.label }}:"
+        ls -la PIOKMbox.uf2 PIOKMbox.elf 2>/dev/null
+
+    - name: Prepare release artifacts
+      run: |
+        mkdir -p release-artifacts
+        cp build-${{ matrix.target }}/PIOKMbox.uf2 release-artifacts/PIOKMbox-${{ matrix.label }}.uf2
+        cp build-${{ matrix.target }}/PIOKMbox.elf release-artifacts/PIOKMbox-${{ matrix.label }}.elf
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: PIOKMbox-${{ matrix.label }}
+        path: release-artifacts/
+        retention-days: 30
+
+  build-bridge:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [metro, feather]
+        include:
+          - target: metro
+            board: adafruit_metro_rp2350
+            label: Bridge-MetroRP2350
+          - target: feather
+            board: adafruit_feather_rp2350
+            label: Bridge-FeatherRP2350
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up ARM toolchain
+      uses: carlosperate/arm-none-eabi-gcc-action@v1
+      with:
+        release: '14.2.Rel1'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+    - name: Cache Pico SDK
+      id: cache-pico-sdk
+      uses: actions/cache@v4
+      with:
+        path: ~/pico-sdk
+        key: pico-sdk-2.2.0
+
+    - name: Install Pico SDK
+      if: steps.cache-pico-sdk.outputs.cache-hit != 'true'
+      run: |
+        cd ~
+        git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git
+        cd pico-sdk
+        git submodule update --init
+
+    - name: Configure and build bridge
+      run: |
+        export PICO_SDK_PATH=$HOME/pico-sdk
+        mkdir -p bridge/build-${{ matrix.target }}
+        cd bridge/build-${{ matrix.target }}
+        cmake .. \
+          -DPICO_SDK_PATH=$PICO_SDK_PATH \
+          -DPICO_BOARD=${{ matrix.board }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -G Ninja
+        ninja
+
+    - name: Verify bridge build outputs
+      run: |
+        cd bridge/build-${{ matrix.target }}
+        if [ ! -f "kmbox_bridge.uf2" ]; then
+          echo "ERROR: kmbox_bridge.uf2 not found!"
+          exit 1
+        fi
+        echo "Build successful for Bridge (${{ matrix.board }}):"
+        ls -la kmbox_bridge.uf2 kmbox_bridge.elf 2>/dev/null
+
+    - name: Prepare bridge release artifacts
+      run: |
+        mkdir -p release-artifacts
+        cp bridge/build-${{ matrix.target }}/kmbox_bridge.uf2 release-artifacts/KMBox-${{ matrix.label }}.uf2
+        cp bridge/build-${{ matrix.target }}/kmbox_bridge.elf release-artifacts/KMBox-${{ matrix.label }}.elf
+
+    - name: Upload bridge build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: KMBox-${{ matrix.label }}
+        path: release-artifacts/
+        retention-days: 30
+
+  build-tools:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install mingw-w64
+      run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+    - name: Build kmbox_relay for Windows
+      run: |
+        cd tools
+        x86_64-w64-mingw32-gcc -Wall -Wextra -O2 \
+          -I../lib/wire-protocol/include \
+          -o kmbox_relay.exe kmbox_relay.c -lws2_32
+
+    - name: Build kmbox_relay for Linux
+      run: |
+        cd tools
+        gcc -Wall -Wextra -O2 \
+          -I../lib/wire-protocol/include \
+          -o kmbox_relay kmbox_relay.c
+
+    - name: Prepare release artifacts
+      run: |
+        mkdir -p release-artifacts
+        cp tools/kmbox_relay.exe release-artifacts/
+        cp tools/kmbox_relay release-artifacts/kmbox_relay-linux
+
+    - name: Upload tool artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: KMBox-Relay-Tools
+        path: release-artifacts/
+        retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-kmbox, build-bridge, build-tools]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-artifacts
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        find all-artifacts -name "*.uf2" -exec cp {} release/ \;
+        find all-artifacts -name "*.elf" -exec cp {} release/ \;
+        find all-artifacts -name "kmbox_relay*" -exec cp {} release/ \;
+        echo "Release contents:"
+        ls -la release/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: PIOKMBox ${{ github.ref_name }}
+        draft: false
+        prerelease: ${{ contains(github.ref_name, '-') }}
+        generate_release_notes: true
+        body: |
+          ## Firmware Binaries
+
+          | File | Board | Description |
+          |------|-------|-------------|
+          | `PIOKMbox-MetroRP2350.uf2` | Adafruit Metro RP2350 | Main KMBox USB proxy |
+          | `PIOKMbox-Pico2.uf2` | Raspberry Pi Pico 2 | Main KMBox USB proxy |
+          | `KMBox-Bridge-MetroRP2350.uf2` | Adafruit Metro RP2350 | Bridge with ILI9341 TFT display |
+          | `KMBox-Bridge-FeatherRP2350.uf2` | Adafruit Feather RP2350 | Minimal latency bridge |
+
+          ## Host Tools
+
+          | File | Platform | Description |
+          |------|----------|-------------|
+          | `kmbox_relay.exe` | Windows x64 | KMBox Net UDP relay (connects KMBox Net clients to bridge over serial) |
+          | `kmbox_relay-linux` | Linux x64 | KMBox Net UDP relay |
+
+          ## Flash Instructions
+
+          1. Hold **BOOTSEL** while connecting the board via USB
+          2. Copy the appropriate `.uf2` file to the mounted **RPI-RP2** drive
+          3. Board reboots automatically
+
+          See [README](https://github.com/${{ github.repository }}#readme) for wiring and setup details.
+        files: |
+          release/PIOKMbox-MetroRP2350.uf2
+          release/PIOKMbox-Pico2.uf2
+          release/KMBox-Bridge-MetroRP2350.uf2
+          release/KMBox-Bridge-FeatherRP2350.uf2
+          release/kmbox_relay.exe
+          release/kmbox_relay-linux
+        token: ${{ secrets.GITHUB_TOKEN }}

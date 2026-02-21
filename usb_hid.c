@@ -17,7 +17,8 @@
 #include "xbox_gip.h"           // Xbox mode flag
 #include "xbox_device.h"        // Xbox device descriptors
 #include <string.h>             // For strcpy, strlen, memset
-#include <math.h>                // For sqrtf
+#include <math.h>                // For sqrtf, roundf
+#include "pico/rand.h"           // For get_rand_32() hardware TRNG
 
 uint16_t attached_vid = 0;
 uint16_t attached_pid = 0;
@@ -292,6 +293,36 @@ static volatile uint8_t last_sent_buttons = 0;
 // final zero-delta "stop" report on the active→idle edge.
 static volatile bool was_active = false;
 
+//--------------------------------------------------------------------+
+// Output-stage PRNG (xorshift32, independent from smooth_injection.c)
+//--------------------------------------------------------------------+
+static uint32_t hid_rng_state = 0;
+
+static void hid_rng_seed(uint32_t seed) {
+    hid_rng_state = seed ? seed : 0xDEADBEEF;
+}
+
+static inline uint32_t hid_rng_next(void) {
+    uint32_t x = hid_rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    hid_rng_state = x;
+    return x;
+}
+
+// Gaussian approximation via CLT: sum of 4 uniform [0,1) values → ~N(2,1/√3)
+// Normalized to ~N(0,1) by subtracting 2 and scaling.
+static inline float hid_rng_gaussian(void) {
+    const float scale = 1.0f / 4294967296.0f;  // 1/(2^32)
+    float sum = (float)hid_rng_next() * scale
+              + (float)hid_rng_next() * scale
+              + (float)hid_rng_next() * scale
+              + (float)hid_rng_next() * scale;
+    // sum ∈ [0,4), mean=2, stddev≈0.577; normalize to ~N(0,1)
+    return (sum - 2.0f) * 1.7320508f;  // 1/0.577 ≈ √3
+}
+
 // Device management helpers
 static void handle_device_disconnection(uint8_t dev_addr);
 static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol);
@@ -303,6 +334,24 @@ static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 // Humanization helpers
 static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x, int16_t injected_y);
 static inline int8_t clamp_i8(int32_t val);
+
+// Stochastic rounding: a value of 0.3 rounds to 1 with 30% probability, 0 with 70%.
+// This preserves the statistical mean while making sub-pixel tremor actually visible
+// in the output — deterministic roundf() kills any tremor < 0.5px.
+static inline int16_t stochastic_round(float v) {
+    if (v >= 0.0f) {
+        int16_t floor_v = (int16_t)v;
+        float frac = v - (float)floor_v;
+        float r = (float)(hid_rng_next() & 0xFFFF) * (1.0f / 65536.0f);
+        return floor_v + (r < frac ? 1 : 0);
+    } else {
+        float abs_v = -v;
+        int16_t floor_v = (int16_t)abs_v;
+        float frac = abs_v - (float)floor_v;
+        float r = (float)(hid_rng_next() & 0xFFFF) * (1.0f / 65536.0f);
+        return -(floor_v + (r < frac ? 1 : 0));
+    }
+}
 
 // --- Runtime HID descriptor mirroring storage & helpers ---
 // Gaming mice (Razer, Logitech, SteelSeries) can have very large HID
@@ -574,10 +623,12 @@ static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x
     float magnitude = total_mag;
     
     // Mode-dependent intensity scaling
+    // MICRO was 0.5x which, combined with 0.5px base jitter, gave only 0.25px
+    // effective tremor — too small to survive even stochastic rounding consistently.
     float mode_scale = 1.0f;
     switch (mode) {
         case HUMANIZATION_MICRO:
-            mode_scale = 0.5f;
+            mode_scale = 0.75f;
             break;
         case HUMANIZATION_FULL:
             mode_scale = 1.0f;
@@ -590,7 +641,14 @@ static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x
     float movement_scale = humanization_jitter_scale(magnitude);
     float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
     float tremor_scale = base_jitter * movement_scale * mode_scale * blend;
-    
+
+    // Scale noise DOWN at low velocities to prevent overwhelming the signal.
+    // At 1-2 count deltas, ±1 of tremor is 50-100% perturbation, creating
+    // chaotic scribble instead of smooth slow transitions.
+    // Ramp: 0 at 0px → full at 4px
+    float low_speed_scale = fminf(1.0f, magnitude / 4.0f);
+    tremor_scale *= low_speed_scale;
+
     // Get runtime tremor (layered oscillators + noise)
     float tremor_x, tremor_y;
     humanization_get_tremor(tremor_scale, &tremor_x, &tremor_y);
@@ -610,14 +668,28 @@ static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x
         float para_dx = norm_x * tremor_x * 0.3f;
         float para_dy = norm_y * tremor_x * 0.3f;
         
-        // Apply tremor to output (with rounding)
-        *x = (int16_t)(*x + (int16_t)(perp_dx + para_dx + 0.5f));
-        *y = (int16_t)(*y + (int16_t)(perp_dy + para_dy + 0.5f));
+        // Apply tremor to output (stochastic rounding so sub-pixel tremor
+        // probabilistically produces visible ±1 counts instead of always 0)
+        *x = (int16_t)(*x + stochastic_round(perp_dx + para_dx));
+        *y = (int16_t)(*y + stochastic_round(perp_dy + para_dy));
     } else {
         // Small/idle movement with injection active: apply tremor as raw X/Y
-        *x += (int16_t)(tremor_x + 0.5f);
-        *y += (int16_t)(tremor_y + 0.5f);
+        *x += stochastic_round(tremor_x);
+        *y += stochastic_round(tremor_y);
     }
+}
+
+// Sensor noise: gaussian-based quantization noise with stochastic rounding.
+// Real optical sensors have continuous noise that maps to discrete count
+// perturbations. Using a continuous gaussian source ensures consecutive
+// identical underlying deltas get DIFFERENT noise samples, reducing repeats.
+// Always-±1 binary noise has P(match)=50% — worse than {-1,0,+1} was.
+static inline int16_t apply_sensor_noise(int16_t value) {
+    if (value == 0) return 0;  // stationary sensor produces no noise
+    // Gaussian with stddev ~0.7 → mostly ±1, sometimes ±2 or 0.
+    // Continuous source means consecutive values are decorrelated.
+    float noise = hid_rng_gaussian() * 0.7f;
+    return value + stochastic_round(noise);
 }
 
 // Minimal HID descriptor parser — extracts report field layout for the mouse
@@ -1176,6 +1248,9 @@ bool usb_hid_init(void)
     // Initialize per-instance HID tracking
     memset(hid_instances, 0, sizeof(hid_instances));
 
+    // Seed output-stage PRNG from hardware TRNG
+    hid_rng_seed(get_rand_32());
+
     // Build default runtime HID report descriptor (keyboard + default mouse + consumer)
     build_runtime_hid_report_with_mouse(NULL, 0);
 
@@ -1586,12 +1661,22 @@ void hid_device_task(void)
     // Xbox mode: skip HID device task entirely, xbox_device_task handles it
     if (g_xbox_mode) return;
 
-    // Use cheap microsecond timer for 1ms precision polling
+    // Use cheap microsecond timer for polling with optional jitter.
+    // Real mice have crystal/scheduling jitter; perfectly regular 1ms is detectable.
     static uint32_t start_us = 0;
+    static int32_t jitter_us = 0;  // per-frame jitter offset (set after each send)
     uint32_t current_us = time_us_32();
     uint32_t elapsed_us = current_us - start_us;
 
-    if (elapsed_us < (HID_DEVICE_TASK_INTERVAL_MS * 1000u))
+    // CRITICAL: Signed arithmetic to avoid uint32 wrap when jitter is negative.
+    // E.g., 1000 + (uint32_t)(-1500) wraps to ~4 billion, clamped to 4000 — WRONG.
+    // Signed: 1000 + (-1500) = -500, clamped to 500 — CORRECT.
+    int32_t interval_signed = (int32_t)(HID_DEVICE_TASK_INTERVAL_MS * 1000) + jitter_us;
+    if (interval_signed < 500) interval_signed = 500;
+    if (interval_signed > 2500) interval_signed = 2500;
+    uint32_t interval_us = (uint32_t)interval_signed;
+
+    if (elapsed_us < interval_us)
     {
         return; // Not enough time elapsed
     }
@@ -1668,6 +1753,36 @@ void hid_device_task(void)
             }
         }
 
+        // All output-stage noise is scaled by movement magnitude to prevent
+        // overwhelming low-speed signals.  At 1-2 counts, ±1 noise is 50-100%
+        // perturbation, creating chaotic scribble.
+        if (smooth_get_humanization_mode() != HUMANIZATION_OFF &&
+            (x != 0 || y != 0)) {
+            float out_mag = sqrtf((float)x * x + (float)y * y);
+            float noise_gate = fminf(1.0f, out_mag / 4.0f);  // ramp 0→1 over [0,4]px
+
+            // Sub-pixel quantization noise: real sensors accumulate fractional
+            // pixel residuals that occasionally leak as ±1 count perturbations.
+            // Accumulator stddev 0.45 → crosses ±1 roughly every 3-5 frames
+            // during fast movement, producing 3-8% sub-pixel noise.
+            static float subpx_accum_x = 0.0f;
+            static float subpx_accum_y = 0.0f;
+            float subpx_noise = 0.45f * noise_gate;
+            subpx_accum_x += hid_rng_gaussian() * subpx_noise;
+            subpx_accum_y += hid_rng_gaussian() * subpx_noise;
+            if (subpx_accum_x >= 1.0f) { x += 1; subpx_accum_x -= 1.0f; }
+            else if (subpx_accum_x <= -1.0f) { x -= 1; subpx_accum_x += 1.0f; }
+            if (subpx_accum_y >= 1.0f) { y += 1; subpx_accum_y -= 1.0f; }
+            else if (subpx_accum_y <= -1.0f) { y -= 1; subpx_accum_y += 1.0f; }
+
+            // Sensor noise: gaussian-based, also scaled by magnitude.
+            // Only apply when movement is large enough that noise won't dominate.
+            if (noise_gate > 0.25f) {
+                x = apply_sensor_noise(x);
+                y = apply_sensor_noise(y);
+            }
+        }
+
         // Send if there's any movement, wheel, OR button state to report.
         if (x != 0 || y != 0 || wheel != 0 || buttons != 0 || buttons_changed) {
             // Build raw report matching host mouse descriptor when available.
@@ -1694,6 +1809,19 @@ void hid_device_task(void)
             }
             last_sent_buttons = buttons;
             was_active = true;
+
+            // Compute next frame's timing jitter.
+            // Always jitter when humanization is active — perfectly regular 1ms
+            // intervals are a fingerprint regardless of physical mouse state.
+            // Real USB polling has crystal oscillator drift + OS scheduling jitter.
+            if (smooth_get_humanization_mode() != HUMANIZATION_OFF) {
+                // Gaussian jitter, stddev ~350us → CV ≈ 0.35 on 1000us base.
+                // Smaller than before to avoid excessive clamping; range is
+                // roughly ±700us (95th percentile), keeping interval in [500, 2000].
+                jitter_us = (int32_t)(hid_rng_gaussian() * 350.0f);
+            } else {
+                jitter_us = 0;
+            }
             return;
         }
     }

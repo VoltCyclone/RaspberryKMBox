@@ -12,8 +12,14 @@ set(PICO_PLATFORM rp2350-arm-s)
 # Custom board headers (for adafruit_metro_rp2350)
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/../boards)
 
-# Import Pico SDK
-set(PICO_SDK_PATH $ENV{HOME}/.pico-sdk/sdk/2.2.0-fresh)
+# Import Pico SDK — prefer cmake -D, then env var, then default local path
+if(NOT DEFINED PICO_SDK_PATH)
+    if(DEFINED ENV{PICO_SDK_PATH})
+        set(PICO_SDK_PATH $ENV{PICO_SDK_PATH})
+    else()
+        set(PICO_SDK_PATH $ENV{HOME}/.pico-sdk/sdk/2.2.0-fresh)
+    endif()
+endif()
 include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
 
 project(kmbox_bridge C CXX ASM)
