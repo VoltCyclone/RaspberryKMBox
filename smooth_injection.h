@@ -24,8 +24,8 @@
 //--------------------------------------------------------------------+
 
 // Maximum movement per HID frame (prevents jarring jumps)
-// At 125Hz (8ms), 16 pixels/frame = ~2000 pixels/sec max smooth speed
-#define SMOOTH_MAX_PER_FRAME        16
+// Mode configs override this default. Sized for high-DPI mice (26000+ DPI).
+#define SMOOTH_MAX_PER_FRAME        127
 
 // Movement queue size (number of pending inject operations)
 #define SMOOTH_QUEUE_SIZE           64
@@ -42,29 +42,30 @@
 // Injection Modes
 //--------------------------------------------------------------------+
 
+// This enum is the canonical typed definition on the KMBox side.
+// fast_protocol.h also defines INJECT_MODE_* as macros for the bridge
+// side (which doesn't include this header). We undef any existing macros
+// (in case fast_protocol.h was included first via defines.h) and set
+// _INJECT_MODES_DEFINED to prevent fast_protocol.h from (re)defining them.
+#undef INJECT_MODE_IMMEDIATE
+#undef INJECT_MODE_SMOOTH
+#undef INJECT_MODE_VELOCITY_MATCHED
+#undef INJECT_MODE_MICRO
+#define _INJECT_MODES_DEFINED
+
 typedef enum {
     // Immediate: Add directly to accumulator (legacy behavior)
     INJECT_MODE_IMMEDIATE = 0,
-    
+
     // Smooth: Spread movement across frames to match max per-frame rate
     INJECT_MODE_SMOOTH,
-    
+
     // Velocity-matched: Blend with current mouse velocity
     INJECT_MODE_VELOCITY_MATCHED,
-    
+
     // Micro: For tiny sub-pixel adjustments (anti-recoil, aim correction)
     INJECT_MODE_MICRO,
 } inject_mode_t;
-
-//--------------------------------------------------------------------+
-// Easing Modes for Natural Movement
-//--------------------------------------------------------------------+
-
-typedef enum {
-    EASING_LINEAR = 0,      // No easing (constant velocity)
-    EASING_EASE_IN_OUT,     // Slow start, fast middle, slow end (natural)
-    EASING_EASE_OUT,        // Quick start, slow end (corrections)
-} easing_mode_t;
 
 //--------------------------------------------------------------------+
 // Humanization Modes
@@ -87,9 +88,8 @@ typedef struct {
     int32_t x_remaining_fp; // Remaining X to inject
     int32_t y_remaining_fp; // Remaining Y to inject
     uint8_t frames_left;    // Frames remaining for this movement
-    uint8_t total_frames;   // Total frames for this movement (for easing calc)
+    uint8_t total_frames;   // Total frames for this movement (for linear progress calc)
     inject_mode_t mode;     // Injection mode
-    easing_mode_t easing;   // Easing curve to apply
     bool active;            // Is this entry in use?
     uint8_t onset_delay;    // Frames to wait before starting delivery (onset jitter)
     
@@ -143,6 +143,12 @@ typedef struct {
     // Configuration
     int16_t max_per_frame;
     bool velocity_matching_enabled;
+
+    // Velocity IIR filter state (output-stage smoothing)
+    int32_t filtered_vx_fp;     // Current filtered velocity X (16.16)
+    int32_t filtered_vy_fp;     // Current filtered velocity Y (16.16)
+    int32_t prev_raw_vx_fp;     // Previous raw velocity X for acceleration calc
+    int32_t prev_raw_vy_fp;     // Previous raw velocity Y for acceleration calc
     
     // Humanization settings
     struct {
@@ -157,6 +163,10 @@ typedef struct {
         int32_t accum_clamp_fp;        // Max accumulator magnitude (mode-dependent)
         uint8_t onset_jitter_min;      // Min onset delay frames
         uint8_t onset_jitter_max;      // Max onset delay frames
+        // Velocity IIR filter parameters
+        int32_t vel_filter_alpha_min_fp;   // Min alpha (responsive, during high accel) ~0.3
+        int32_t vel_filter_alpha_max_fp;   // Max alpha (smooth, steady state) ~0.85
+        int32_t vel_filter_accel_sens_fp;  // Acceleration sensitivity ~0.15
     } humanization;
 } smooth_injection_state_t;
 
@@ -205,7 +215,7 @@ void smooth_record_physical_movement(int16_t x, int16_t y);
  * @param out_x Output X movement for this frame
  * @param out_y Output Y movement for this frame
  */
-void smooth_process_frame(int8_t *out_x, int8_t *out_y);
+void smooth_process_frame(int16_t *out_x, int16_t *out_y);
 
 /**
  * Get current average velocity (for velocity-matched injection)

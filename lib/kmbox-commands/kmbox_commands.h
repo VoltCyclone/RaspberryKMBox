@@ -14,12 +14,14 @@
 // Button Definitions
 //--------------------------------------------------------------------+
 
-// HID Button bit masks (compatible with FAST_BTN_* protocol)
-#define KMBOX_HID_BTN_LEFT      0x01
-#define KMBOX_HID_BTN_RIGHT     0x02
-#define KMBOX_HID_BTN_MIDDLE    0x04
-#define KMBOX_HID_BTN_BACK      0x08
-#define KMBOX_HID_BTN_FORWARD   0x10
+#include "hid_defs.h"
+
+// Legacy aliases — prefer HID_BTN_* from hid_defs.h in new code
+#define KMBOX_HID_BTN_LEFT      HID_BTN_LEFT
+#define KMBOX_HID_BTN_RIGHT     HID_BTN_RIGHT
+#define KMBOX_HID_BTN_MIDDLE    HID_BTN_MIDDLE
+#define KMBOX_HID_BTN_BACK      HID_BTN_BACK
+#define KMBOX_HID_BTN_FORWARD   HID_BTN_FORWARD
 
 typedef enum {
     KMBOX_BUTTON_LEFT = 0,
@@ -151,6 +153,14 @@ void kmbox_start_button_click(kmbox_button_t button, uint32_t current_time_ms);
 // Get the current combined button byte (physical | forced) without draining accumulators.
 // Used to detect button-only state changes that need an immediate report.
 uint8_t kmbox_get_current_buttons(void);
+
+// Atomic check-and-drain: single spinlock acquire to test pending + drain accumulators.
+// Returns true if any movement/wheel/pan/button-change was pending and writes drained values.
+// Replaces separate kmbox_has_pending_movement() + kmbox_get_mouse_report_16() calls
+// to eliminate double spinlock acquisition in the hot path.
+bool kmbox_try_drain_mouse_16(uint8_t last_sent_buttons,
+                               uint8_t *buttons, int16_t *x, int16_t *y,
+                               int8_t *wheel, int8_t *pan);
 
 // Get button name string for debugging
 const char* kmbox_get_button_name(kmbox_button_t button);

@@ -56,48 +56,12 @@ static inline float humanization_jitter_scale(float magnitude) {
 }
 
 /**
- * Ease-in-out cubic (FPU direct computation)
- */
-static inline float ease_in_out_cubic(float t) {
-    if (t < 0.5f) {
-        return 4.0f * t * t * t;
-    } else {
-        float x = -2.0f * t + 2.0f;
-        return 1.0f - x * x * x * 0.5f;
-    }
-}
-
-/**
- * Ease-out quadratic (FPU direct computation)
- */
-static inline float ease_out_quad(float t) {
-    float x = 1.0f - t;
-    return 1.0f - x * x;
-}
-
-/**
  * Minimum-jerk velocity profile
  * Natural acceleration/deceleration curve
  */
 static inline float min_jerk_velocity(float t) {
     float one_minus_t = 1.0f - t;
     return 30.0f * t * t * one_minus_t * one_minus_t;
-}
-
-/**
- * Convert progress (0-1) to eased progress based on mode
- */
-static inline float apply_easing_fpu(float t, uint8_t mode) {
-    switch (mode) {
-        case 0:  // EASING_LINEAR
-            return t;
-        case 1:  // EASING_EASE_IN_OUT
-            return ease_in_out_cubic(t);
-        case 2:  // EASING_EASE_OUT
-            return ease_out_quad(t);
-        default:
-            return t;
-    }
 }
 
 #endif // HUMANIZATION_FPU_H

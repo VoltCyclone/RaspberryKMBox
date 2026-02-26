@@ -250,7 +250,7 @@ static uint32_t uart_rx_bytes_total = 0;
 static uint32_t uart_tx_bytes_total = 0;
 static uint32_t uart_rx_overflows = 0;
 
-// KMBox temperature (from 0x0C info packet)
+// KMBox temperature (from 0x0D info packet)
 static float kmbox_temperature_c = -999.0f;
 
 // Sync stats from hw_uart module (called periodically)
@@ -496,8 +496,8 @@ static void uart_rx_task(void) {
             binary_idx = 0;
         }
         
-        // Check for start of binary response packet (0xFF, 0xFE, 0x0C, or 0x0E from KMBox)
-        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0C || c == 0x0E)) {
+        // Check for start of binary response packet (0xFF, 0xFE, 0x0D, or 0x0E from KMBox)
+        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0D || c == 0x0E)) {
             in_binary_packet = true;
             binary_idx = 0;
             binary_packet[binary_idx++] = c;
@@ -530,8 +530,8 @@ static void uart_rx_task(void) {
                     if (kmbox_state != KMBOX_CONNECTED) {
                         kmbox_state = KMBOX_CONNECTED;
                     }
-                } else if (binary_packet[0] == 0x0C) {
-                    // Info response: [0x0C][hmode][imode][max_per_frame][queue_count][temp_lo][temp_hi][flags]
+                } else if (binary_packet[0] == 0x0D) {
+                    // Info response: [0x0D][hmode][imode][max_per_frame][queue_count][temp_lo][temp_hi][flags]
                     // flags: [0]=jitter_en [1]=vel_match [2:4]=queue_depth_3bit
                     kmbox_humanization_mode = binary_packet[1];
                     kmbox_inject_mode = binary_packet[2];
@@ -555,7 +555,7 @@ static void uart_rx_task(void) {
                     // Extended stats: [0x0E][queue_count][queue_cap][hmode][total_lo][total_hi][ovf_lo][ovf_hi]
                     kmbox_queue_depth = binary_packet[1];
                     kmbox_queue_capacity = binary_packet[2];
-                    // binary_packet[3] = hmode (redundant, but useful if 0x0C wasn't received)
+                    // binary_packet[3] = hmode (redundant, but useful if 0x0D wasn't received)
                     if (!kmbox_humanization_valid) {
                         kmbox_humanization_mode = binary_packet[3];
                     }
@@ -672,7 +672,7 @@ static void kmbox_connection_task(void) {
             last_humanization_request_ms = now - HUMANIZATION_REQUEST_INTERVAL_MS + HUMANIZATION_INITIAL_DELAY_MS;
             
             // Send initial info request right away (binary)
-            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            uint8_t info_req[8] = {0x0D, 0, 0, 0, 0, 0, 0, 0};
             send_uart_packet(info_req, 8);
         }
     }
@@ -696,11 +696,11 @@ static void kmbox_connection_task(void) {
         if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
             last_humanization_request_ms = now;
             
-            // Alternate between 0x0C (basic info + temp) and 0x0E (extended stats)
+            // Alternate between 0x0D (basic info + temp) and 0x0E (extended stats)
             static uint8_t info_cycle = 0;
             if (info_cycle % 2 == 0) {
                 // Primary: humanization mode, inject mode, queue depth, temperature, flags
-                uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+                uint8_t info_req[8] = {0x0D, 0, 0, 0, 0, 0, 0, 0};
                 send_uart_packet(info_req, 8);
             } else {
                 // Extended: total injected, queue overflows, queue capacity
@@ -736,16 +736,16 @@ static void kmbox_connection_task(void) {
             }
         }
         
-        // TEMP: Send 0x0C request even when disconnected to test UART RX
+        // Send 0x0D info request even when disconnected to test UART RX
         if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
             last_humanization_request_ms = now;
-            uint8_t info_req[8] = {0x0C, 0, 0, 0, 0, 0, 0, 0};
+            uint8_t info_req[8] = {0x0D, 0, 0, 0, 0, 0, 0, 0};
             bool sent = send_uart_packet(info_req, 8);
-            
+
             // Debug: confirm we're sending the request
             static uint32_t last_info_debug_disc = 0;
             if (now - last_info_debug_disc > 5000) {
-                printf("[Bridge TX DISC] 0x0C: %02X %02X %02X %02X %02X %02X %02X %02X (sent=%d)\n",
+                printf("[Bridge TX DISC] 0x0D: %02X %02X %02X %02X %02X %02X %02X %02X (sent=%d)\n",
                        info_req[0], info_req[1], info_req[2], info_req[3],
                        info_req[4], info_req[5], info_req[6], info_req[7], sent);
                 last_info_debug_disc = now;

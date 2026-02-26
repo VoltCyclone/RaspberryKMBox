@@ -1363,6 +1363,71 @@ uint8_t kmbox_get_current_buttons(void)
            (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
 }
 
+bool kmbox_try_drain_mouse_16(uint8_t last_sent_buttons,
+                               uint8_t *buttons, int16_t *x, int16_t *y,
+                               int8_t *wheel, int8_t *pan)
+{
+    // Build button byte (no lock needed — single-core writes)
+    uint8_t button_byte =
+        (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
+        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
+
+    *buttons = button_byte;
+    bool buttons_changed = (button_byte != last_sent_buttons);
+
+    // Single spinlock: check pending + drain in one shot
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
+
+    bool pending = (g_kmbox_state.mouse_x_accumulator != 0 ||
+                    g_kmbox_state.mouse_y_accumulator != 0 ||
+                    g_kmbox_state.wheel_accumulator != 0);
+
+    if (!pending && !buttons_changed) {
+        // Nothing to do — fast unlock
+        spin_unlock(g_acc_spinlock, irq);
+        *x = 0; *y = 0; *wheel = 0; *pan = 0;
+        return false;
+    }
+
+    // Drain movement accumulators
+    *x = (int16_t)g_kmbox_state.mouse_x_accumulator;
+    g_kmbox_state.mouse_x_accumulator = 0;
+    *y = (int16_t)g_kmbox_state.mouse_y_accumulator;
+    g_kmbox_state.mouse_y_accumulator = 0;
+
+    // Drain wheel (clamp to int8 range, keep remainder)
+    int16_t w_acc = g_kmbox_state.wheel_accumulator;
+    if (w_acc > 127) {
+        *wheel = 127;
+        g_kmbox_state.wheel_accumulator = w_acc - 127;
+    } else if (w_acc < -128) {
+        *wheel = -128;
+        g_kmbox_state.wheel_accumulator = w_acc + 128;
+    } else {
+        *wheel = (int8_t)w_acc;
+        g_kmbox_state.wheel_accumulator = 0;
+    }
+
+    // Drain pan (clamp to int8 range, keep remainder)
+    int16_t p_acc = g_kmbox_state.pan_accumulator;
+    if (p_acc > 127) {
+        *pan = 127;
+        g_kmbox_state.pan_accumulator = p_acc - 127;
+    } else if (p_acc < -128) {
+        *pan = -128;
+        g_kmbox_state.pan_accumulator = p_acc + 128;
+    } else {
+        *pan = (int8_t)p_acc;
+        g_kmbox_state.pan_accumulator = 0;
+    }
+
+    spin_unlock(g_acc_spinlock, irq);
+    return true;
+}
+
 void kmbox_set_axis_lock(bool lock_x, bool lock_y)
 {
     g_kmbox_state.lock_mx = lock_x;

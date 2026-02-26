@@ -142,6 +142,22 @@ static const int16_t sin_lut[SINCOS_LUT_SIZE] = {
 static inline int16_t lut_sin(int angle_idx) { return sin_lut[angle_idx % SINCOS_LUT_SIZE]; }
 static inline int16_t lut_cos(int angle_idx) { return sin_lut[(angle_idx + 45) % SINCOS_LUT_SIZE]; } // +45 entries = +90°
 
+// Fast integer square root (Newton's method, 4 iterations — good for r<=320)
+static inline int fast_isqrt(int v) {
+    if (v <= 0) return 0;
+    int x = v;
+    // Initial estimate: highest bit / 2
+    int s = 1;
+    while (s * s <= v) s <<= 1;
+    x = s;
+    x = (x + v / x) >> 1;
+    x = (x + v / x) >> 1;
+    x = (x + v / x) >> 1;
+    // Correct off-by-one
+    if ((x + 1) * (x + 1) <= v) x++;
+    return x;
+}
+
 // ============================================================================
 // State — timer-driven background rendering
 //
@@ -209,6 +225,39 @@ static volatile bool stats_pending = false; // Main loop set, timer clears
 
 // Frame ready flag: timer ISR sets after drawing, main loop clears after DMA
 static volatile bool frame_ready = false;
+
+// Stats hash for frame-skip optimization: skip render if stats unchanged
+static uint32_t last_stats_hash = 0;
+
+// Lightweight FNV-1a hash over the key volatile fields of stats
+static uint32_t stats_quick_hash(const tft_stats_t *s) {
+    uint32_t h = 2166136261u;
+    #define HASH_MIX(val) do { \
+        uint32_t v = (uint32_t)(val); \
+        h ^= v; h *= 16777619u; \
+    } while(0)
+    HASH_MIX(s->cdc_connected);
+    HASH_MIX(s->kmbox_connected);
+    HASH_MIX(s->humanization_mode);
+    HASH_MIX(s->inject_mode);
+    HASH_MIX(s->queue_depth);
+    HASH_MIX(s->tx_rate_bps);
+    HASH_MIX(s->rx_rate_bps);
+    HASH_MIX(s->mouse_moves);
+    HASH_MIX(s->commands_per_sec);
+    HASH_MIX(s->latency_avg_us);
+    HASH_MIX(s->latency_jitter_us);
+    HASH_MIX(s->uptime_sec);
+    HASH_MIX(s->button_presses);
+    HASH_MIX(s->total_injected);
+    HASH_MIX(s->uart_errors + s->frame_errors);
+    HASH_MIX((uint32_t)(s->bridge_temperature_c * 10));
+    HASH_MIX((uint32_t)(s->kmbox_temperature_c * 10));
+    HASH_MIX(s->console_mode);
+    HASH_MIX(s->gamepad_buttons);
+    #undef HASH_MIX
+    return h;
+}
 
 // Repeating timer handle
 static repeating_timer_t tft_render_timer;
@@ -292,6 +341,12 @@ static inline uint8_t hmode_color(uint8_t m) {
 }
 
 #define TEMP_VALID(t) ((t) > -50.0f && (t) < 150.0f)
+
+static inline uint8_t latency_color(uint32_t us) {
+    if (us < 200)  return COL_GREEN;
+    if (us < 500)  return COL_YELLOW;
+    return COL_RED;
+}
 
 // ============================================================================
 // Touch Interrupt Callback
@@ -569,11 +624,13 @@ static void format_stats(const tft_stats_t *stats) {
     } else { fmt_clear(&fmt_rx_peak); }
 }
 
-// Helper to draw a section header label
+// Helper to draw a section header label with accent bar
 static int draw_section_header(int y, const char *title) {
     hline(y, COL_DIM_LINE);
     y += SEP_GAP + 1;
-    tft_draw_string(MARGIN, y, COL_CYAN, title);
+    // Small accent bar before title
+    box(MARGIN, y + 4, 3, FONT_H - 8, COL_CYAN);
+    tft_draw_string(MARGIN + 6, y, COL_CYAN, title);
     y += LINE_H;
     return y;
 }
@@ -665,22 +722,28 @@ static void draw_stats(const tft_stats_t *stats) {
     hline(y, COL_DIM_LINE);
     y += SEP_GAP + 2;
     
-    // === CONNECTION STATUS ===
+    // === CONNECTION STATUS (with indicator dots) ===
     {
         uint8_t cdc_col = stats->cdc_connected ? COL_GREEN : COL_RED;
         uint8_t km_col  = stats->kmbox_connected ? COL_GREEN : COL_RED;
-        
-        tft_draw_string(MARGIN, y, COL_GRAY, "Host");
-        tft_draw_string(MARGIN + 5 * FONT_W, y, cdc_col,
+
+        // Status dot (filled 5x5 square) + label
+        box(MARGIN, y + 5, 5, 5, cdc_col);
+        tft_draw_string(MARGIN + 8, y, COL_GRAY, "Host");
+        tft_draw_string(MARGIN + 8 + 5 * FONT_W, y, cdc_col,
                         stats->cdc_connected ? "OK" : "--");
 
 #if (TFT_RAW_WIDTH >= 240)
-        tft_draw_string(MARGIN + 10 * FONT_W, y, COL_GRAY, "KMBox");
-        tft_draw_string(MARGIN + 16 * FONT_W, y, km_col,
+        int km_x = MARGIN + 14 * FONT_W;
+        box(km_x, y + 5, 5, 5, km_col);
+        tft_draw_string(km_x + 8, y, COL_GRAY, "KMBox");
+        tft_draw_string(km_x + 8 + 6 * FONT_W, y, km_col,
                         stats->kmbox_connected ? "OK" : "--");
 #else
-        tft_draw_string(MARGIN + 8 * FONT_W, y, COL_GRAY, "KM");
-        tft_draw_string(MARGIN + 11 * FONT_W, y, km_col,
+        int km_x = MARGIN + 9 * FONT_W;
+        box(km_x, y + 5, 5, 5, km_col);
+        tft_draw_string(km_x + 8, y, COL_GRAY, "KM");
+        tft_draw_string(km_x + 8 + 3 * FONT_W, y, km_col,
                         stats->kmbox_connected ? "OK" : "--");
 #endif
         y += LINE_H;
@@ -713,14 +776,30 @@ static void draw_stats(const tft_stats_t *stats) {
         }
         y += LINE_H;
         
-        // Queue bar + injection count
+        // Queue bar + injection count (with visual bar)
         if (fmt_queuebar.len) {
             tft_draw_string(MARGIN, y, COL_GRAY, "Queue");
+
             uint8_t q_col = COL_GREEN;
             if (stats->queue_depth > stats->queue_capacity * 3 / 4) q_col = COL_RED;
             else if (stats->queue_depth > stats->queue_capacity / 2) q_col = COL_YELLOW;
-            tft_draw_string(MARGIN + 6 * FONT_W, y, q_col, fmt_queuebar.str);
-            
+
+            // Visual progress bar
+            int bar_x = MARGIN + 6 * FONT_W;
+            int bar_w = TFT_WIDTH - bar_x - MARGIN;
+            if (fmt_injcount.len) bar_w -= (fmt_injcount.len + 1) * FONT_W;
+            int bar_h = FONT_H - 4;
+            int bar_y = y + 2;
+            box(bar_x, bar_y, bar_w, bar_h, COL_DARK);
+            if (stats->queue_capacity > 0) {
+                int fill = (int)((float)stats->queue_depth / stats->queue_capacity * bar_w);
+                if (fill > bar_w) fill = bar_w;
+                if (fill > 0) box(bar_x, bar_y, fill, bar_h, q_col);
+            }
+            // Overlay text on bar
+            int txt_x = bar_x + (bar_w - fmt_queuebar.len * FONT_W) / 2;
+            tft_draw_string(txt_x, y, COL_WHITE, fmt_queuebar.str);
+
             if (fmt_injcount.len) {
                 int ix = TFT_WIDTH - MARGIN - fmt_injcount.len * FONT_W;
                 tft_draw_string(ix, y, COL_GRAY, fmt_injcount.str);
@@ -808,17 +887,21 @@ static void draw_stats(const tft_stats_t *stats) {
         y += SECTION_GAP;
         y = draw_section_header(y, "Latency");
         
-        draw_row_lr(y, "Avg", COL_GRAY, fmt_lat_avg.str, fmt_lat_avg.len, COL_GREEN);
+        draw_row_lr(y, "Avg", COL_GRAY, fmt_lat_avg.str, fmt_lat_avg.len,
+                    latency_color(stats->latency_avg_us));
         y += LINE_H;
-        
+
 #if (TFT_RAW_WIDTH >= 240)
         if (fmt_lat_range.len) {
-            draw_row_lr(y, "Range", COL_GRAY, fmt_lat_range.str, fmt_lat_range.len, COL_GRAY);
+            draw_row_lr(y, "Range", COL_GRAY, fmt_lat_range.str, fmt_lat_range.len,
+                        latency_color(stats->latency_max_us));
             y += LINE_H;
         }
 #endif
         if (fmt_lat_jitter.len) {
-            draw_row_lr(y, "Jitter", COL_GRAY, fmt_lat_jitter.str, fmt_lat_jitter.len, COL_YELLOW);
+            uint8_t jit_col = stats->latency_jitter_us < 50 ? COL_GREEN :
+                              stats->latency_jitter_us < 150 ? COL_YELLOW : COL_RED;
+            draw_row_lr(y, "Jitter", COL_GRAY, fmt_lat_jitter.str, fmt_lat_jitter.len, jit_col);
             y += LINE_H;
         }
     }
@@ -855,16 +938,27 @@ static void draw_stats(const tft_stats_t *stats) {
             y += LINE_H;
         }
         
-        // Temperatures
+        // Temperatures — with mini visual bar
         if (fmt_br_temp.len || fmt_km_temp.len) {
             tft_draw_string(MARGIN, y, COL_GRAY, "Temp");
             int tx = MARGIN + 5 * FONT_W;
             if (fmt_br_temp.len) {
-                tft_draw_string(tx, y, temp_color(stats->bridge_temperature_c), fmt_br_temp.str);
+                uint8_t tcol = temp_color(stats->bridge_temperature_c);
+                tft_draw_string(tx, y, tcol, fmt_br_temp.str);
+                // Mini bar: 2px tall under the text, width proportional to temp (0-100C)
+                int bar_w = (int)(stats->bridge_temperature_c * (fmt_br_temp.len * FONT_W) / 100.0f);
+                if (bar_w < 0) bar_w = 0;
+                if (bar_w > fmt_br_temp.len * FONT_W) bar_w = fmt_br_temp.len * FONT_W;
+                box(tx, y + FONT_H, bar_w, 2, tcol);
                 tx += (fmt_br_temp.len + 1) * FONT_W;
             }
             if (fmt_km_temp.len) {
-                tft_draw_string(tx, y, temp_color(stats->kmbox_temperature_c), fmt_km_temp.str);
+                uint8_t tcol = temp_color(stats->kmbox_temperature_c);
+                tft_draw_string(tx, y, tcol, fmt_km_temp.str);
+                int bar_w = (int)(stats->kmbox_temperature_c * (fmt_km_temp.len * FONT_W) / 100.0f);
+                if (bar_w < 0) bar_w = 0;
+                if (bar_w > fmt_km_temp.len * FONT_W) bar_w = fmt_km_temp.len * FONT_W;
+                box(tx, y + FONT_H, bar_w, 2, tcol);
             }
         }
     }
@@ -908,20 +1002,15 @@ static void draw_circle_ring(int cx, int cy, int r_inner, int r_outer, uint8_t c
         if (py < 0 || py >= TFT_HEIGHT) continue;
 
         int dy2 = dy * dy;
-        // Solve for x range: r_inner^2 <= dx^2+dy^2 <= r_outer^2
         int xo2 = r2_outer - dy2;
         if (xo2 < 0) continue;
 
-        // Outer x extent (integer sqrt via isqrt approximation)
-        int xo = 0;
-        while ((xo + 1) * (xo + 1) <= xo2) xo++;
+        int xo = fast_isqrt(xo2);
 
-        // Inner x extent (hollow center)
         int xi = 0;
         int xi2 = r2_inner - dy2;
         if (xi2 > 0) {
-            while ((xi + 1) * (xi + 1) <= xi2) xi++;
-            xi++; // inner boundary is exclusive
+            xi = fast_isqrt(xi2) + 1; // inner boundary exclusive
         }
 
         uint8_t *row = &tft_input[py * TFT_WIDTH];
@@ -942,40 +1031,156 @@ static void draw_circle_ring(int cx, int cy, int r_inner, int r_outer, uint8_t c
     }
 }
 
-static void draw_circular_gauge(int cx, int cy, int radius, float value, float max_value,
-                                const char* label, uint8_t color) {
-    // Draw gauge outline ring (3px thick)
-    draw_circle_ring(cx, cy, radius - 2, radius, COL_DARK);
+// Draw a filled arc ring between r_inner..r_outer, from start_deg to end_deg
+// Uses angle test per-pixel within bounding ring — clean filled arcs
+static void draw_arc_ring(int cx, int cy, int r_inner, int r_outer,
+                          int start_deg, int end_deg, uint8_t color) {
+    int r2_inner = r_inner * r_inner;
+    int r2_outer = r_outer * r_outer;
 
-    // Draw value arc using LUT (6px thick band)
-    float percentage = (value / max_value);
-    if (percentage > 1.0f) percentage = 1.0f;
-    int end_angle = (int)(percentage * 270.0f) - 135;
+    // Precompute angle boundary vectors (Q15) for start/end
+    int si_start = angle_to_idx(start_deg);
+    int si_end   = angle_to_idx(end_deg);
+    int16_t sx = lut_cos(si_start), sy = lut_sin(si_start);
+    int16_t ex = lut_cos(si_end),   ey = lut_sin(si_end);
 
-    for (int angle = -135; angle < end_angle && angle < 135; angle += 2) {
-        int ai = angle_to_idx(angle);
-        int16_t s = lut_sin(ai);
-        int16_t c = lut_cos(ai);
-        // Draw just inner and outer edge pixels of the arc band
-        for (int r = radius - 8; r <= radius - 3; r++) {
-            int x = cx + (r * c + 16384) / 32768;
-            int y = cy + (r * s + 16384) / 32768;
-            if ((unsigned)x < (unsigned)TFT_WIDTH && (unsigned)y < (unsigned)TFT_HEIGHT) {
-                tft_input[y * TFT_WIDTH + x] = color;
+    for (int dy = -r_outer; dy <= r_outer; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= TFT_HEIGHT) continue;
+
+        int dy2 = dy * dy;
+        int xo2 = r2_outer - dy2;
+        if (xo2 < 0) continue;
+
+        int xo = fast_isqrt(xo2);
+        int xi = 0;
+        int xi2 = r2_inner - dy2;
+        if (xi2 > 0) xi = fast_isqrt(xi2) + 1;
+
+        uint8_t *row = &tft_input[py * TFT_WIDTH];
+
+        for (int dx = -xo; dx <= xo; dx++) {
+            // Skip inner hollow
+            if (dx > -xi && dx < xi) { dx = xi - 1; continue; }
+
+            int px = cx + dx;
+            if (px < 0 || px >= TFT_WIDTH) continue;
+
+            // Angle test: is (dx,dy) between start_deg and end_deg?
+            // Cross product sign test against boundary vectors
+            // cross(start_vec, point) >= 0 AND cross(point, end_vec) >= 0
+            // For arcs < 180°, both must be true
+            // For arcs >= 180°, either can be true
+            int32_t cross_start = (int32_t)sx * dy - (int32_t)sy * dx;
+            int32_t cross_end   = (int32_t)dx * ey - (int32_t)dy * ex;
+
+            int span = end_deg - start_deg;
+            if (span < 0) span += 360;
+            bool inside;
+            if (span <= 180) {
+                inside = (cross_start >= 0) && (cross_end >= 0);
+            } else {
+                inside = (cross_start >= 0) || (cross_end >= 0);
+            }
+
+            if (inside) {
+                row[px] = color;
             }
         }
     }
+}
 
-    // Draw value text in center
+static void draw_circular_gauge(int cx, int cy, int radius, float value, float max_value,
+                                const char* label, uint8_t color) {
+    // Draw gauge background ring (track)
+    draw_circle_ring(cx, cy, radius - 8, radius, COL_DARK);
+
+    // Draw value arc (filled thick ring sector)
+    float percentage = (max_value > 0.0f) ? (value / max_value) : 0.0f;
+    if (percentage > 1.0f) percentage = 1.0f;
+    if (percentage < 0.0f) percentage = 0.0f;
+
+    if (percentage > 0.01f) {
+        int start_deg = -135 + 360; // Normalize to positive: 225°
+        int end_deg = start_deg + (int)(percentage * 270.0f);
+        draw_arc_ring(cx, cy, radius - 7, radius - 1,
+                      start_deg, end_deg, color);
+    }
+
+    // Tick marks at 0%, 50%, 100% positions on the outer edge
+    for (int i = 0; i <= 2; i++) {
+        int tick_deg = -135 + i * 135;
+        int ai = angle_to_idx(tick_deg);
+        int16_t s = lut_sin(ai);
+        int16_t c = lut_cos(ai);
+        for (int r = radius + 1; r <= radius + 3; r++) {
+            int tx = cx + (r * c + 16384) / 32768;
+            int ty = cy + (r * s + 16384) / 32768;
+            if ((unsigned)tx < (unsigned)TFT_WIDTH && (unsigned)ty < (unsigned)TFT_HEIGHT)
+                tft_input[ty * TFT_WIDTH + tx] = COL_GRAY;
+        }
+    }
+
+    // Draw value text in center (larger visual emphasis)
     char value_str[16];
     char *p = u32_to_str(value_str, (uint32_t)(value + 0.5f));
     *p = '\0';
     int text_len = (int)(p - value_str);
-    tft_draw_string(cx - (text_len * FONT_W) / 2, cy - FONT_H / 2, color, value_str);
+    tft_draw_string(cx - (text_len * FONT_W) / 2, cy - FONT_H / 2, COL_WHITE, value_str);
 
-    // Draw label below
-    int label_len = strlen(label);
-    tft_draw_string(cx - (label_len * FONT_W) / 2, cy + radius + 4, COL_GRAY, label);
+    // Draw label below center
+    int label_len = 0;
+    const char *lp = label;
+    while (*lp++) label_len++;
+    tft_draw_string(cx - (label_len * FONT_W) / 2, cy + FONT_H / 2 + 2, COL_GRAY, label);
+}
+
+// Draw a circular gauge with a unit suffix next to the value (e.g. "42C")
+static void draw_circular_gauge_unit(int cx, int cy, int radius, float value, float max_value,
+                                     const char* label, const char* unit, uint8_t color) {
+    // Draw gauge background ring (track)
+    draw_circle_ring(cx, cy, radius - 8, radius, COL_DARK);
+
+    // Draw value arc
+    float percentage = (max_value > 0.0f) ? (value / max_value) : 0.0f;
+    if (percentage > 1.0f) percentage = 1.0f;
+    if (percentage < 0.0f) percentage = 0.0f;
+
+    if (percentage > 0.01f) {
+        int start_deg = -135 + 360;
+        int end_deg = start_deg + (int)(percentage * 270.0f);
+        draw_arc_ring(cx, cy, radius - 7, radius - 1,
+                      start_deg, end_deg, color);
+    }
+
+    // Tick marks at 0%, 50%, 100%
+    for (int i = 0; i <= 2; i++) {
+        int tick_deg = -135 + i * 135;
+        int ai = angle_to_idx(tick_deg);
+        int16_t s = lut_sin(ai);
+        int16_t c = lut_cos(ai);
+        for (int r = radius + 1; r <= radius + 3; r++) {
+            int tx = cx + (r * c + 16384) / 32768;
+            int ty = cy + (r * s + 16384) / 32768;
+            if ((unsigned)tx < (unsigned)TFT_WIDTH && (unsigned)ty < (unsigned)TFT_HEIGHT)
+                tft_input[ty * TFT_WIDTH + tx] = COL_GRAY;
+        }
+    }
+
+    // Value text with unit suffix: e.g. "42C"
+    char value_str[16];
+    char *p = u32_to_str(value_str, (uint32_t)(value + 0.5f));
+    const char *up = unit;
+    while (*up) *p++ = *up++;
+    *p = '\0';
+    int text_len = (int)(p - value_str);
+    tft_draw_string(cx - (text_len * FONT_W) / 2, cy - FONT_H / 2, COL_WHITE, value_str);
+
+    // Label below center
+    int label_len = 0;
+    const char *lp = label;
+    while (*lp++) label_len++;
+    tft_draw_string(cx - (label_len * FONT_W) / 2, cy + FONT_H / 2 + 2, COL_GRAY, label);
 }
 
 static void draw_bar_gauge(int x, int y, int width, int height, float value, float max_value,
@@ -1008,103 +1213,137 @@ static void draw_bar_gauge(int x, int y, int width, int height, float value, flo
 
 static void draw_gauge_view(const tft_stats_t *stats) {
     int y = MARGIN;
-    
-    // === HEADER ===
-    tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "KMBox Gauges");
+
+    // === HEADER with connection status inline ===
+    {
+        uint8_t cdc_col = stats->cdc_connected ? COL_GREEN : COL_RED;
+        uint8_t km_col  = stats->kmbox_connected ? COL_GREEN : COL_RED;
+
+        // Left: connection dots
+        box(MARGIN, y + 5, 5, 5, cdc_col);
+        box(MARGIN + 8, y + 5, 5, 5, km_col);
+
+        // Center: title
+        tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "KMBox Gauges");
+
+        // Right: uptime
+        int ux = TFT_WIDTH - MARGIN - fmt_uptime.len * FONT_W;
+        tft_draw_string(ux, y, COL_DARK, fmt_uptime.str);
+    }
     y += LINE_H + SEP_GAP;
     hline(y, COL_DARK);
-    y += SEP_GAP + 10;
-    
+    y += SEP_GAP + 4;
+
 #if (TFT_RAW_WIDTH >= 240)
-    // Large display: circular gauges in a grid
-    int gauge_radius = 50;
-    int gauge_spacing_x = TFT_WIDTH / 2;
-    int gauge_spacing_y = 120;
-    
-    // Row 1: Latency and Command Rate
-    if (stats->latency_samples > 0) {
-        draw_circular_gauge(gauge_spacing_x / 2, y + gauge_radius, gauge_radius,
-                           stats->latency_avg_us, 1000.0f, "Lat us",
-                           stats->latency_avg_us < 200 ? COL_GREEN : 
-                           stats->latency_avg_us < 500 ? COL_YELLOW : COL_RED);
+    // ── Large display (ILI9341 240x320): 3 rows of 2 circular gauges ──
+    //   Row 1: Latency + Cmd/s      (performance)
+    //   Row 2: Bridge Temp + KMBox Temp  (thermal)
+    //   Row 3: TX Rate + RX Rate    (throughput)
+    int gauge_radius = 42;
+    int col_cx_l = TFT_WIDTH / 4;          // Left column center X
+    int col_cx_r = TFT_WIDTH * 3 / 4;      // Right column center X
+    int row_h = 100;                        // Vertical spacing per row
+
+    // ── Row 1: Latency + Command Rate ──
+    {
+        int row_cy = y + gauge_radius;
+
+        // Latency gauge — always shown, color by threshold
+        uint8_t lat_col = latency_color(stats->latency_avg_us);
+        draw_circular_gauge(col_cx_l, row_cy, gauge_radius,
+                            (float)stats->latency_avg_us, 1000.0f, "Lat us", lat_col);
+
+        // Command rate gauge — always shown
+        uint8_t cmd_col = (stats->commands_per_sec > 500) ? COL_YELLOW :
+                          (stats->commands_per_sec > 0)   ? COL_GREEN  : COL_DARK;
+        draw_circular_gauge(col_cx_r, row_cy, gauge_radius,
+                            (float)stats->commands_per_sec, 1000.0f, "Cmd/s", cmd_col);
+
+        y += row_h;
     }
-    
-    if (stats->commands_per_sec > 0) {
-        draw_circular_gauge(gauge_spacing_x + gauge_spacing_x / 2, y + gauge_radius, gauge_radius,
-                           stats->commands_per_sec, 1000.0f, "Cmd/s", COL_GREEN);
+
+    // ── Row 2: Temperature Gauges ──
+    {
+        int row_cy = y + gauge_radius;
+
+        // Bridge temperature gauge (0-100C range)
+        if (TEMP_VALID(stats->bridge_temperature_c)) {
+            draw_circular_gauge_unit(col_cx_l, row_cy, gauge_radius,
+                                     stats->bridge_temperature_c, 100.0f,
+                                     "Bridge", "C",
+                                     temp_color(stats->bridge_temperature_c));
+        } else {
+            // Show empty gauge with "--" placeholder
+            draw_circle_ring(col_cx_l, row_cy, gauge_radius - 8, gauge_radius, COL_DARK);
+            tft_draw_string(col_cx_l - FONT_W, row_cy - FONT_H / 2, COL_DARK, "--");
+            tft_draw_string(col_cx_l - 3 * FONT_W, row_cy + FONT_H / 2 + 2, COL_GRAY, "Bridge");
+        }
+
+        // KMBox temperature gauge
+        if (stats->kmbox_connected && TEMP_VALID(stats->kmbox_temperature_c)) {
+            draw_circular_gauge_unit(col_cx_r, row_cy, gauge_radius,
+                                     stats->kmbox_temperature_c, 100.0f,
+                                     "KMBox", "C",
+                                     temp_color(stats->kmbox_temperature_c));
+        } else {
+            draw_circle_ring(col_cx_r, row_cy, gauge_radius - 8, gauge_radius, COL_DARK);
+            tft_draw_string(col_cx_r - FONT_W, row_cy - FONT_H / 2, COL_DARK, "--");
+            tft_draw_string(col_cx_r - 3 * FONT_W / 2, row_cy + FONT_H / 2 + 2, COL_GRAY, "KMBox");
+        }
+
+        y += row_h;
     }
-    
-    y += gauge_spacing_y;
-    
-    // Row 2: TX and RX rates
-    float tx_mbps = stats->tx_rate_bps / 1000.0f;
-    float rx_mbps = stats->rx_rate_bps / 1000.0f;
-    
-    draw_circular_gauge(gauge_spacing_x / 2, y + gauge_radius, gauge_radius,
-                       tx_mbps, 100.0f, "TX KB/s", COL_CYAN);
-    
-    draw_circular_gauge(gauge_spacing_x + gauge_spacing_x / 2, y + gauge_radius, gauge_radius,
-                       rx_mbps, 100.0f, "RX KB/s", COL_CYAN);
-    
-    y += gauge_spacing_y + 10;
-    
-    // Connection status row
-    hline(y, COL_DARK);
-    y += 4;
-    
-    uint8_t cdc_col = stats->cdc_connected ? COL_GREEN : COL_RED;
-    uint8_t km_col = stats->kmbox_connected ? COL_GREEN : COL_RED;
-    
-    tft_draw_string(MARGIN, y, COL_GRAY, "CDC:");
-    tft_draw_string(MARGIN + 40, y, cdc_col, stats->cdc_connected ? "CONN" : "DISC");
-    
-    tft_draw_string(TFT_WIDTH / 2, y, COL_GRAY, "KM:");
-    tft_draw_string(TFT_WIDTH / 2 + 32, y, km_col, stats->kmbox_connected ? "CONN" : "DISC");
-    
-    y += LINE_H;
-    
-    // Temperature
-    if (TEMP_VALID(stats->bridge_temperature_c)) {
-        char temp_str[16];
-        char *tp = u32_to_str(temp_str, (uint32_t)(stats->bridge_temperature_c + 0.5f));
-        *tp++ = 'C'; *tp = '\0';
-        tft_draw_string(MARGIN, y, temp_color(stats->bridge_temperature_c), temp_str);
+
+    // ── Row 3: TX + RX throughput ──
+    {
+        int row_cy = y + gauge_radius;
+        float tx_kbps = stats->tx_rate_bps / 1000.0f;
+        float rx_kbps = stats->rx_rate_bps / 1000.0f;
+
+        uint8_t tx_col = (tx_kbps > 50.0f) ? COL_YELLOW :
+                         (tx_kbps > 0.1f)   ? COL_CYAN   : COL_DARK;
+        uint8_t rx_col = (rx_kbps > 50.0f) ? COL_YELLOW :
+                         (rx_kbps > 0.1f)   ? COL_CYAN   : COL_DARK;
+
+        draw_circular_gauge(col_cx_l, row_cy, gauge_radius,
+                            tx_kbps, 100.0f, "TX KB/s", tx_col);
+        draw_circular_gauge(col_cx_r, row_cy, gauge_radius,
+                            rx_kbps, 100.0f, "RX KB/s", rx_col);
     }
-    
-    // Uptime (reuse pre-formatted buffer)
-    int uptime_x = TFT_WIDTH - MARGIN - fmt_uptime.len * FONT_W;
-    tft_draw_string(uptime_x, y, COL_CYAN, fmt_uptime.str);
+
 #else
-    // Small display: horizontal bar gauges
-    int bar_height = 24;
+    // ── Small display (ST7735 128x160): horizontal bar gauges ──
+    int bar_height = 20;
     int bar_width = TFT_WIDTH - MARGIN * 2;
-    
-    // Latency bar
-    if (stats->latency_samples > 0) {
-        draw_bar_gauge(MARGIN, y, bar_width, bar_height, stats->latency_avg_us, 1000.0f,
-                      "Latency (us)", stats->latency_avg_us < 200 ? COL_GREEN : COL_YELLOW);
-        y += bar_height + LINE_H + 4;
+
+    // Latency bar (always shown)
+    {
+        uint8_t lat_col = latency_color(stats->latency_avg_us);
+        draw_bar_gauge(MARGIN, y, bar_width, bar_height,
+                       (float)stats->latency_avg_us, 1000.0f, "Latency us", lat_col);
+        y += bar_height + LINE_H + 2;
     }
-    
-    // Command rate bar
-    if (stats->commands_per_sec > 0) {
-        draw_bar_gauge(MARGIN, y, bar_width, bar_height, stats->commands_per_sec, 500.0f,
-                      "Commands/sec", COL_GREEN);
-        y += bar_height + LINE_H + 4;
+
+    // Command rate bar (always shown)
+    {
+        uint8_t cmd_col = (stats->commands_per_sec > 0) ? COL_GREEN : COL_DARK;
+        draw_bar_gauge(MARGIN, y, bar_width, bar_height,
+                       (float)stats->commands_per_sec, 500.0f, "Cmd/s", cmd_col);
+        y += bar_height + LINE_H + 2;
     }
-    
-    // TX rate bar
-    draw_bar_gauge(MARGIN, y, bar_width, bar_height, stats->tx_rate_bps / 1000.0f, 50.0f,
-                  "TX (KB/s)", COL_CYAN);
-    y += bar_height + LINE_H + 4;
-    
-    // RX rate bar  
-    draw_bar_gauge(MARGIN, y, bar_width, bar_height, stats->rx_rate_bps / 1000.0f, 50.0f,
-                  "RX (KB/s)", COL_CYAN);
+
+    // Temperature bar (bridge)
+    if (TEMP_VALID(stats->bridge_temperature_c)) {
+        draw_bar_gauge(MARGIN, y, bar_width, bar_height,
+                       stats->bridge_temperature_c, 100.0f, "Temp C",
+                       temp_color(stats->bridge_temperature_c));
+    } else {
+        draw_bar_gauge(MARGIN, y, bar_width, bar_height, 0.0f, 100.0f, "Temp C", COL_DARK);
+    }
 #endif
 
 #if TOUCH_ENABLED
-    // Touch zone hints (right edge, centered in each zone — no hlines)
+    // Touch zone hints (right edge, centered in each zone)
     {
         int zone_x = TFT_WIDTH - MARGIN - FONT_W;
         int z1_y = (TOUCH_ZONE_TOP_END) / 2 - FONT_H / 2;
@@ -1367,7 +1606,12 @@ static bool tft_render_timer_callback(repeating_timer_t *rt) {
     if (!stats_pending) return true;
     tft_stats_t local_stats = shared_stats;  // Snapshot
     stats_pending = false;
-    
+
+    // Skip render if stats haven't meaningfully changed (saves CPU in steady state)
+    uint32_t h = stats_quick_hash(&local_stats);
+    if (h == last_stats_hash && menu_highlight_item < 0) return true;
+    last_stats_hash = h;
+
     // Render into the back buffer
     tft_fill(COL_BG);
     format_stats(&local_stats);
@@ -1446,18 +1690,37 @@ void tft_display_refresh(const tft_stats_t *stats) {
 
 void tft_display_splash(void) {
     if (!initialized) return;
-    
+
     tft_fill(COL_BG);
-    
-    int y = TFT_HEIGHT / 2 - LINE_H * 2;
-    box(10, y - 4, TFT_WIDTH - 20, LINE_H * 3 + 8, COL_DARK);
-    
-    tft_draw_string_center(TFT_WIDTH / 2, y, COL_CYAN, "KMBox Bridge");
-    y += LINE_H;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COL_WHITE, "Autopilot");
-    y += LINE_H * 2;
-    tft_draw_string_center(TFT_WIDTH / 2, y, COL_GREEN, "Starting...");
-    
+
+    int cx = TFT_WIDTH / 2;
+    int cy = TFT_HEIGHT / 2;
+
+    // Outer frame with double border
+    int bx = 8, by = cy - LINE_H * 3;
+    int bw = TFT_WIDTH - 16, bh = LINE_H * 5 + 12;
+    box(bx, by, bw, 2, COL_CYAN);                     // top
+    box(bx, by + bh - 2, bw, 2, COL_CYAN);            // bottom
+    box(bx, by, 2, bh, COL_CYAN);                      // left
+    box(bx + bw - 2, by, 2, bh, COL_CYAN);             // right
+    // Inner fill
+    box(bx + 4, by + 4, bw - 8, bh - 8, COL_DARK);
+
+    int y = by + 8;
+    tft_draw_string_center(cx, y, COL_CYAN, "KMBox Bridge");
+    y += LINE_H + 2;
+
+    // Thin accent line
+    int line_x = cx - 40;
+    int line_w = 80;
+    if (line_x < bx + 6) { line_x = bx + 6; line_w = bw - 12; }
+    box(line_x, y, line_w, 1, COL_CYAN);
+    y += 6;
+
+    tft_draw_string_center(cx, y, COL_WHITE, "Autopilot");
+    y += LINE_H + LINE_H;
+    tft_draw_string_center(cx, y, COL_GREEN, "Starting...");
+
     tft_swap_sync();
 }
 

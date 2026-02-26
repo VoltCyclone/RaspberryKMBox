@@ -66,11 +66,11 @@ uint16_t makcu_build_response(
 // Helper: Convert Makcu button number to HID button mask
 static uint8_t makcu_button_to_mask(uint8_t button) {
     switch (button) {
-        case 1: return 0x01;  // Left
-        case 2: return 0x02;  // Right
-        case 3: return 0x04;  // Middle
-        case 4: return 0x08;  // Side1
-        case 5: return 0x10;  // Side2
+        case 1: return HID_BTN_LEFT;
+        case 2: return HID_BTN_RIGHT;
+        case 3: return HID_BTN_MIDDLE;
+        case 4: return HID_BTN_BACK;
+        case 5: return HID_BTN_FORWARD;
         default: return 0x00;
     }
 }

@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "hid_defs.h"
 
 // ============================================================================
 // Command Bytes
@@ -52,14 +53,16 @@
 
 #define WIRE_MAX_PACKET  8     // Maximum packet size in bytes
 
-// Button masks (match HID standard)
-#define WIRE_BTN_LEFT    0x01
-#define WIRE_BTN_RIGHT   0x02
-#define WIRE_BTN_MIDDLE  0x04
-#define WIRE_BTN_BACK    0x08
-#define WIRE_BTN_FORWARD 0x10
+// Button masks — canonical definitions in hid_defs.h (HID_BTN_*)
+// Legacy aliases for existing wire-protocol consumers
+#define WIRE_BTN_LEFT    HID_BTN_LEFT
+#define WIRE_BTN_RIGHT   HID_BTN_RIGHT
+#define WIRE_BTN_MIDDLE  HID_BTN_MIDDLE
+#define WIRE_BTN_BACK    HID_BTN_BACK
+#define WIRE_BTN_FORWARD HID_BTN_FORWARD
 
-// Smooth injection modes
+// Injection modes — canonical definitions in fast_protocol.h (INJECT_MODE_*)
+// Legacy aliases for existing wire-protocol consumers
 #define WIRE_INJECT_IMMEDIATE        0
 #define WIRE_INJECT_SMOOTH           1
 #define WIRE_INJECT_VELOCITY_MATCHED 2

@@ -165,9 +165,117 @@ static struct {
     bool     valid;
 } host_config_info = { .bmAttributes = TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, .bMaxPower = USB_CONFIG_POWER_MA / 2, .bInterfaceProtocol = HID_ITF_PROTOCOL_NONE, .bInterfaceSubClass = 0, .wMaxPacketSize = CFG_TUD_HID_EP_BUFSIZE, .bInterval = HID_POLLING_INTERVAL_MS, .valid = false };
 
-// Runtime configuration descriptor buffer (mutable so we can patch it)
-static uint8_t desc_configuration_runtime[TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN];
+// Runtime configuration descriptor buffer (large enough for multi-interface)
+static uint8_t desc_configuration_runtime[DESC_CONFIG_RUNTIME_MAX];
 static bool desc_config_runtime_valid = false;
+
+//--------------------------------------------------------------------+
+// Multi-interface mirroring infrastructure
+//--------------------------------------------------------------------+
+
+// Per-interface state captured from host device for faithful mirroring.
+// Gaming mice expose 2-4 HID interfaces (mouse, keyboard-macros, vendor).
+// We capture all of them and present matching interfaces on the device side.
+typedef struct {
+    // Interface properties (from host config descriptor)
+    uint8_t  itf_subclass;
+    uint8_t  itf_protocol;
+    uint16_t ep_in_max_packet;
+    uint8_t  ep_in_interval;
+    bool     has_ep_out;
+    uint16_t ep_out_max_packet;
+    uint8_t  ep_out_interval;
+
+    // Runtime state (populated during tuh_hid_mount_cb)
+    uint8_t  host_dev_addr;
+    uint8_t  host_instance;
+    bool     is_mouse;         // Interface we inject mouse/keyboard/consumer into
+
+    // HID report descriptor (non-mouse only; mouse uses desc_hid_report_runtime)
+    uint8_t  report_desc[MIRROR_ITF_DESC_MAX];
+    uint16_t report_desc_len;
+
+    bool     active;
+} mirrored_interface_t;
+
+static mirrored_interface_t mirrored_itfs[MAX_DEVICE_HID_INTERFACES];
+static uint8_t mirrored_itf_count = 0;      // Active mirrored interfaces
+static uint8_t expected_hid_itf_count = 0;   // Expected from config descriptor
+static uint8_t mounted_hid_itf_count = 0;    // Mounted so far
+
+// Which device-side HID instance carries the composite descriptor (keyboard +
+// mouse + consumer).  All mouse/keyboard/consumer reports must be sent on this
+// instance.  Defaults to 0 for single-interface mode.
+static uint8_t mouse_device_instance = 0;
+
+// Vendor report passthrough queue (Core1 producer → Core0 consumer).
+// When the host mouse sends vendor reports (e.g. Logitech HID++, Razer),
+// Core1 queues them here and Core0 drains them via tud_hid_report().
+#define VENDOR_QUEUE_SIZE 8
+#define VENDOR_QUEUE_MASK (VENDOR_QUEUE_SIZE - 1)
+#define VENDOR_REPORT_MAX_LEN 64
+
+typedef struct {
+    uint8_t device_instance;  // Which device-side HID instance to send on
+    uint8_t report_id;
+    uint8_t data[VENDOR_REPORT_MAX_LEN];
+    uint8_t len;
+} vendor_report_entry_t;
+
+static struct {
+    vendor_report_entry_t entries[VENDOR_QUEUE_SIZE];
+    volatile uint8_t head;   // Written by Core1 (producer)
+    volatile uint8_t tail;   // Read by Core0 (consumer)
+} vendor_fwd_queue;
+
+// SET_REPORT passthrough queue (Core0 producer → Core1 consumer).
+// When the downstream PC sends SET_REPORT to vendor interfaces, Core0
+// queues them here and Core1 forwards to the real mouse.
+typedef struct {
+    uint8_t host_dev_addr;
+    uint8_t host_instance;
+    uint8_t report_id;
+    uint8_t report_type;
+    uint8_t data[VENDOR_REPORT_MAX_LEN];
+    uint8_t len;
+} set_report_entry_t;
+
+static struct {
+    set_report_entry_t entries[VENDOR_QUEUE_SIZE];
+    volatile uint8_t head;   // Written by Core0 (producer)
+    volatile uint8_t tail;   // Read by Core1 (consumer)
+} set_report_queue;
+
+// Extended string descriptor cache.
+// Gaming mice may use string indices beyond the standard 1-3 (manufacturer,
+// product, serial). Interface strings, HID class strings, etc.
+#define MAX_CACHED_STRINGS 8
+#define CACHED_STRING_MAX_LEN 64
+
+typedef struct {
+    uint8_t index;
+    char    str[CACHED_STRING_MAX_LEN];
+    bool    valid;
+} cached_string_t;
+
+static cached_string_t extra_strings[MAX_CACHED_STRINGS];
+static uint8_t extra_string_count = 0;
+static uint8_t max_string_index_seen = 3;  // Track highest string index from host
+
+// GET_REPORT cache: stores the last received report per (instance, report_id)
+// so that tud_hid_get_report_cb can respond to the host (macOS IOKit sends
+// GET_REPORT during device open to verify responsiveness).
+// Written by Core1 (in queue_vendor_report), read by Core0 (in get_report_cb).
+#define REPORT_CACHE_SLOTS_PER_ITF 8
+
+typedef struct {
+    uint8_t report_id;
+    uint8_t data[VENDOR_REPORT_MAX_LEN];
+    uint8_t len;
+    bool    valid;
+} cached_report_t;
+
+static cached_report_t report_cache[MAX_DEVICE_HID_INTERFACES][REPORT_CACHE_SLOTS_PER_ITF];
 
 // Function to fetch string descriptors from attached device
 static void fetch_device_string_descriptors(uint8_t dev_addr) {
@@ -434,6 +542,16 @@ static uint8_t host_mouse_report_id = 0;
 // incoming reports with kmbox/smooth deltas injected in-place.
 //
 // Layout populated by parse_mouse_report_layout() during tuh_hid_mount_cb.
+
+// Fast-path classification for forward_raw_mouse_report():
+// Most gaming mice use byte-aligned 8-bit or 16-bit XY.  Classifying the
+// layout at parse time lets the hot path skip complex bitwise extraction.
+typedef enum {
+    LAYOUT_GENERIC,     // Arbitrary bit-width / non-aligned — full extraction needed
+    LAYOUT_FAST_8BIT,   // buttons[1] + X[i8] + Y[i8] + optional wheel/pan — all byte-aligned
+    LAYOUT_FAST_16BIT,  // buttons[1-2] + X[i16 LE] + Y[i16 LE] — all byte-aligned
+} layout_class_t;
+
 typedef struct {
     // Total expected report size (excluding report-ID prefix byte)
     uint8_t  report_size;
@@ -471,6 +589,7 @@ typedef struct {
     bool     has_report_id;
 
     bool     valid;            // true once successfully parsed
+    layout_class_t layout_class; // fast-path classification (set by classify_layout)
 } mouse_report_layout_t;
 
 static mouse_report_layout_t host_mouse_layout = { .valid = false };
@@ -516,7 +635,7 @@ static void reset_device_string_descriptors(void) {
     memset(attached_serial, 0, sizeof(attached_serial));
     string_descriptors_fetched = false;
     attached_has_serial = false;
-    
+
     // Reset cloned descriptor state
     host_device_info.valid = false;
     host_config_info.valid = false;
@@ -525,11 +644,28 @@ static void reset_device_string_descriptors(void) {
     host_mouse_has_report_id = false;
     host_mouse_report_id = 0;
     cloned_dev_addr = 0;
-    
+
+    // Reset multi-interface mirroring state
+    mirrored_itf_count = 0;
+    expected_hid_itf_count = 0;
+    mounted_hid_itf_count = 0;
+    mouse_device_instance = 0;
+    memset(mirrored_itfs, 0, sizeof(mirrored_itfs));
+
+    // Reset vendor report queues and GET_REPORT cache
+    vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
+    set_report_queue.head = set_report_queue.tail = 0;
+    memset(report_cache, 0, sizeof(report_cache));
+
+    // Reset extra string descriptor cache
+    extra_string_count = 0;
+    max_string_index_seen = 3;
+    memset(extra_strings, 0, sizeof(extra_strings));
+
     // Reset runtime report IDs to defaults
     runtime_kbd_report_id = REPORT_ID_KEYBOARD;
     runtime_consumer_report_id = REPORT_ID_CONSUMER_CONTROL;
-    
+
     // Rebuild config descriptor with defaults
     build_runtime_hid_report_with_mouse(NULL, 0);
     rebuild_configuration_descriptor();
@@ -1248,6 +1384,17 @@ bool usb_hid_init(void)
     // Initialize per-instance HID tracking
     memset(hid_instances, 0, sizeof(hid_instances));
 
+    // Initialize multi-interface mirroring state
+    memset(mirrored_itfs, 0, sizeof(mirrored_itfs));
+    mirrored_itf_count = 0;
+    expected_hid_itf_count = 0;
+    mounted_hid_itf_count = 0;
+    mouse_device_instance = 0;
+    vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
+    set_report_queue.head = set_report_queue.tail = 0;
+    memset(report_cache, 0, sizeof(report_cache));
+    extra_string_count = 0;
+
     // Seed output-stage PRNG from hardware TRNG
     hid_rng_seed(get_rand_32());
 
@@ -1364,13 +1511,13 @@ static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyb
     // CRITICAL FIX: Check readiness before attempting to send
     // If endpoint is busy, return true anyway to avoid blocking the HID report pipeline
     // The keyboard state will be sent with the next available opportunity
-    if (!tud_hid_ready())
+    if (!tud_hid_n_ready(mouse_device_instance))
     {
         return true;  // Endpoint busy, continue processing without blocking
     }
 
     // Fast path: send report immediately if endpoint is ready
-    bool success = tud_hid_report(runtime_kbd_report_id, report, sizeof(hid_keyboard_report_t));
+    bool success = tud_hid_n_report(mouse_device_instance, runtime_kbd_report_id, report, sizeof(hid_keyboard_report_t));
     if (success)
     {
         // Skip error counter reset for performance
@@ -1447,6 +1594,26 @@ static inline void build_raw_mouse_report(uint8_t *buf, uint8_t sz,
         buf[L->pan_offset] = (uint8_t)pan;
 }
 
+// Classify a parsed layout for fast-path dispatch in forward_raw_mouse_report().
+// Called once after parse (+ any fixups), not on the hot path.
+static void classify_mouse_layout(mouse_report_layout_t *L) {
+    if (!L->valid) { L->layout_class = LAYOUT_GENERIC; return; }
+
+    // Check byte-alignment: all axes must start on byte boundary
+    bool x_aligned = (L->x_bit_in_byte == 0);
+    bool y_aligned = (L->y_bit_in_byte == 0);
+
+    if (x_aligned && y_aligned && L->x_bits == 16 && L->y_bits == 16 &&
+        L->x_is_16bit && L->y_is_16bit && L->buttons_bits <= 8) {
+        L->layout_class = LAYOUT_FAST_16BIT;
+    } else if (x_aligned && y_aligned && L->x_bits == 8 && L->y_bits == 8 &&
+               !L->x_is_16bit && !L->y_is_16bit && L->buttons_bits <= 8) {
+        L->layout_class = LAYOUT_FAST_8BIT;
+    } else {
+        L->layout_class = LAYOUT_GENERIC;
+    }
+}
+
 /**
  * Core1 accumulate-only mouse report handler.
  *
@@ -1461,10 +1628,35 @@ static void __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
 {
     const mouse_report_layout_t *L = &host_mouse_layout;
 
-    // --- Extract physical movement from the raw report ---
     int16_t phys_x = 0, phys_y = 0;
     int8_t  phys_wheel = 0, phys_pan = 0;
     uint8_t phys_buttons = 0;
+
+    // --- Fast paths for common byte-aligned layouts (95%+ of gaming mice) ---
+    // Avoids all the bitwise extraction, bounds checks, and branches below.
+    if (__builtin_expect(L->layout_class == LAYOUT_FAST_16BIT, 1)) {
+        // 16-bit XY, byte-aligned, <=8-bit buttons
+        if (__builtin_expect(raw_len >= L->y_offset + 2, 1)) {
+            phys_buttons = raw[L->buttons_offset] & ((L->buttons_bits >= 8) ? 0xFF : ((1u << L->buttons_bits) - 1));
+            phys_x = (int16_t)(raw[L->x_offset] | (raw[L->x_offset + 1] << 8));
+            phys_y = (int16_t)(raw[L->y_offset] | (raw[L->y_offset + 1] << 8));
+            if (L->has_wheel && L->wheel_offset < raw_len) phys_wheel = (int8_t)raw[L->wheel_offset];
+            if (L->has_pan && L->pan_offset < raw_len)     phys_pan = (int8_t)raw[L->pan_offset];
+            goto accumulate;
+        }
+    } else if (L->layout_class == LAYOUT_FAST_8BIT) {
+        // 8-bit XY, byte-aligned, <=8-bit buttons
+        if (__builtin_expect(raw_len >= L->y_offset + 1, 1)) {
+            phys_buttons = raw[L->buttons_offset] & ((L->buttons_bits >= 8) ? 0xFF : ((1u << L->buttons_bits) - 1));
+            phys_x = (int8_t)raw[L->x_offset];
+            phys_y = (int8_t)raw[L->y_offset];
+            if (L->has_wheel && L->wheel_offset < raw_len) phys_wheel = (int8_t)raw[L->wheel_offset];
+            if (L->has_pan && L->pan_offset < raw_len)     phys_pan = (int8_t)raw[L->pan_offset];
+            goto accumulate;
+        }
+    }
+
+    // --- Generic path: arbitrary bit-width and non-aligned fields ---
 
     // Extract buttons (handle both 8-bit and 16-bit button fields)
     if (L->buttons_offset < raw_len) {
@@ -1533,6 +1725,7 @@ static void __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         phys_pan = (int8_t)raw[L->pan_offset];
     }
 
+accumulate:
     // --- Accumulate into shared state (spinlock-protected inside each call) ---
     kmbox_update_physical_buttons(phys_buttons & 0x1F);
 
@@ -1600,7 +1793,7 @@ void __not_in_flash_func(process_kbd_report)(const hid_keyboard_report_t *report
     }
 
     static uint32_t activity_counter = 0;
-    if (++activity_counter % KEYBOARD_ACTIVITY_THROTTLE == 0)
+    if ((++activity_counter & KEYBOARD_ACTIVITY_MASK) == 0)
     {
         neopixel_trigger_activity_flash_color(COLOR_KEYBOARD_ACTIVITY);
     }
@@ -1620,7 +1813,7 @@ void __not_in_flash_func(process_mouse_report)(const hid_mouse_report_t *report)
     }
 
     static uint32_t activity_counter = 0;
-    if (++activity_counter % MOUSE_ACTIVITY_THROTTLE == 0)
+    if ((++activity_counter & MOUSE_ACTIVITY_MASK) == 0)
     {
         neopixel_trigger_activity_flash_color(0x000000FF); // Blue for mouse activity
     }
@@ -1711,31 +1904,29 @@ void hid_device_task(void)
     // ARCHITECTURE: Core0 is the ONLY core that calls tud_hid_report().
     // Core1 (physical mouse callbacks) accumulates into kmbox accumulators
     // and sets was_active=true.  We drain everything here.
-    if (tud_hid_ready())
+    if (tud_hid_n_ready(mouse_device_instance))
     {
-        bool has_kmbox = kmbox_has_pending_movement();
+        // Cache humanization mode for this frame — avoid 3 function calls per frame
+        const humanization_mode_t frame_human_mode = smooth_get_humanization_mode();
+
+        // Atomic check-and-drain: single spinlock instead of separate
+        // kmbox_has_pending_movement() + kmbox_get_mouse_report_16() (was 2 spinlock roundtrips)
+        uint8_t buttons;
+        int16_t x, y;
+        int8_t wheel, pan;
+        bool has_kmbox = kmbox_try_drain_mouse_16(last_sent_buttons,
+                                                   &buttons, &x, &y, &wheel, &pan);
         bool has_smooth = smooth_has_pending();
-        // Cheaply read current button byte without draining accumulators
-        uint8_t current_buttons = kmbox_get_current_buttons();
-        bool buttons_changed = (current_buttons != last_sent_buttons);
+        bool buttons_changed = (buttons != last_sent_buttons);
 
         bool has_pending = has_kmbox || has_smooth || buttons_changed;
 
         if (!has_pending) goto check_idle;
 
-        // Drain accumulators (spinlock-protected, safe from both cores)
-        uint8_t buttons;
-        int16_t x, y;
-        int8_t wheel, pan;
-        kmbox_get_mouse_report_16(&buttons, &x, &y, &wheel, &pan);
-
-        // Process smooth injection
+        // Process smooth injection (int16_t for high-DPI support)
         int16_t smooth_x = 0, smooth_y = 0;
         if (has_smooth) {
-            int8_t sx8 = 0, sy8 = 0;
-            smooth_process_frame(&sx8, &sy8);
-            smooth_x = sx8;
-            smooth_y = sy8;
+            smooth_process_frame(&smooth_x, &smooth_y);
             x += smooth_x;
             y += smooth_y;
         }
@@ -1756,7 +1947,7 @@ void hid_device_task(void)
         // All output-stage noise is scaled by movement magnitude to prevent
         // overwhelming low-speed signals.  At 1-2 counts, ±1 noise is 50-100%
         // perturbation, creating chaotic scribble.
-        if (smooth_get_humanization_mode() != HUMANIZATION_OFF &&
+        if (frame_human_mode != HUMANIZATION_OFF &&
             (x != 0 || y != 0)) {
             float out_mag = sqrtf((float)x * x + (float)y * y);
             float noise_gate = fminf(1.0f, out_mag / 4.0f);  // ramp 0→1 over [0,4]px
@@ -1790,7 +1981,7 @@ void hid_device_task(void)
                 uint8_t raw[16];
                 build_raw_mouse_report(raw, sizeof(raw), &output_mouse_layout_16bit,
                                        buttons, x, y, wheel, pan);
-                tud_hid_report(REPORT_ID_MOUSE, raw, output_mouse_layout_16bit.report_size);
+                tud_hid_n_report(mouse_device_instance, REPORT_ID_MOUSE, raw, output_mouse_layout_16bit.report_size);
             } else if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
                 uint8_t raw[64];
                 uint8_t sz = host_mouse_layout.report_size;
@@ -1800,12 +1991,12 @@ void hid_device_task(void)
                                        buttons, x, y, wheel, pan);
 
                 uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
-                tud_hid_report(rid, raw, sz);
+                tud_hid_n_report(mouse_device_instance, rid, raw, sz);
             } else {
                 // Clamp to int8 for standard HID mouse report
                 int8_t cx = (x > 127) ? 127 : ((x < -128) ? -128 : (int8_t)x);
                 int8_t cy = (y > 127) ? 127 : ((y < -128) ? -128 : (int8_t)y);
-                tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, cx, cy, wheel, pan);
+                tud_hid_n_mouse_report(mouse_device_instance, REPORT_ID_MOUSE, buttons, cx, cy, wheel, pan);
             }
             last_sent_buttons = buttons;
             was_active = true;
@@ -1814,7 +2005,7 @@ void hid_device_task(void)
             // Always jitter when humanization is active — perfectly regular 1ms
             // intervals are a fingerprint regardless of physical mouse state.
             // Real USB polling has crystal oscillator drift + OS scheduling jitter.
-            if (smooth_get_humanization_mode() != HUMANIZATION_OFF) {
+            if (frame_human_mode != HUMANIZATION_OFF) {
                 // Gaussian jitter, stddev ~350us → CV ≈ 0.35 on 1000us base.
                 // Smaller than before to avoid excessive clamping; range is
                 // roughly ±700us (95th percentile), keeping interval in [500, 2000].
@@ -1830,7 +2021,7 @@ check_idle:
     // --- Active → idle edge: send one final zero-delta stop report ---
     // Real mice send a last report with zero deltas (confirming the stop)
     // before they begin NAKing idle polls.  Mirror that behavior here.
-    if (was_active && tud_hid_ready())
+    if (was_active && tud_hid_n_ready(mouse_device_instance))
     {
         uint8_t current_buttons = kmbox_get_current_buttons();
         if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
@@ -1842,9 +2033,9 @@ check_idle:
                                    current_buttons, 0, 0, 0, 0);
 
             uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
-            tud_hid_report(rid, raw, sz);
+            tud_hid_n_report(mouse_device_instance, rid, raw, sz);
         } else {
-            tud_hid_mouse_report(REPORT_ID_MOUSE, current_buttons, 0, 0, 0, 0);
+            tud_hid_n_mouse_report(mouse_device_instance, REPORT_ID_MOUSE, current_buttons, 0, 0, 0, 0);
         }
         last_sent_buttons = current_buttons;
         was_active = false;
@@ -1862,6 +2053,19 @@ check_idle:
     if (!connection_state.mouse_connected && !connection_state.keyboard_connected)
     {
         send_hid_report(REPORT_ID_MOUSE);
+    }
+
+    // --- Drain vendor report queue (Core1 → Core0 passthrough) ---
+    // Forward vendor/non-mouse reports from the host device to the downstream PC.
+    // This enables software like Logitech G Hub / Razer Synapse to communicate
+    // through the proxy for battery status, DPI changes, lighting, etc.
+    while (vendor_fwd_queue.tail != vendor_fwd_queue.head) {
+        vendor_report_entry_t *e = &vendor_fwd_queue.entries[vendor_fwd_queue.tail];
+        if (e->device_instance < CFG_TUD_HID && tud_hid_n_ready(e->device_instance)) {
+            tud_hid_n_report(e->device_instance, e->report_id, e->data, e->len);
+        }
+        __dmb();
+        vendor_fwd_queue.tail = (vendor_fwd_queue.tail + 1) & VENDOR_QUEUE_MASK;
     }
 }
 
@@ -1891,11 +2095,11 @@ void send_hid_report(uint8_t report_id)
         if (!connection_state.keyboard_connected)
         {
             // Check device readiness before each report
-            if (tud_hid_ready())
+            if (tud_hid_n_ready(mouse_device_instance))
             {
                 // Use static array to avoid stack allocation overhead
                 static const uint8_t empty_keycode[HID_KEYBOARD_KEYCODE_COUNT] = {0};
-                tud_hid_keyboard_report(runtime_kbd_report_id, 0, empty_keycode);
+                tud_hid_n_keyboard_report(mouse_device_instance, runtime_kbd_report_id, 0, empty_keycode);
             }
         }
         break;
@@ -1905,7 +2109,7 @@ void send_hid_report(uint8_t report_id)
         if (!connection_state.mouse_connected)
         {
             // Check device readiness before each report
-            if (tud_hid_ready())
+            if (tud_hid_n_ready(mouse_device_instance))
             {
                 static bool prev_button_state = true; // true = not pressed (active low)
                 bool current_button_state = gpio_get(PIN_BUTTON);
@@ -1913,14 +2117,14 @@ void send_hid_report(uint8_t report_id)
                 if (!current_button_state)
                 { // button pressed (active low)
                     // Mouse move up (negative Y direction)
-                    tud_hid_mouse_report(REPORT_ID_MOUSE, MOUSE_BUTTON_NONE,
+                    tud_hid_n_mouse_report(mouse_device_instance, REPORT_ID_MOUSE, MOUSE_BUTTON_NONE,
                                          MOUSE_NO_MOVEMENT, MOUSE_BUTTON_MOVEMENT_DELTA,
                                          MOUSE_NO_MOVEMENT, MOUSE_NO_MOVEMENT);
                 }
                 else if (prev_button_state != current_button_state)
                 {
                     // Send stop movement when button is released
-                    tud_hid_mouse_report(REPORT_ID_MOUSE, MOUSE_BUTTON_NONE,
+                    tud_hid_n_mouse_report(mouse_device_instance, REPORT_ID_MOUSE, MOUSE_BUTTON_NONE,
                                          MOUSE_NO_MOVEMENT, MOUSE_NO_MOVEMENT,
                                          MOUSE_NO_MOVEMENT, MOUSE_NO_MOVEMENT);
                 }
@@ -1933,10 +2137,10 @@ void send_hid_report(uint8_t report_id)
     case REPORT_ID_CONSUMER_CONTROL:
     {
         // CRITICAL: Check device readiness before each report
-        if (tud_hid_ready())
+        if (tud_hid_n_ready(mouse_device_instance))
         {
             static const uint16_t empty_key = 0;
-            tud_hid_report(runtime_consumer_report_id, &empty_key, HID_CONSUMER_CONTROL_SIZE);
+            tud_hid_n_report(mouse_device_instance, runtime_consumer_report_id, &empty_key, HID_CONSUMER_CONTROL_SIZE);
         }
         break;
     }
@@ -1948,8 +2152,18 @@ void send_hid_report(uint8_t report_id)
 
 void hid_host_task(void)
 {
-    // This function can be called from core0 if needed for additional host processing
-    // The main host task runs on core1 in PIOKMbox.c
+    // Drain SET_REPORT passthrough queue (Core0 → Core1).
+    // Forward vendor SET_REPORT requests from the downstream PC to the real mouse.
+    // Process at most 1 per call — tuh_hid_set_report() may block on USB
+    // control transfer, and draining the full queue could stall Core1's PIO USB.
+    if (set_report_queue.tail != set_report_queue.head) {
+        set_report_entry_t *e = &set_report_queue.entries[set_report_queue.tail];
+        tuh_hid_set_report(e->host_dev_addr, e->host_instance,
+                           e->report_id, e->report_type,
+                           (void*)e->data, e->len);
+        __dmb();
+        set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
+    }
 }
 
 // Device callbacks with improved error handling
@@ -2016,24 +2230,25 @@ void tuh_umount_cb(uint8_t dev_addr)
     neopixel_update_status();
 }
 
-// HID host callbacks with improved validation
+// HID host callbacks — multi-interface mirroring with vendor report passthrough
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_report, uint16_t desc_len)
 {
     uint16_t vid, pid;
     tuh_vid_pid_get(dev_addr, &vid, &pid);
 
     // === DEVICE-LEVEL CLONING (once per physical device) ===
-    // Composite devices (e.g. Razer Basilisk V3 = 4 HID interfaces) trigger
-    // tuh_hid_mount_cb once per interface. Device/config descriptors and strings
-    // are device-level, so we only need to fetch them once.
     bool first_interface_for_device = (cloned_dev_addr != dev_addr);
-    
+
     if (first_interface_for_device) {
         cloned_dev_addr = dev_addr;
-        
+        mounted_hid_itf_count = 0;
+        mirrored_itf_count = 0;
+        mouse_device_instance = 0;
+        memset(mirrored_itfs, 0, sizeof(mirrored_itfs));
+
         // Fetch string descriptors from the attached device
         fetch_device_string_descriptors(dev_addr);
-        
+
         // Capture full device descriptor for identity cloning
         tusb_desc_device_t host_dev_desc;
         if (tuh_descriptor_get_device_sync(dev_addr, &host_dev_desc, sizeof(host_dev_desc)) == XFER_RESULT_SUCCESS) {
@@ -2044,159 +2259,172 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             host_device_info.bMaxPacketSize0 = host_dev_desc.bMaxPacketSize0;
             host_device_info.bcdDevice       = host_dev_desc.bcdDevice;
             host_device_info.valid           = true;
+
+            // Track string indices from device descriptor
+            if (host_dev_desc.iManufacturer > max_string_index_seen) max_string_index_seen = host_dev_desc.iManufacturer;
+            if (host_dev_desc.iProduct > max_string_index_seen) max_string_index_seen = host_dev_desc.iProduct;
+            if (host_dev_desc.iSerialNumber > max_string_index_seen) max_string_index_seen = host_dev_desc.iSerialNumber;
         }
-        
-        // Capture configuration descriptor (contains all interfaces + endpoints)
-        uint8_t cfg_buf[256];
+
+        // Capture and parse full configuration descriptor (all interfaces + endpoints)
+        uint8_t cfg_buf[512];
         if (tuh_descriptor_get_configuration_sync(dev_addr, 0, cfg_buf, sizeof(cfg_buf)) == XFER_RESULT_SUCCESS) {
-            parse_host_config_descriptor(cfg_buf, sizeof(cfg_buf));
+            uint16_t cfg_total = cfg_buf[2] | (cfg_buf[3] << 8);
+            if (cfg_total > sizeof(cfg_buf)) cfg_total = sizeof(cfg_buf);
+            parse_host_config_descriptor(cfg_buf, cfg_total);
+        }
+
+        // Fetch any extra string descriptors beyond the standard 3 (manufacturer, product, serial)
+        for (uint8_t si = 4; si <= max_string_index_seen && extra_string_count < MAX_CACHED_STRINGS; si++) {
+            uint16_t tmp_buf[48];
+            memset(tmp_buf, 0, sizeof(tmp_buf));
+            if (tuh_descriptor_get_string_sync(dev_addr, si, LANGUAGE_ID, tmp_buf, sizeof(tmp_buf)) == XFER_RESULT_SUCCESS) {
+                cached_string_t *cs = &extra_strings[extra_string_count];
+                cs->index = si;
+                utf16_to_utf8(tmp_buf, sizeof(tmp_buf), cs->str, sizeof(cs->str));
+                cs->valid = (strlen(cs->str) > 0);
+                if (cs->valid) extra_string_count++;
+            }
         }
     }
+
+    mounted_hid_itf_count++;
 
     // === DETERMINE EFFECTIVE PROTOCOL ===
     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
     hid_instance_info_t *inst_info = alloc_hid_instance(dev_addr, instance);
     uint8_t effective_protocol = itf_protocol;
-    
+
     if (itf_protocol == HID_ITF_PROTOCOL_NONE && desc_report != NULL && desc_len > 0) {
-        // Non-boot protocol device — detect usage from report descriptor
         effective_protocol = detect_usage_from_report_descriptor(desc_report, desc_len, inst_info);
     }
-    
     if (inst_info) {
         inst_info->effective_protocol = effective_protocol;
     }
 
-    // === MOUSE INTERFACE: Capture HID report descriptor ===
-    // CRITICAL: Only capture the mouse descriptor from the mouse interface!
-    // Composite devices have multiple interfaces with different descriptors.
-    // e.g. Razer Basilisk V3:
-    //   Interface 0: Boot Mouse (protocol=2), 79 byte desc — THIS IS THE MOUSE
-    //   Interface 1: Keyboard (protocol=1), 159 byte desc — macro keys
-    //   Interface 2: Keyboard (protocol=1), 61 byte desc — more keys
-    //   Interface 3: Vendor (protocol=0), 22 byte desc — lighting control
-    // We MUST NOT let interfaces 1-3 overwrite the mouse descriptor from interface 0.
     bool is_mouse_interface = (effective_protocol == HID_ITF_PROTOCOL_MOUSE);
-    
-    if (is_mouse_interface && desc_report != NULL && desc_len > 0) {
-        // Capture this interface's HID report descriptor as the mouse descriptor.
-        // Logitech Unifying receivers include HID++ vendor collections (Report IDs
-        // 0x10/0x11, Usage Page 0xFF00) alongside the mouse collection.  Strip
-        // these before storing — they confuse host HID drivers and can trigger
-        // installation of vendor filter drivers that fight the proxy.
-        size_t copy_len = desc_len;
-        if (copy_len > sizeof(host_mouse_desc))
-            copy_len = sizeof(host_mouse_desc);
-        host_mouse_desc_len = strip_vendor_collections(desc_report, copy_len,
-                                                        host_mouse_desc, sizeof(host_mouse_desc));
 
-        // Parse the mouse report layout to discover field offsets for raw forwarding
-        parse_mouse_report_layout(host_mouse_desc, host_mouse_desc_len, &host_mouse_layout);
-        
-        // CRITICAL FIX: Detect OS descriptor mismatches (macOS/Windows sometimes expose
-        // 8-bit descriptors for 16-bit mice). Check if descriptor claims 8-bit X/Y but
-        // report is large enough for 16-bit data (8+ bytes = 2 btn + 2 X + 2 Y + wheel + pan).
-        if (host_mouse_layout.valid && 
-            host_mouse_layout.x_bits == 8 && 
-            host_mouse_layout.y_bits == 8 &&
-            host_mouse_layout.report_size >= 8 &&
-            host_mouse_layout.buttons_bits >= 8) {
-            // Descriptor says 8-bit but structure suggests 16-bit
-            // Override to 16-bit layout (common with Logitech Lightspeed, etc.)
-            host_mouse_layout.x_bits = 16;
-            host_mouse_layout.y_bits = 16;
-            host_mouse_layout.x_is_16bit = true;
-            host_mouse_layout.y_is_16bit = true;
-            host_mouse_layout.report_size = 8;
+    // === ALLOCATE MIRRORED INTERFACE SLOT ===
+    // Each host HID interface gets a corresponding device-side interface.
+    uint8_t mirror_idx = mirrored_itf_count;
+    if (mirror_idx < MAX_DEVICE_HID_INTERFACES) {
+        mirrored_interface_t *mitf = &mirrored_itfs[mirror_idx];
+        mitf->active = true;
+        mitf->host_dev_addr = dev_addr;
+        mitf->host_instance = instance;
+        mitf->is_mouse = is_mouse_interface;
+
+        // Endpoint config was already parsed from config descriptor;
+        // the Nth HID interface in the config maps to mirrored_itfs[N].
+        // (parse_host_config_descriptor pre-populated subclass/protocol/ep_*)
+
+        // Track which device-side instance is the mouse (composite descriptor)
+        if (is_mouse_interface) {
+            mouse_device_instance = mirror_idx;
         }
-        
-        // Use the layout-parsed report ID (extracted from the mouse collection context)
-        // instead of blindly scanning for the first 0x85 tag
-        if (host_mouse_layout.valid && host_mouse_layout.has_report_id) {
-            host_mouse_has_report_id = true;
-            host_mouse_report_id = host_mouse_layout.mouse_report_id;
-        } else {
-            // Fallback: scan for any Report ID tag in the descriptor
-            host_mouse_has_report_id = false;
-            host_mouse_report_id = 0;
-            for (size_t i = 0; i + 1 < host_mouse_desc_len; ++i) {
-                if (host_mouse_desc[i] == 0x85) {
-                    host_mouse_has_report_id = true;
-                    host_mouse_report_id = host_mouse_desc[i + 1];
-                    break;
+
+        if (is_mouse_interface && desc_report != NULL && desc_len > 0) {
+            // --- MOUSE INTERFACE ---
+            // Store full descriptor (including vendor collections) for the mouse interface.
+            size_t copy_len = desc_len;
+            if (copy_len > sizeof(host_mouse_desc)) copy_len = sizeof(host_mouse_desc);
+            memcpy(host_mouse_desc, desc_report, copy_len);
+            host_mouse_desc_len = copy_len;
+
+            // Parse mouse report layout for raw forwarding
+            parse_mouse_report_layout(host_mouse_desc, host_mouse_desc_len, &host_mouse_layout);
+
+            // Detect OS descriptor mismatches (8-bit desc for 16-bit mouse)
+            if (host_mouse_layout.valid &&
+                host_mouse_layout.x_bits == 8 && host_mouse_layout.y_bits == 8 &&
+                host_mouse_layout.report_size >= 8 && host_mouse_layout.buttons_bits >= 8) {
+                host_mouse_layout.x_bits = 16;
+                host_mouse_layout.y_bits = 16;
+                host_mouse_layout.x_is_16bit = true;
+                host_mouse_layout.y_is_16bit = true;
+                host_mouse_layout.report_size = 8;
+            }
+
+            // Classify layout for fast-path dispatch (after all fixups)
+            classify_mouse_layout(&host_mouse_layout);
+
+            // Extract mouse report ID
+            if (host_mouse_layout.valid && host_mouse_layout.has_report_id) {
+                host_mouse_has_report_id = true;
+                host_mouse_report_id = host_mouse_layout.mouse_report_id;
+            } else {
+                host_mouse_has_report_id = false;
+                host_mouse_report_id = 0;
+                for (size_t i = 0; i + 1 < host_mouse_desc_len; ++i) {
+                    if (host_mouse_desc[i] == 0x85) {
+                        host_mouse_has_report_id = true;
+                        host_mouse_report_id = host_mouse_desc[i + 1];
+                        break;
+                    }
                 }
             }
-        }
-        
-        // Also update instance info with the correct mouse report ID
-        if (inst_info) {
-            inst_info->has_report_id = host_mouse_has_report_id;
-            inst_info->mouse_report_id = host_mouse_report_id;
+
+            if (inst_info) {
+                inst_info->has_report_id = host_mouse_has_report_id;
+                inst_info->mouse_report_id = host_mouse_report_id;
+            }
+
+            // Build composite HID report descriptor (keyboard + mouse + consumer)
+            build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
+
+        } else if (desc_report != NULL && desc_len > 0) {
+            // --- NON-MOUSE INTERFACE (keyboard-macros, vendor, etc.) ---
+            // Store verbatim descriptor for faithful mirroring
+            size_t copy_len = desc_len;
+            if (copy_len > MIRROR_ITF_DESC_MAX) copy_len = MIRROR_ITF_DESC_MAX;
+            memcpy(mitf->report_desc, desc_report, copy_len);
+            mitf->report_desc_len = copy_len;
         }
 
-        // Build runtime HID report descriptor (keyboard + mouse + consumer)
-        build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
-        rebuild_configuration_descriptor();
-        
-        // CRITICAL: set_attached_device_vid_pid() triggers force_usb_reenumeration()
-        // which disconnects/reconnects the device stack. This MUST happen AFTER all
-        // descriptors are fully rebuilt. It also only triggers if VID/PID changed.
-        set_attached_device_vid_pid(vid, pid);
-    }
-    else if (first_interface_for_device && !is_mouse_interface) {
-        // First interface mounted but it's not the mouse — still need to set VID/PID
-        // so we present the correct identity. The mouse descriptor will be captured
-        // when the mouse interface mounts (if it exists).
-        // Don't overwrite host_mouse_desc or host_mouse_layout here!
-        
-        // If we haven't seen a mouse interface yet for this device, build
-        // descriptors with defaults. They'll be rebuilt when mouse mounts.
-        if (host_mouse_desc_len == 0) {
-            build_runtime_hid_report_with_mouse(NULL, 0);
-            rebuild_configuration_descriptor();
-            set_attached_device_vid_pid(vid, pid);
-        }
+        mirrored_itf_count++;
     }
 
     // Handle HID device connection using effective protocol
     handle_hid_device_connection(dev_addr, effective_protocol);
 
-    // Start receiving reports — but only from interfaces we actually want.
-    //
-    // Composite gaming mice (e.g. Razer Basilisk V3) expose multiple HID
-    // interfaces on a single dev_addr:
-    //   Interface 0: Boot Mouse (protocol=2)  — WE WANT THIS
-    //   Interface 1: Keyboard (protocol=1)    — macro keys, NOT a real keyboard
-    //   Interface 2: Keyboard (protocol=1)    — media keys, NOT a real keyboard
-    //   Interface 3: Vendor (protocol=0)      — lighting control
-    //
-    // If we receive reports from the non-mouse interfaces, their periodic
-    // status/idle reports get forwarded as keyboard input, causing garbage
-    // keypresses (e.g. '#' flood).
-    //
-    // Rule: Only receive from mouse interfaces, OR from keyboard/vendor
-    // interfaces on a DIFFERENT device (i.e. a standalone keyboard).
+    // === START RECEIVING REPORTS ===
+    // Receive from ALL interfaces on the mouse device for vendor report passthrough.
+    // Standalone keyboards on a different device are also received.
+    // Filtering of composite macro-keyboard garbage happens in report_received_cb.
     bool should_receive = false;
-    
+
     if (is_mouse_interface) {
-        // Always receive from mouse interfaces
         should_receive = true;
     } else if (dev_addr != connection_state.mouse_dev_addr) {
-        // This interface is on a different physical device than the mouse,
-        // so it's a standalone keyboard — receive its reports
+        // Standalone keyboard on different device
+        should_receive = true;
+    } else {
+        // Non-mouse interface on same device — receive for vendor report passthrough
         should_receive = true;
     }
-    // else: non-mouse interface on the same device as the mouse → skip
 
     if (should_receive) {
         if (!tuh_hid_receive_report(dev_addr, instance)) {
             neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
-        } else {
-            neopixel_update_status();
         }
-    } else {
-        // Skip receiving from non-mouse interfaces on the same device
     }
+
+    // === DEFERRED RE-ENUMERATION ===
+    // Wait until all expected HID interfaces have mounted before triggering
+    // re-enumeration.  This ensures the config descriptor includes ALL
+    // interfaces, not just the first one.
+    if (mounted_hid_itf_count >= expected_hid_itf_count) {
+        // All interfaces captured — build final descriptors
+        if (host_mouse_desc_len == 0) {
+            // No mouse interface found; use defaults
+            build_runtime_hid_report_with_mouse(NULL, 0);
+        }
+        rebuild_configuration_descriptor();
+
+        // Trigger re-enumeration (only fires if VID/PID actually changed)
+        set_attached_device_vid_pid(vid, pid);
+    }
+
     neopixel_update_status();
 }
 
@@ -2307,6 +2535,61 @@ static void __not_in_flash_func(parse_and_forward_mouse_report)(const uint8_t *d
     process_mouse_report(&mouse_report_local);
 }
 
+// Queue a vendor/non-mouse report for Core0 to send on the device side.
+// Called from Core1 — must not call any tud_* functions.
+static void __not_in_flash_func(queue_vendor_report)(uint8_t device_instance, uint8_t report_id,
+                                                       const uint8_t *data, uint8_t data_len)
+{
+    uint8_t capped_len = (data_len > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : data_len;
+
+    // Update GET_REPORT cache so tud_hid_get_report_cb can respond to macOS IOKit.
+    if (device_instance < MAX_DEVICE_HID_INTERFACES) {
+        cached_report_t *slots = report_cache[device_instance];
+        int slot = -1;
+        int empty = -1;
+        for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
+            if (slots[i].valid && slots[i].report_id == report_id) { slot = i; break; }
+            if (!slots[i].valid && empty < 0) empty = i;
+        }
+        if (slot < 0) slot = (empty >= 0) ? empty : 0;  // Evict first slot if full
+        slots[slot].report_id = report_id;
+        slots[slot].len = capped_len;
+        memcpy(slots[slot].data, data, capped_len);
+        __dmb();
+        slots[slot].valid = true;
+    }
+
+    // Queue for Core0 to forward via interrupt IN endpoint
+    uint8_t next_head = (vendor_fwd_queue.head + 1) & VENDOR_QUEUE_MASK;
+    if (next_head == vendor_fwd_queue.tail) return;  // Queue full, drop
+
+    vendor_report_entry_t *e = &vendor_fwd_queue.entries[vendor_fwd_queue.head];
+    e->device_instance = device_instance;
+    e->report_id = report_id;
+    e->len = capped_len;
+    memcpy(e->data, data, capped_len);
+
+    __dmb();  // Ensure data written before head advances
+    vendor_fwd_queue.head = next_head;
+}
+
+// Find which mirrored interface slot corresponds to a host (dev_addr, instance).
+static mirrored_interface_t* find_mirrored_interface(uint8_t dev_addr, uint8_t instance) {
+    for (uint8_t i = 0; i < mirrored_itf_count; i++) {
+        if (mirrored_itfs[i].active &&
+            mirrored_itfs[i].host_dev_addr == dev_addr &&
+            mirrored_itfs[i].host_instance == instance) {
+            return &mirrored_itfs[i];
+        }
+    }
+    return NULL;
+}
+
+// Get the device-side instance index for a mirrored interface.
+static uint8_t mirrored_device_instance(const mirrored_interface_t *mitf) {
+    return (uint8_t)(mitf - mirrored_itfs);
+}
+
 void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len)
 {
     if (report == NULL || len == 0)
@@ -2315,45 +2598,46 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         return;
     }
 
-    // Look up effective protocol from our per-instance tracking
-    // This handles non-boot-protocol devices (Logitech, gaming mice, etc.)
+    // Look up effective protocol from per-instance tracking
     uint8_t effective_protocol = tuh_hid_interface_protocol(dev_addr, instance);
     hid_instance_info_t *inst_info = find_hid_instance(dev_addr, instance);
     bool has_report_id = false;
-    uint8_t mouse_report_id = 0;
-    
+    uint8_t mouse_report_id_local = 0;
+
     if (inst_info) {
         effective_protocol = inst_info->effective_protocol;
         has_report_id = inst_info->has_report_id;
-        mouse_report_id = inst_info->mouse_report_id;
+        mouse_report_id_local = inst_info->mouse_report_id;
     }
 
-    // Direct processing without extra copying for better performance
-    // SAFETY: Only forward keyboard reports from standalone keyboard devices,
-    // not from keyboard interfaces on composite mouse devices (e.g. Razer
-    // Basilisk V3 exposes macro/media key interfaces that send garbage data).
     switch (effective_protocol)
     {
     case HID_ITF_PROTOCOL_KEYBOARD:
         {
-            // Only forward if this is a standalone keyboard (different device than mouse)
+            // Only forward keyboard from standalone devices (different device than mouse)
             if (dev_addr == connection_state.mouse_dev_addr) {
-                // This keyboard interface is on the same device as the mouse —
-                // it's a composite gaming mouse's macro/media keys, skip it
+                // Composite gaming mouse macro/media keys — queue for vendor passthrough
+                // instead of interpreting as keyboard input
+                mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
+                if (mitf) {
+                    uint8_t dev_inst = mirrored_device_instance(mitf);
+                    uint8_t rid = (has_report_id && len > 0) ? report[0] : 0;
+                    const uint8_t *data = (has_report_id && len > 0) ? report + 1 : report;
+                    uint8_t dlen = (has_report_id && len > 0) ? (uint8_t)(len - 1) : (uint8_t)len;
+                    queue_vendor_report(dev_inst, rid, data, dlen);
+                }
                 break;
             }
-            
+
             const uint8_t *kbd_data = report;
             uint16_t kbd_len = len;
-            
-            // Strip report ID prefix if present
+
             if (has_report_id && kbd_len > 0) {
                 kbd_data++;
                 kbd_len--;
             }
-            
-            if (kbd_len >= (int)sizeof(hid_keyboard_report_t))
-            {
+
+            if (kbd_len >= (int)sizeof(hid_keyboard_report_t)) {
                 process_kbd_report((const hid_keyboard_report_t*)kbd_data);
             }
         }
@@ -2363,26 +2647,40 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         {
             const uint8_t *mouse_data = report;
             uint16_t mouse_len = len;
-            
-            // For composite/report-ID devices, the first byte is the report ID
-            // We need to strip it before parsing the mouse data
+
             if (has_report_id && mouse_len > 0) {
                 uint8_t received_id = mouse_data[0];
-                // Only process if this report ID matches the mouse report ID
-                if (received_id != mouse_report_id) {
-                    // Not a mouse report from this composite device - skip
+                if (received_id != mouse_report_id_local) {
+                    // Not the mouse report — this is a vendor report on the mouse
+                    // interface (e.g. Logitech HID++ on same interface as mouse).
+                    // Queue for passthrough to device side.
+                    mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
+                    if (mitf) {
+                        uint8_t dev_inst = mirrored_device_instance(mitf);
+                        queue_vendor_report(dev_inst, received_id, mouse_data + 1, (uint8_t)(mouse_len - 1));
+                    }
                     break;
                 }
                 mouse_data++;
                 mouse_len--;
             }
-            
+
             parse_and_forward_mouse_report(mouse_data, mouse_len);
         }
         break;
 
     default:
-        // Unknown HID protocol - ignore
+        {
+            // Unknown/vendor protocol — forward entire report for passthrough
+            mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
+            if (mitf) {
+                uint8_t dev_inst = mirrored_device_instance(mitf);
+                uint8_t rid = (has_report_id && len > 0) ? report[0] : 0;
+                const uint8_t *data = (has_report_id && len > 0) ? report + 1 : report;
+                uint8_t dlen = (has_report_id && len > 0) ? (uint8_t)(len - 1) : (uint8_t)len;
+                queue_vendor_report(dev_inst, rid, data, dlen);
+            }
+        }
         break;
     }
 
@@ -2393,25 +2691,35 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
 // HID device callbacks with improved validation
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
 {
-    (void)instance;
-    (void)report_id;
     (void)report_type;
-    (void)buffer;
-    (void)reqlen;
-    return 0;
+
+    if (instance >= MAX_DEVICE_HID_INTERFACES || !buffer || reqlen == 0) return 0;
+
+    // Look up cached report from the real device
+    cached_report_t *slots = report_cache[instance];
+    __dmb();  // Ensure we see Core1's latest cache writes
+    for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
+        if (slots[i].valid && slots[i].report_id == report_id) {
+            uint16_t copy_len = (slots[i].len < reqlen) ? slots[i].len : reqlen;
+            memcpy(buffer, slots[i].data, copy_len);
+            return copy_len;
+        }
+    }
+
+    // No cached data yet — return zeros so the host sees the device as responsive.
+    // macOS IOKit sends GET_REPORT during device open; returning 0 (no data) causes
+    // "open failed". Returning a zeroed buffer keeps the open path happy.
+    uint16_t fill_len = (reqlen > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : reqlen;
+    memset(buffer, 0, fill_len);
+    return fill_len;
 }
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, const uint8_t *buffer, uint16_t bufsize)
 {
-    (void)instance;
-
+    // Handle keyboard LED output reports (caps lock, etc.)
     if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == runtime_kbd_report_id)
     {
-        // Validate buffer
-        if (buffer == NULL || bufsize < MIN_BUFFER_SIZE)
-        {
-            return;
-        }
+        if (buffer == NULL || bufsize < MIN_BUFFER_SIZE) return;
 
         uint8_t const kbd_leds = buffer[0];
         bool new_caps_state = (kbd_leds & KEYBOARD_LED_CAPSLOCK) != 0;
@@ -2419,8 +2727,28 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
         if (new_caps_state != caps_lock_state)
         {
             caps_lock_state = new_caps_state;
-            // Indicate caps lock change with LED flash instead of console logging
             neopixel_trigger_caps_lock_flash();
+        }
+        return;
+    }
+
+    // Forward all other SET_REPORT requests to the real mouse for vendor passthrough.
+    // This enables Logitech G Hub, Razer Synapse, etc. to configure DPI, lighting,
+    // macros, battery queries through the proxy.
+    if (buffer != NULL && bufsize > 0 && instance < mirrored_itf_count && mirrored_itfs[instance].active) {
+        mirrored_interface_t *mitf = &mirrored_itfs[instance];
+
+        uint8_t next_head = (set_report_queue.head + 1) & VENDOR_QUEUE_MASK;
+        if (next_head != set_report_queue.tail) {
+            set_report_entry_t *e = &set_report_queue.entries[set_report_queue.head];
+            e->host_dev_addr = mitf->host_dev_addr;
+            e->host_instance = mitf->host_instance;
+            e->report_id = report_id;
+            e->report_type = (uint8_t)report_type;
+            e->len = (bufsize > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)bufsize;
+            memcpy(e->data, buffer, e->len);
+            __dmb();
+            set_report_queue.head = next_head;
         }
     }
 }
@@ -2586,16 +2914,28 @@ uint8_t const * tud_descriptor_device_cb(void)
     return (uint8_t const *)&desc_device;
 }
 
-// HID Report Descriptor
+// HID Report Descriptor — per-instance for multi-interface mirroring.
+// Instance 0 is typically the mouse interface (composite: keyboard + mouse + consumer).
+// Other instances return verbatim cloned descriptors from the host device.
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
-    (void)instance;
-    if (desc_hid_runtime_valid)
-    {
+    // Multi-interface mode: return the correct descriptor for each instance
+    if (mirrored_itf_count > 0 && instance < mirrored_itf_count && mirrored_itfs[instance].active) {
+        if (mirrored_itfs[instance].is_mouse) {
+            // Mouse interface returns composite descriptor (keyboard + mouse + consumer)
+            return desc_hid_runtime_valid ? desc_hid_report_runtime : desc_hid_report;
+        }
+        // Non-mouse interface returns verbatim host descriptor
+        if (mirrored_itfs[instance].report_desc_len > 0) {
+            return mirrored_itfs[instance].report_desc;
+        }
+    }
+
+    // Single-interface fallback
+    if (instance == 0 && desc_hid_runtime_valid) {
         return desc_hid_report_runtime;
     }
-    // Fallback to static concatenation if runtime descriptor not ready
-    return desc_hid_report_runtime; // still points to buffer (may contain defaults)
+    return desc_hid_report;
 }
 
 // Configuration Descriptor - now dynamic for cloning
@@ -2605,107 +2945,216 @@ enum
     ITF_NUM_TOTAL
 };
 
-// Offsets within the configuration descriptor for fields we patch
-#define CFG_DESC_OFFSET_BMATTRIBUTES    7
-#define CFG_DESC_OFFSET_BMAXPOWER       8
-#define HID_ITF_OFFSET_SUBCLASS         (TUD_CONFIG_DESC_LEN + 6)  // bInterfaceSubClass
-#define HID_ITF_OFFSET_PROTOCOL         (TUD_CONFIG_DESC_LEN + 7)  // bInterfaceProtocol
-#define HID_DESC_OFFSET_REPORT_LEN_LO   (TUD_CONFIG_DESC_LEN + 9 + 7)  // wDescriptorLength low byte
-#define HID_DESC_OFFSET_REPORT_LEN_HI   (TUD_CONFIG_DESC_LEN + 9 + 8)  // wDescriptorLength high byte
-#define HID_EP_OFFSET_MAXPACKET_LO      (TUD_CONFIG_DESC_LEN + 9 + 9 + 4) // wMaxPacketSize low byte
-#define HID_EP_OFFSET_MAXPACKET_HI      (TUD_CONFIG_DESC_LEN + 9 + 9 + 5) // wMaxPacketSize high byte
-#define HID_EP_OFFSET_INTERVAL          (TUD_CONFIG_DESC_LEN + 9 + 9 + 6) // bInterval
+// Helper: write one HID interface block (interface desc + HID desc + endpoint(s))
+// into a buffer.  Returns number of bytes written.
+static uint16_t write_hid_interface_desc(uint8_t *buf, uint16_t buf_max,
+                                          uint8_t itf_num, uint8_t subclass,
+                                          uint8_t protocol, uint16_t report_desc_len,
+                                          uint8_t ep_in_addr, uint16_t ep_in_size,
+                                          uint8_t ep_in_interval,
+                                          bool has_ep_out, uint8_t ep_out_interval)
+{
+    uint16_t pos = 0;
+    uint8_t num_eps = has_ep_out ? 2 : 1;
 
-// Build the configuration descriptor from current runtime state
+    // Interface descriptor (9 bytes)
+    if (pos + 9 > buf_max) return 0;
+    buf[pos++] = 9;
+    buf[pos++] = TUSB_DESC_INTERFACE;
+    buf[pos++] = itf_num;
+    buf[pos++] = 0;              // bAlternateSetting
+    buf[pos++] = num_eps;
+    buf[pos++] = TUSB_CLASS_HID;
+    buf[pos++] = subclass;
+    buf[pos++] = protocol;
+    buf[pos++] = 0;              // iInterface
+
+    // HID descriptor (9 bytes)
+    if (pos + 9 > buf_max) return 0;
+    buf[pos++] = 9;
+    buf[pos++] = HID_DESC_TYPE_HID;
+    buf[pos++] = 0x11;           // bcdHID low (1.11)
+    buf[pos++] = 0x01;           // bcdHID high
+    buf[pos++] = 0;              // bCountryCode
+    buf[pos++] = 1;              // bNumDescriptors
+    buf[pos++] = HID_DESC_TYPE_REPORT;
+    buf[pos++] = (uint8_t)(report_desc_len & 0xFF);
+    buf[pos++] = (uint8_t)((report_desc_len >> 8) & 0xFF);
+
+    // IN endpoint descriptor (7 bytes)
+    if (pos + 7 > buf_max) return 0;
+    buf[pos++] = 7;
+    buf[pos++] = TUSB_DESC_ENDPOINT;
+    buf[pos++] = ep_in_addr;
+    buf[pos++] = TUSB_XFER_INTERRUPT;
+    buf[pos++] = (uint8_t)(ep_in_size & 0xFF);
+    buf[pos++] = (uint8_t)((ep_in_size >> 8) & 0xFF);
+    buf[pos++] = ep_in_interval;
+
+    // OUT endpoint descriptor (7 bytes, optional)
+    if (has_ep_out) {
+        if (pos + 7 > buf_max) return 0;
+        buf[pos++] = 7;
+        buf[pos++] = TUSB_DESC_ENDPOINT;
+        buf[pos++] = ep_in_addr & 0x0F;  // Same EP number, OUT direction
+        buf[pos++] = TUSB_XFER_INTERRUPT;
+        buf[pos++] = (uint8_t)(ep_in_size & 0xFF);
+        buf[pos++] = (uint8_t)((ep_in_size >> 8) & 0xFF);
+        buf[pos++] = ep_out_interval;
+    }
+
+    return pos;
+}
+
+// Build the configuration descriptor from current runtime state.
+// Supports 1-4 HID interfaces mirroring the host device's layout.
 static void rebuild_configuration_descriptor(void) {
-    // Determine actual report descriptor length
-    size_t report_desc_len = desc_hid_runtime_valid ? desc_hid_runtime_len : sizeof(desc_hid_report);
-    
-    // Clone ALL configuration descriptor fields from the host mouse.
-    // The goal is to present as the exact same device to the downstream PC.
+    uint8_t num_itfs = (mirrored_itf_count > 0) ? mirrored_itf_count : 1;
+    if (num_itfs > MAX_DEVICE_HID_INTERFACES) num_itfs = MAX_DEVICE_HID_INTERFACES;
+
     uint8_t cfg_attributes = TU_BIT(7) | (host_config_info.valid ? host_config_info.bmAttributes : TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP);
     uint8_t cfg_max_power = host_config_info.valid ? host_config_info.bMaxPower : (USB_CONFIG_POWER_MA / 2);
-    uint8_t itf_sub_class = host_config_info.valid ? host_config_info.bInterfaceSubClass : 0;
-    uint8_t itf_protocol = host_config_info.valid ? host_config_info.bInterfaceProtocol : HID_ITF_PROTOCOL_NONE;
-    // CRITICAL: wMaxPacketSize must be our actual EP buffer size, NOT the host mouse's.
-    // We re-encode reports through tud_hid_mouse_report() / tud_hid_keyboard_report(),
-    // and our keyboard report (1 + 8 = 9 bytes) may exceed a small mouse EP size (e.g. 8).
-    // The downstream PC uses this to allocate its receive buffer — it must fit our largest report.
-    uint16_t ep_max_packet = CFG_TUD_HID_EP_BUFSIZE;
-    uint8_t ep_interval = host_config_info.valid ? host_config_info.bInterval : HID_POLLING_INTERVAL_MS;
-    
-    // Build using the TinyUSB macros as a base template, then patch
-    uint8_t template[] = {
-        TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, USB_CONFIG_POWER_MA),
-        TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, HID_POLLING_INTERVAL_MS)
-    };
-    
-    _Static_assert(sizeof(template) == TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN, "config descriptor size mismatch");
-    memcpy(desc_configuration_runtime, template, sizeof(template));
-    
-    // Patch config descriptor fields
-    desc_configuration_runtime[CFG_DESC_OFFSET_BMATTRIBUTES] = cfg_attributes;
-    desc_configuration_runtime[CFG_DESC_OFFSET_BMAXPOWER] = cfg_max_power;
-    
-    // Patch HID interface descriptor fields
-    desc_configuration_runtime[HID_ITF_OFFSET_SUBCLASS] = itf_sub_class;
-    desc_configuration_runtime[HID_ITF_OFFSET_PROTOCOL] = itf_protocol;
-    
-    // Patch HID report descriptor length (critical — must match what tud_hid_descriptor_report_cb returns)
-    desc_configuration_runtime[HID_DESC_OFFSET_REPORT_LEN_LO] = (uint8_t)(report_desc_len & 0xFF);
-    desc_configuration_runtime[HID_DESC_OFFSET_REPORT_LEN_HI] = (uint8_t)((report_desc_len >> 8) & 0xFF);
-    
-    // Patch endpoint descriptor fields  
-    desc_configuration_runtime[HID_EP_OFFSET_MAXPACKET_LO] = (uint8_t)(ep_max_packet & 0xFF);
-    desc_configuration_runtime[HID_EP_OFFSET_MAXPACKET_HI] = (uint8_t)((ep_max_packet >> 8) & 0xFF);
-    desc_configuration_runtime[HID_EP_OFFSET_INTERVAL] = ep_interval;
-    
+
+    // Leave 9 bytes for config header, fill interfaces after
+    uint16_t pos = 9;
+
+    for (uint8_t i = 0; i < num_itfs; i++) {
+        uint16_t report_len;
+        uint8_t subclass, protocol, ep_interval;
+        bool has_out = false;
+        uint8_t ep_out_interval_val = 1;
+
+        if (mirrored_itf_count > 0 && i < mirrored_itf_count && mirrored_itfs[i].active) {
+            mirrored_interface_t *itf = &mirrored_itfs[i];
+            if (itf->is_mouse) {
+                report_len = desc_hid_runtime_valid ? desc_hid_runtime_len : sizeof(desc_hid_report);
+            } else {
+                report_len = itf->report_desc_len;
+            }
+            subclass = itf->itf_subclass;
+            protocol = itf->itf_protocol;
+            ep_interval = itf->ep_in_interval ? itf->ep_in_interval : HID_POLLING_INTERVAL_MS;
+            has_out = itf->has_ep_out;
+            ep_out_interval_val = itf->ep_out_interval ? itf->ep_out_interval : ep_interval;
+        } else {
+            // Default single-interface fallback
+            report_len = desc_hid_runtime_valid ? desc_hid_runtime_len : sizeof(desc_hid_report);
+            subclass = host_config_info.valid ? host_config_info.bInterfaceSubClass : 0;
+            protocol = host_config_info.valid ? host_config_info.bInterfaceProtocol : HID_ITF_PROTOCOL_NONE;
+            ep_interval = host_config_info.valid ? host_config_info.bInterval : HID_POLLING_INTERVAL_MS;
+        }
+
+        // CRITICAL: wMaxPacketSize must be our buffer size, not the host's.
+        // The downstream PC uses this to allocate receive buffers.
+        uint16_t written = write_hid_interface_desc(
+            &desc_configuration_runtime[pos], DESC_CONFIG_RUNTIME_MAX - pos,
+            i,                         // bInterfaceNumber
+            subclass, protocol,
+            report_len,
+            0x81 + i,                  // EP IN address: 0x81, 0x82, 0x83, 0x84
+            CFG_TUD_HID_EP_BUFSIZE,
+            ep_interval,
+            has_out, ep_out_interval_val
+        );
+        if (written == 0) break;  // Buffer full
+        pos += written;
+    }
+
+    // Fill config descriptor header (first 9 bytes)
+    desc_configuration_runtime[0] = 9;                          // bLength
+    desc_configuration_runtime[1] = TUSB_DESC_CONFIGURATION;    // bDescriptorType
+    desc_configuration_runtime[2] = (uint8_t)(pos & 0xFF);      // wTotalLength low
+    desc_configuration_runtime[3] = (uint8_t)((pos >> 8) & 0xFF); // wTotalLength high
+    desc_configuration_runtime[4] = num_itfs;                   // bNumInterfaces
+    desc_configuration_runtime[5] = 1;                          // bConfigurationValue
+    desc_configuration_runtime[6] = 0;                          // iConfiguration
+    desc_configuration_runtime[7] = cfg_attributes;             // bmAttributes
+    desc_configuration_runtime[8] = cfg_max_power;              // bMaxPower
+
     desc_config_runtime_valid = true;
 }
 
-// Parse host configuration descriptor to extract endpoint size, interval, power, etc.
+// Parse host configuration descriptor to extract ALL HID interfaces and their endpoints.
+// Populates mirrored_itfs[] with per-interface endpoint configs, and tracks string indices.
 static void parse_host_config_descriptor(const uint8_t *cfg_desc, uint16_t cfg_len) {
     if (!cfg_desc || cfg_len < TUD_CONFIG_DESC_LEN) return;
-    
+
     // Extract config-level fields
     host_config_info.bmAttributes = cfg_desc[7] & 0x7F; // Mask off reserved bit 7 (we add it back)
     host_config_info.bMaxPower = cfg_desc[8];
-    
-    // Walk the descriptor chain to find HID interface + endpoint
+
+    // Reset per-interface state
+    expected_hid_itf_count = 0;
+
+    // Walk the descriptor chain to find ALL HID interfaces + their endpoints
     uint16_t offset = 0;
-    bool found_hid_interface = false;
-    
+    int current_hid_idx = -1;  // Index into mirrored_itfs for current HID interface
+
     while (offset + 1 < cfg_len) {
         uint8_t desc_length = cfg_desc[offset];
         uint8_t desc_type = cfg_desc[offset + 1];
-        
+
         if (desc_length == 0) break; // Prevent infinite loop on malformed descriptors
-        
+
         // Interface descriptor
         if (desc_type == TUSB_DESC_INTERFACE && desc_length >= 9 && offset + 8 < cfg_len) {
             uint8_t itf_class = cfg_desc[offset + 5];
-            if (itf_class == TUSB_CLASS_HID) {
-                host_config_info.bInterfaceSubClass = cfg_desc[offset + 6];
-                host_config_info.bInterfaceProtocol = cfg_desc[offset + 7];
-                found_hid_interface = true;
+            if (itf_class == TUSB_CLASS_HID && expected_hid_itf_count < MAX_DEVICE_HID_INTERFACES) {
+                current_hid_idx = expected_hid_itf_count;
+                mirrored_itfs[current_hid_idx].itf_subclass = cfg_desc[offset + 6];
+                mirrored_itfs[current_hid_idx].itf_protocol = cfg_desc[offset + 7];
+                mirrored_itfs[current_hid_idx].has_ep_out = false;
+
+                // Track interface string index for faithful string mirroring
+                uint8_t iInterface = cfg_desc[offset + 8];
+                if (iInterface > 0 && iInterface > max_string_index_seen)
+                    max_string_index_seen = iInterface;
+
+                // Back-compat: populate legacy host_config_info from first HID interface
+                if (expected_hid_itf_count == 0) {
+                    host_config_info.bInterfaceSubClass = cfg_desc[offset + 6];
+                    host_config_info.bInterfaceProtocol = cfg_desc[offset + 7];
+                }
+
+                expected_hid_itf_count++;
+            } else {
+                current_hid_idx = -1; // Non-HID interface, ignore endpoints
             }
         }
-        
-        // Endpoint descriptor (IN endpoint after HID interface)
-        if (found_hid_interface && desc_type == TUSB_DESC_ENDPOINT && desc_length >= 7 && offset + 6 < cfg_len) {
+
+        // Endpoint descriptor (after a HID interface)
+        if (current_hid_idx >= 0 && desc_type == TUSB_DESC_ENDPOINT && desc_length >= 7 && offset + 6 < cfg_len) {
             uint8_t ep_addr = cfg_desc[offset + 2];
             uint8_t ep_attr = cfg_desc[offset + 3];
-            
-            // Only capture IN interrupt endpoint (direction bit 7 set, transfer type = interrupt)
-            if ((ep_addr & 0x80) && (ep_attr & 0x03) == TUSB_XFER_INTERRUPT) {
-                host_config_info.wMaxPacketSize = cfg_desc[offset + 4] | (cfg_desc[offset + 5] << 8);
-                host_config_info.bInterval = cfg_desc[offset + 6];
-                host_config_info.valid = true;
-                break; // Found what we need
+            uint16_t ep_size = cfg_desc[offset + 4] | (cfg_desc[offset + 5] << 8);
+            uint8_t ep_interval = cfg_desc[offset + 6];
+
+            if ((ep_attr & 0x03) == TUSB_XFER_INTERRUPT) {
+                if (ep_addr & 0x80) {
+                    // IN endpoint
+                    mirrored_itfs[current_hid_idx].ep_in_max_packet = ep_size;
+                    mirrored_itfs[current_hid_idx].ep_in_interval = ep_interval;
+
+                    // Back-compat: populate legacy host_config_info from first IN endpoint
+                    if (!host_config_info.valid) {
+                        host_config_info.wMaxPacketSize = ep_size;
+                        host_config_info.bInterval = ep_interval;
+                        host_config_info.valid = true;
+                    }
+                } else {
+                    // OUT endpoint
+                    mirrored_itfs[current_hid_idx].has_ep_out = true;
+                    mirrored_itfs[current_hid_idx].ep_out_max_packet = ep_size;
+                    mirrored_itfs[current_hid_idx].ep_out_interval = ep_interval;
+                }
             }
         }
-        
+
         offset += desc_length;
+    }
+
+    if (expected_hid_itf_count == 0) {
+        expected_hid_itf_count = 1; // At least 1 interface expected
     }
 }
 
@@ -2791,21 +3240,9 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
     }
     else
     {
-        // Note: the 0xEE index string is a Microsoft OS 1.0 Descriptors.
-        // https://docs.microsoft.com/en-us/windows-hardware/drivers/usbcon/microsoft-defined-usb-descriptors
+        const char *str = NULL;
 
-        if (!(index < sizeof(string_desc_arr) / sizeof(string_desc_arr[BUFFER_FIRST_ELEMENT_INDEX])))
-        {
-            return NULL;
-        }
-
-        const char *str = string_desc_arr[index];
-        if (str == NULL)
-        {
-            return NULL;
-        }
-
-        // Use dynamic string descriptors if available
+        // Standard indices 1-3: manufacturer, product, serial
         if (string_descriptors_fetched) {
             switch (index) {
                 case STRING_DESC_MANUFACTURER_IDX:
@@ -2822,17 +3259,34 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
                     }
                     break;
                 default:
-                    // Use default for other indices
                     break;
-            }
-        } else {
-            // Fallback to default strings if not fetched yet
-            if (index == STRING_DESC_SERIAL_IDX) {
-                str = get_dynamic_serial_string();
             }
         }
 
-        // Convert ASCII string to UTF-16 and get character count
+        // Check extra string cache for higher indices (interface strings, etc.)
+        if (str == NULL && index > STRING_DESC_SERIAL_IDX) {
+            for (uint8_t i = 0; i < extra_string_count; i++) {
+                if (extra_strings[i].valid && extra_strings[i].index == index) {
+                    str = extra_strings[i].str;
+                    break;
+                }
+            }
+        }
+
+        // Fallback to static array or defaults
+        if (str == NULL) {
+            if (index < sizeof(string_desc_arr) / sizeof(string_desc_arr[0])) {
+                str = string_desc_arr[index];
+            }
+        }
+
+        // Final fallback for serial
+        if (str == NULL && index == STRING_DESC_SERIAL_IDX) {
+            str = get_dynamic_serial_string();
+        }
+
+        if (str == NULL) return NULL;
+
         chr_count = convert_string_to_utf16(str, _desc_str);
     }
 

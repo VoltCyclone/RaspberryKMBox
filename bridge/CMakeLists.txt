@@ -130,6 +130,8 @@ if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/lut.pio)
 endif()
 
 # Add shared libraries
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/hid-defs hid-defs)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/fast-protocol fast-protocol)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/kmbox-commands kmbox-commands)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/wire-protocol wire-protocol)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../lib/peri-clock peri-clock)
@@ -149,6 +151,8 @@ set(BRIDGE_LIBS
     hardware_uart
     hardware_adc
     kmbox_commands
+    hid_defs
+    fast_protocol
     wire_protocol
     dma_uart
     led_utils

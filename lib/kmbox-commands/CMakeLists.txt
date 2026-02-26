@@ -11,4 +11,5 @@ target_include_directories(kmbox_commands PUBLIC
 # Link with pico_stdlib for time functions
 target_link_libraries(kmbox_commands
     pico_stdlib
+    hid_defs
 )

@@ -113,9 +113,12 @@ static inline int32_t __not_in_flash_func(fp_mul)(int32_t a, int32_t b) {
     return (int32_t)((uint32_t)(hi << SMOOTH_FP_SHIFT) | (lo >> SMOOTH_FP_SHIFT));
 }
 
+// Fixed-point division via M33 FPU float path (~14 cycles VDIV.F32)
+// instead of 64-bit software division (__aeabi_ldivmod, ~60-100 cycles).
+// Precision: 24-bit mantissa → sufficient for 16.16 fixed-point work.
 static __force_inline int32_t fp_div(int32_t a, int32_t b) {
     if (b == 0) return 0;
-    return (int32_t)(((int64_t)a << SMOOTH_FP_SHIFT) / b);
+    return (int32_t)((float)a / (float)b * (float)SMOOTH_FP_ONE);
 }
 
 static __force_inline int32_t int_to_fp(int16_t val) {
@@ -132,18 +135,59 @@ static __force_inline int16_t fp_to_int(int32_t fp_val) {
     return (int16_t)((fp_val + SMOOTH_FP_HALF) >> SMOOTH_FP_SHIFT);
 }
 
-static __force_inline int8_t clamp_i8(int32_t val) {
-    if (val > 127) return 127;
-    if (val < -128) return -128;
-    return (int8_t)val;
+static __force_inline int16_t clamp_i16(int32_t val) {
+    if (val > 32767) return 32767;
+    if (val < -32768) return -32768;
+    return (int16_t)val;
 }
 
 //--------------------------------------------------------------------+
-// Easing Curves - FPU direct computation (no LUTs on M33)
+// Velocity IIR Filter Helpers
 //--------------------------------------------------------------------+
 
-// Easing is now computed directly using apply_easing_fpu() inline
-// M33 FPU makes direct computation faster than LUT lookups
+// Fixed-point square root using hardware VSQRT.F32 (14 cycles on M33)
+static inline int32_t __not_in_flash_func(fp_sqrt)(int32_t x) {
+    if (x <= 0) return 0;
+    float f = (float)x / (float)SMOOTH_FP_ONE;
+    float r = sqrtf(f);
+    return (int32_t)(r * SMOOTH_FP_ONE);
+}
+
+// Soft saturation using Padé approximant: max * x * (27 + x²) / (27 + 9x²)
+// Provides smooth clamping instead of hard clamp — no sharp discontinuity
+static inline int32_t __not_in_flash_func(soft_saturate_fp)(int32_t input, int32_t max_fp) {
+    if (max_fp <= 0) return input;
+    int32_t abs_input = input >= 0 ? input : -input;
+    if (abs_input <= max_fp / 2) return input;  // Linear region, no saturation needed
+
+    // x = abs_input / max_fp (normalized)
+    int32_t x = fp_div(abs_input, max_fp);
+    // x² in fixed-point
+    int32_t x2 = fp_mul(x, x);
+    // numerator = x * (27 + x²)
+    int32_t twenty_seven = 27 * SMOOTH_FP_ONE;
+    int32_t num = fp_mul(x, twenty_seven + x2);
+    // denominator = 27 + 9*x²
+    int32_t den = twenty_seven + 9 * x2;
+    if (den == 0) return input;
+    // result = max * num / den
+    int32_t result = fp_mul(max_fp, fp_div(num, den));
+    return input >= 0 ? result : -result;
+}
+
+// Adaptive alpha: high accel → alpha near alpha_max (responsive);
+// low accel → alpha near alpha_min (smooth)
+// Formula: alpha_min + range - range / (1 + accel_mag * sensitivity)
+static inline int32_t __not_in_flash_func(compute_adaptive_alpha)(
+    int32_t accel_mag, int32_t alpha_min, int32_t alpha_max, int32_t sensitivity) {
+    int32_t range = alpha_max - alpha_min;
+    if (range <= 0) return alpha_max;
+    int32_t product = fp_mul(accel_mag, sensitivity);
+    int32_t denom = SMOOTH_FP_ONE + product;
+    if (denom <= 0) denom = 1;
+    int32_t decay = fp_div(range, denom);
+    return alpha_min + range - decay;
+}
 
 //--------------------------------------------------------------------+
 // Velocity Tracking
@@ -153,26 +197,32 @@ static __force_inline int8_t clamp_i8(int32_t val) {
 static int32_t g_velocity_sum_x_fp = 0;
 static int32_t g_velocity_sum_y_fp = 0;
 
+// SMOOTH_VELOCITY_WINDOW must be power of 2 for bitmask; use shift for division
+_Static_assert((SMOOTH_VELOCITY_WINDOW & (SMOOTH_VELOCITY_WINDOW - 1)) == 0,
+               "SMOOTH_VELOCITY_WINDOW must be power of 2");
+#define VELOCITY_WINDOW_MASK  (SMOOTH_VELOCITY_WINDOW - 1)
+#define VELOCITY_WINDOW_SHIFT 3  // log2(8) = 3
+
 static void velocity_update(int16_t x, int16_t y) {
     velocity_tracker_t *v = &g_smooth.velocity;
-    
+    const uint8_t idx = v->history_index;
+
     // Get old value that will be replaced
-    int16_t old_x = v->x_history[v->history_index];
-    int16_t old_y = v->y_history[v->history_index];
-    
+    int16_t old_x = v->x_history[idx];
+    int16_t old_y = v->y_history[idx];
+
     // Store new values in history
-    v->x_history[v->history_index] = x;
-    v->y_history[v->history_index] = y;
-    v->history_index = (v->history_index + 1) % SMOOTH_VELOCITY_WINDOW;
-    
+    v->x_history[idx] = x;
+    v->y_history[idx] = y;
+    v->history_index = (idx + 1) & VELOCITY_WINDOW_MASK;  // Bitmask instead of modulo
+
     // Update running sum in fixed-point (remove old, add new) - O(1)
-    // Keep accumulators in fixed-point to preserve precision across cycles
-    g_velocity_sum_x_fp = g_velocity_sum_x_fp - int_to_fp(old_x) + int_to_fp(x);
-    g_velocity_sum_y_fp = g_velocity_sum_y_fp - int_to_fp(old_y) + int_to_fp(y);
-    
-    // Store as fixed-point average (no precision loss)
-    v->avg_velocity_x_fp = g_velocity_sum_x_fp / SMOOTH_VELOCITY_WINDOW;
-    v->avg_velocity_y_fp = g_velocity_sum_y_fp / SMOOTH_VELOCITY_WINDOW;
+    g_velocity_sum_x_fp += int_to_fp(x) - int_to_fp(old_x);
+    g_velocity_sum_y_fp += int_to_fp(y) - int_to_fp(old_y);
+
+    // Arithmetic right shift by 3 = divide by 8 (power of 2, no division instruction)
+    v->avg_velocity_x_fp = g_velocity_sum_x_fp >> VELOCITY_WINDOW_SHIFT;
+    v->avg_velocity_y_fp = g_velocity_sum_y_fp >> VELOCITY_WINDOW_SHIFT;
 }
 
 // smooth state accessor for external use
@@ -374,23 +424,6 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
                                           g_smooth.humanization.onset_jitter_max);
     }
     
-    // Fix #4: Fix easing curve selection bias - single RNG draw, correct distribution
-    // Old code: two draws created biased distribution (33% ease-out, then 25% of remaining)
-    // New code: one draw with explicit probability buckets
-    easing_mode_t easing = EASING_LINEAR;
-    if (max_component > int_to_fp(10)) {
-        // Larger sub-steps: smooth easing
-        easing = EASING_EASE_IN_OUT;
-    } else {
-        uint32_t r = rng_next() % 12;
-        if (r < 4) {
-            easing = EASING_EASE_OUT;      // 33% chance
-        } else if (r < 7) {
-            easing = EASING_EASE_IN_OUT;   // 25% chance
-        }
-        // else: 42% linear (default)
-    }
-    
     // For velocity-matched mode, adjust based on current velocity
     if (mode == INJECT_MODE_VELOCITY_MATCHED && g_smooth.velocity_matching_enabled) {
         int32_t vel_mag = g_smooth.velocity.avg_velocity_x_fp;
@@ -423,7 +456,6 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
     entry->frames_left = frames;
     entry->total_frames = frames;
     entry->mode = mode;
-    entry->easing = easing;
     entry->active = true;
     entry->onset_delay = onset_delay;   // Fix #1: onset jitter
     entry->will_overshoot = false;
@@ -454,8 +486,8 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
 #define SUBSTEP_MIN_MOVEMENT_PX     3
 
 // Number of sub-steps to split into (base value, randomized)
-#define SUBSTEP_COUNT_BASE          4
-#define SUBSTEP_COUNT_EXTRA_MAX     4   // Up to +4 extra = 4-8 total
+#define SUBSTEP_COUNT_BASE          2
+#define SUBSTEP_COUNT_EXTRA_MAX     2   // Up to +2 extra = 2-4 total
 
 // Frame delay between consecutive sub-steps (randomized)
 #define SUBSTEP_DELAY_MIN           1
@@ -540,7 +572,7 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     //--------------------------------------------------------------------+
     
     // Determine number of sub-steps (only reached in FULL mode)
-    uint8_t num_substeps = SUBSTEP_COUNT_BASE + (uint8_t)rng_range(0, 3);  // 4-7 sub-steps
+    uint8_t num_substeps = SUBSTEP_COUNT_BASE + (uint8_t)rng_range(0, 2);  // 2-4 sub-steps
     
     // Clamp to available queue space
     uint8_t available = SMOOTH_QUEUE_SIZE - g_smooth.queue_count;
@@ -670,11 +702,13 @@ void smooth_record_physical_movement(int16_t x, int16_t y) {
     velocity_update(x, y);
 }
 
-void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
-    // Super-fast path for empty queue with no accumulator
-    if (g_smooth.queue_count == 0 && 
-        g_smooth.x_accumulator_fp == 0 && 
-        g_smooth.y_accumulator_fp == 0) {
+void __not_in_flash_func(smooth_process_frame)(int16_t *out_x, int16_t *out_y) {
+    // Super-fast path for empty queue with no accumulator and no filter debt
+    if (g_smooth.queue_count == 0 &&
+        g_smooth.x_accumulator_fp == 0 &&
+        g_smooth.y_accumulator_fp == 0 &&
+        g_smooth.filtered_vx_fp == 0 &&
+        g_smooth.filtered_vy_fp == 0) {
         *out_x = 0;
         *out_y = 0;
         g_smooth.frames_processed++;
@@ -692,17 +726,17 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
     int32_t frame_x_fp = 0;
     int32_t frame_y_fp = 0;
     
-    // Early exit if no active entries
+    // Early exit if no active entries (still run IIR filter to release debt)
     if (g_smooth.queue_count == 0) {
-        goto apply_accumulator;
+        goto apply_vel_filter;
     }
-    
+
     // Safety: if queue_count > 0 but linked list is empty, reset to prevent hang
     if (g_active_head == NULL) {
         g_smooth.queue_count = 0;
         g_free_bitmap = 0xFFFFFFFFFFFFFFFFULL;
         g_active_node_bitmap = 0ULL;
-        goto apply_accumulator;
+        goto apply_vel_filter;
     }
     
     // Process active entries using linked list (O(n) where n = active count, not queue size)
@@ -722,22 +756,13 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
         }
         
         if (entry->frames_left > 0) {
-            // Calculate progress using FPU (faster than LUT on M33)
-            // Offset by +1 so the first frame (frames_elapsed=0) produces
-            // non-zero output.  Without this, progress_delta is always 0 on
-            // the first frame, which means no HID report is sent when the
-            // physical mouse is idle — the cursor won't move until frame 2.
-            uint8_t frames_elapsed = entry->total_frames - entry->frames_left;
-            float progress_flt = (float)(frames_elapsed + 1) / (float)(entry->total_frames + 1);
-            float prev_progress = (float)frames_elapsed / (float)(entry->total_frames + 1);
-            
-            // Apply easing curve using FPU (3 cycles for multiply on M33)
-            float eased_progress = apply_easing_fpu(progress_flt, entry->easing);
-            float prev_eased = apply_easing_fpu(prev_progress, entry->easing);
-            float progress_delta_flt = eased_progress - prev_eased;
-            
-            // Convert to fixed-point for accumulator
-            int32_t progress_delta = (int32_t)(progress_delta_flt * SMOOTH_FP_ONE);
+            // Linear progress: equal fraction per frame (IIR filter handles smoothing)
+            int32_t progress_delta;
+            if (entry->total_frames <= 1) {
+                progress_delta = SMOOTH_FP_ONE;
+            } else {
+                progress_delta = SMOOTH_FP_ONE / entry->total_frames;
+            }
             
             // === MOVEMENT DELTA (tracked - affects remaining) ===
             int32_t movement_dx_fp = fp_mul(entry->x_fp, progress_delta);
@@ -776,7 +801,6 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
                         correction->frames_left = (uint8_t)rng_range(2, 4); // Correct over 2-4 frames
                         correction->total_frames = correction->frames_left;
                         correction->mode = INJECT_MODE_SMOOTH;
-                        correction->easing = EASING_EASE_OUT; // Quick correction
                         correction->active = true;
                         correction->will_overshoot = false;
                         corrections_this_frame++;
@@ -809,26 +833,73 @@ void __not_in_flash_func(smooth_process_frame)(int8_t *out_x, int8_t *out_y) {
         frame_y_fp = 0;
     }
     
-apply_accumulator:
+apply_vel_filter:
+    // Velocity IIR filter: debt-based smoothing across command boundaries.
+    // Raw queue output accumulates as "debt"; each frame releases a fraction (alpha).
+    // Total movement is conserved — no tracking loss.
+    if (g_smooth.humanization.mode == HUMANIZATION_FULL) {
+        int32_t raw_vx = frame_x_fp, raw_vy = frame_y_fp;
+
+        // Acceleration magnitude (for adaptive alpha)
+        int32_t ax = raw_vx - g_smooth.prev_raw_vx_fp;
+        int32_t ay = raw_vy - g_smooth.prev_raw_vy_fp;
+        int32_t accel_mag = fp_sqrt(fp_mul(ax, ax) + fp_mul(ay, ay));
+        g_smooth.prev_raw_vx_fp = raw_vx;
+        g_smooth.prev_raw_vy_fp = raw_vy;
+
+        // Adaptive alpha: high accel → fast release, low accel → slow release
+        int32_t alpha = compute_adaptive_alpha(
+            accel_mag,
+            g_smooth.humanization.vel_filter_alpha_min_fp,
+            g_smooth.humanization.vel_filter_alpha_max_fp,
+            g_smooth.humanization.vel_filter_accel_sens_fp);
+
+        // Accumulate raw queue output into velocity debt
+        g_smooth.filtered_vx_fp += raw_vx;
+        g_smooth.filtered_vy_fp += raw_vy;
+
+        // Release portion of debt (alpha controls release rate)
+        int32_t release_x = fp_mul(alpha, g_smooth.filtered_vx_fp);
+        int32_t release_y = fp_mul(alpha, g_smooth.filtered_vy_fp);
+        g_smooth.filtered_vx_fp -= release_x;
+        g_smooth.filtered_vy_fp -= release_y;
+
+        frame_x_fp = release_x;
+        frame_y_fp = release_y;
+
+        // Soft saturation (replaces hard clamp for FULL mode)
+        int32_t max_fp = int_to_fp(g_smooth.max_per_frame);
+        int32_t sat_x = soft_saturate_fp(frame_x_fp, max_fp);
+        int32_t sat_y = soft_saturate_fp(frame_y_fp, max_fp);
+        // Return any capped excess back to debt (conserves movement)
+        g_smooth.filtered_vx_fp += frame_x_fp - sat_x;
+        g_smooth.filtered_vy_fp += frame_y_fp - sat_y;
+        frame_x_fp = sat_x;
+        frame_y_fp = sat_y;
+    }
+
     // Add sub-pixel accumulator
     frame_x_fp += g_smooth.x_accumulator_fp;
     frame_y_fp += g_smooth.y_accumulator_fp;
-    
+
     // Convert to integer with sub-pixel tracking
     int16_t out_x_int = fp_to_int(frame_x_fp);
     int16_t out_y_int = fp_to_int(frame_y_fp);
-    
-    // Apply per-frame rate limiting
-    if (out_x_int > g_smooth.max_per_frame) {
-        out_x_int = g_smooth.max_per_frame;
-    } else if (out_x_int < -g_smooth.max_per_frame) {
-        out_x_int = -g_smooth.max_per_frame;
-    }
-    
-    if (out_y_int > g_smooth.max_per_frame) {
-        out_y_int = g_smooth.max_per_frame;
-    } else if (out_y_int < -g_smooth.max_per_frame) {
-        out_y_int = -g_smooth.max_per_frame;
+
+    // Apply per-frame rate limiting (hard clamp for non-FULL modes;
+    // FULL mode uses soft saturation from IIR filter above)
+    if (g_smooth.humanization.mode != HUMANIZATION_FULL) {
+        if (out_x_int > g_smooth.max_per_frame) {
+            out_x_int = g_smooth.max_per_frame;
+        } else if (out_x_int < -g_smooth.max_per_frame) {
+            out_x_int = -g_smooth.max_per_frame;
+        }
+
+        if (out_y_int > g_smooth.max_per_frame) {
+            out_y_int = g_smooth.max_per_frame;
+        } else if (out_y_int < -g_smooth.max_per_frame) {
+            out_y_int = -g_smooth.max_per_frame;
+        }
     }
     
     // Update sub-pixel accumulator with remainder
@@ -850,8 +921,8 @@ apply_accumulator:
     }
     
     // Output
-    *out_x = clamp_i8(out_x_int);
-    *out_y = clamp_i8(out_y_int);
+    *out_x = clamp_i16(out_x_int);
+    *out_y = clamp_i16(out_y_int);
     
     // Fix: When queue is fully drained and output rounds to zero, flush
     // sub-pixel accumulator residuals. Without this, tiny residuals (<1px)
@@ -860,6 +931,20 @@ apply_accumulator:
     if (g_smooth.queue_count == 0 && out_x_int == 0 && out_y_int == 0) {
         g_smooth.x_accumulator_fp = 0;
         g_smooth.y_accumulator_fp = 0;
+
+        // Flush velocity filter state to prevent residual drift
+        if (g_smooth.humanization.mode == HUMANIZATION_FULL) {
+            // Only flush if filtered velocity is sub-quarter-pixel
+            int32_t quarter_px = SMOOTH_FP_ONE / 4;
+            int32_t abs_fvx = g_smooth.filtered_vx_fp >= 0 ? g_smooth.filtered_vx_fp : -g_smooth.filtered_vx_fp;
+            int32_t abs_fvy = g_smooth.filtered_vy_fp >= 0 ? g_smooth.filtered_vy_fp : -g_smooth.filtered_vy_fp;
+            if (abs_fvx < quarter_px && abs_fvy < quarter_px) {
+                g_smooth.filtered_vx_fp = 0;
+                g_smooth.filtered_vy_fp = 0;
+                g_smooth.prev_raw_vx_fp = 0;
+                g_smooth.prev_raw_vy_fp = 0;
+            }
+        }
     }
     
     g_smooth.frames_processed++;
@@ -892,6 +977,11 @@ void smooth_clear_queue(void) {
     // Also reset velocity tracking accumulators for consistency
     g_velocity_sum_x_fp = 0;
     g_velocity_sum_y_fp = 0;
+    // Reset velocity IIR filter state
+    g_smooth.filtered_vx_fp = 0;
+    g_smooth.filtered_vy_fp = 0;
+    g_smooth.prev_raw_vx_fp = 0;
+    g_smooth.prev_raw_vy_fp = 0;
 }
 
 void smooth_get_stats(uint32_t *total_injected, uint32_t *frames_processed, 
@@ -906,6 +996,9 @@ bool smooth_has_pending(void) {
     if (g_smooth.queue_count > 0) return true;
     if (g_smooth.x_accumulator_fp != 0) return true;
     if (g_smooth.y_accumulator_fp != 0) return true;
+    // Velocity filter debt: movement received but not yet output
+    if (g_smooth.filtered_vx_fp != 0) return true;
+    if (g_smooth.filtered_vy_fp != 0) return true;
     return false;
 }
 
@@ -921,7 +1014,7 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
     switch (mode) {
         case HUMANIZATION_OFF:
             // Disable all humanization - pure digital pass-through
-            g_smooth.max_per_frame = 16;                                // Fix #2: fixed
+            g_smooth.max_per_frame = 32767;                             // No artificial limit
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = false;
             g_smooth.humanization.jitter_amount_fp = 0;
@@ -933,12 +1026,15 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.humanization.accum_clamp_fp = 0;                   // Fix #13: no clamp (unlimited)
             g_smooth.humanization.onset_jitter_min = 0;                 // Fix #1: no onset delay
             g_smooth.humanization.onset_jitter_max = 0;
+            g_smooth.humanization.vel_filter_alpha_min_fp = SMOOTH_FP_ONE;  // Passthrough
+            g_smooth.humanization.vel_filter_alpha_max_fp = SMOOTH_FP_ONE;
+            g_smooth.humanization.vel_filter_accel_sens_fp = 0;
             break;
-            
+
         case HUMANIZATION_MICRO:
             // Micro-noise only — for pre-humanized input
             // Only adds sub-pixel tremor + sensor noise below the PC's correction threshold
-            g_smooth.max_per_frame = 16;                                // Fixed — don't alter delivery rate
+            g_smooth.max_per_frame = 32767;                             // No artificial limit
             g_smooth.velocity_matching_enabled = false;                 // Input already has natural velocity
             g_smooth.humanization.jitter_enabled = true;
             g_smooth.humanization.jitter_amount_fp = int_to_fp(1) / 2;  // 0.5px base tremor
@@ -947,17 +1043,20 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(2);
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(10);
             g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 100;  // ±1% sensor noise
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(8);        // ±8px — generous clamp prevents
+            g_smooth.humanization.accum_clamp_fp = int_to_fp(1000);      // Generous clamp prevents
                                                                         // unbounded drift from delivery error
                                                                         // residuals while trusting input
             g_smooth.humanization.onset_jitter_min = 0;                 // No onset delay
             g_smooth.humanization.onset_jitter_max = 0;
+            g_smooth.humanization.vel_filter_alpha_min_fp = SMOOTH_FP_ONE;  // Passthrough
+            g_smooth.humanization.vel_filter_alpha_max_fp = SMOOTH_FP_ONE;
+            g_smooth.humanization.vel_filter_accel_sens_fp = 0;
             break;
 
         case HUMANIZATION_FULL:
             // Full humanization — for raw/robotic input
-            // Subdivision, easing, onset delay, overshoot — the works
-            g_smooth.max_per_frame = (int16_t)rng_range(12, 20);        // Per-session variation
+            // Subdivision, IIR velocity filter, onset delay, overshoot — the works
+            g_smooth.max_per_frame = (int16_t)rng_range(10000, 12000);   // High-DPI: ~650 IPS at 26000 DPI
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
             g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base tremor
@@ -966,11 +1065,14 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(8, 14));
             g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 50;  // ±2%
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(16);       // ±16px — matches max_per_frame,
+            g_smooth.humanization.accum_clamp_fp = int_to_fp(12000);     // Matches max_per_frame,
                                                                         // lets accumulator drain naturally
                                                                         // when queue overflow dumps to accum
             g_smooth.humanization.onset_jitter_min = 1;                 // 1-4 frames
             g_smooth.humanization.onset_jitter_max = 4;
+            g_smooth.humanization.vel_filter_alpha_min_fp = SMOOTH_FP_ONE * 50 / 100;  // 0.50 — near-passthrough
+            g_smooth.humanization.vel_filter_alpha_max_fp = SMOOTH_FP_ONE * 90 / 100;  // 0.90 — near-instant
+            g_smooth.humanization.vel_filter_accel_sens_fp = SMOOTH_FP_ONE * 25 / 100; // 0.25
             break;
             
         default:
@@ -978,6 +1080,12 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             return;
     }
     
+    // Reset velocity IIR filter state on mode change
+    g_smooth.filtered_vx_fp = 0;
+    g_smooth.filtered_vy_fp = 0;
+    g_smooth.prev_raw_vx_fp = 0;
+    g_smooth.prev_raw_vy_fp = 0;
+
     // NOTE: Runtime flash saves are DISABLED to prevent device hangs.
     // flash_safe_execute() pauses Core1 (USB host) via multicore_lockout
     // during the ~100ms flash erase/program, which causes the USB host
