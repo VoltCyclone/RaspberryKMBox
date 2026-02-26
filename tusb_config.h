@@ -81,7 +81,11 @@
 #endif
 
 //------------- CLASS -------------//
-#define CFG_TUD_HID              1
+// Support up to 4 HID interfaces for faithful multi-interface device mirroring.
+// Gaming mice expose 2-4 HID interfaces (mouse, keyboard-macros, vendor).
+// We mirror all of them on the device side so the downstream PC sees an
+// identical interface layout.
+#define CFG_TUD_HID              4
 
 // HID buffer size - should be sufficient to hold ID (if any) + Data
 #define CFG_TUD_HID_EP_BUFSIZE   64

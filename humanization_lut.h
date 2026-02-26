@@ -175,42 +175,6 @@ extern const int32_t g_frame_spread_by_movement_lut[FRAME_SPREAD_LUT_SIZE];
 //--------------------------------------------------------------------+
 
 /**
- * Fast easing lookup with interpolation
- * @param t Progress in 16.16 fixed-point [0, SMOOTH_FP_ONE]
- * @param mode Easing mode
- * @return Eased progress in 16.16 fixed-point
- */
-static inline int32_t lut_apply_easing(int32_t t, easing_mode_t mode) {
-    // Clamp t to valid range
-    if (t <= 0) return 0;
-    if (t >= SMOOTH_FP_ONE) return SMOOTH_FP_ONE;
-    
-    // Convert t to table index (0-255)
-    // t is 16.16, we want 8-bit index
-    uint32_t index = (uint32_t)t >> (SMOOTH_FP_SHIFT - EASING_LUT_SHIFT);
-    if (index >= EASING_LUT_SIZE - 1) index = EASING_LUT_SIZE - 2;
-    
-    // Select table based on mode
-    const int32_t *table;
-    switch (mode) {
-        case EASING_LINEAR:      table = g_ease_linear_lut; break;
-        case EASING_EASE_IN_OUT: table = g_ease_in_out_cubic_lut; break;
-        case EASING_EASE_OUT:    table = g_ease_out_quad_lut; break;
-        default:                 table = g_ease_linear_lut; break;  // Fallback for safety
-    }
-    
-    // Linear interpolation between table entries for smoothness
-    int32_t v0 = table[index];
-    int32_t v1 = table[index + 1];
-    
-    // Fractional part for interpolation (lower 8 bits of shifted t)
-    uint32_t frac = ((uint32_t)t >> (SMOOTH_FP_SHIFT - EASING_LUT_SHIFT - 8)) & 0xFF;
-    
-    // Interpolate: v0 + (v1 - v0) * frac / 256
-    return v0 + (((v1 - v0) * (int32_t)frac) >> 8);
-}
-
-/**
  * Fast progress lookup (no division needed)
  * @param total_frames Total frames for movement
  * @param current_frame Current frame (0 to total_frames-1)

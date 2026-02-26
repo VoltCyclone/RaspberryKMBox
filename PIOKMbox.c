@@ -119,6 +119,9 @@ static void core1_task_loop(void) {
         
         tuh_task();
 
+        // Drain SET_REPORT passthrough queue (device→host vendor reports)
+        hid_host_task();
+
         // Xbox host task: forward console commands to controller, keepalive
         if (g_xbox_mode) {
             xbox_host_task();
