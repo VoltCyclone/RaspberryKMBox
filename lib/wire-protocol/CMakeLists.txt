@@ -1,2 +1,3 @@
 add_library(wire_protocol INTERFACE)
 target_include_directories(wire_protocol INTERFACE include)
+target_link_libraries(wire_protocol INTERFACE hid_defs)

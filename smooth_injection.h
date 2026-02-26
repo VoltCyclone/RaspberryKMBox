@@ -42,16 +42,27 @@
 // Injection Modes
 //--------------------------------------------------------------------+
 
+// This enum is the canonical typed definition on the KMBox side.
+// fast_protocol.h also defines INJECT_MODE_* as macros for the bridge
+// side (which doesn't include this header). We undef any existing macros
+// (in case fast_protocol.h was included first via defines.h) and set
+// _INJECT_MODES_DEFINED to prevent fast_protocol.h from (re)defining them.
+#undef INJECT_MODE_IMMEDIATE
+#undef INJECT_MODE_SMOOTH
+#undef INJECT_MODE_VELOCITY_MATCHED
+#undef INJECT_MODE_MICRO
+#define _INJECT_MODES_DEFINED
+
 typedef enum {
     // Immediate: Add directly to accumulator (legacy behavior)
     INJECT_MODE_IMMEDIATE = 0,
-    
+
     // Smooth: Spread movement across frames to match max per-frame rate
     INJECT_MODE_SMOOTH,
-    
+
     // Velocity-matched: Blend with current mouse velocity
     INJECT_MODE_VELOCITY_MATCHED,
-    
+
     // Micro: For tiny sub-pixel adjustments (anti-recoil, aim correction)
     INJECT_MODE_MICRO,
 } inject_mode_t;

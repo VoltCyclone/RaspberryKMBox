@@ -127,6 +127,8 @@ add_subdirectory(lib/Pico-PIO-USB)
 add_subdirectory(lib/kmbox-commands)
 
 # Shared libraries
+add_subdirectory(lib/hid-defs)
+add_subdirectory(lib/fast-protocol)
 add_subdirectory(lib/wire-protocol)
 add_subdirectory(lib/peri-clock)
 add_subdirectory(lib/dma-uart)
@@ -161,7 +163,7 @@ target_link_libraries(PIOKMbox pico_pio_usb)
 target_link_libraries(PIOKMbox kmbox_commands)
 
 # Link shared libraries
-target_link_libraries(PIOKMbox wire_protocol peri_clock dma_uart led_utils)
+target_link_libraries(PIOKMbox hid_defs fast_protocol wire_protocol peri_clock dma_uart led_utils)
 
 # Add PIO USB HCD implementation directly
 target_sources(PIOKMbox PRIVATE

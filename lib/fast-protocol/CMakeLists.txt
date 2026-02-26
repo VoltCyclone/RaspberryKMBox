@@ -1,0 +1,3 @@
+add_library(fast_protocol INTERFACE)
+target_include_directories(fast_protocol INTERFACE include)
+target_link_libraries(fast_protocol INTERFACE hid_defs)

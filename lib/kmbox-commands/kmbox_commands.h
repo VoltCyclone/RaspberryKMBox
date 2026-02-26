@@ -14,12 +14,14 @@
 // Button Definitions
 //--------------------------------------------------------------------+
 
-// HID Button bit masks (compatible with FAST_BTN_* protocol)
-#define KMBOX_HID_BTN_LEFT      0x01
-#define KMBOX_HID_BTN_RIGHT     0x02
-#define KMBOX_HID_BTN_MIDDLE    0x04
-#define KMBOX_HID_BTN_BACK      0x08
-#define KMBOX_HID_BTN_FORWARD   0x10
+#include "hid_defs.h"
+
+// Legacy aliases — prefer HID_BTN_* from hid_defs.h in new code
+#define KMBOX_HID_BTN_LEFT      HID_BTN_LEFT
+#define KMBOX_HID_BTN_RIGHT     HID_BTN_RIGHT
+#define KMBOX_HID_BTN_MIDDLE    HID_BTN_MIDDLE
+#define KMBOX_HID_BTN_BACK      HID_BTN_BACK
+#define KMBOX_HID_BTN_FORWARD   HID_BTN_FORWARD
 
 typedef enum {
     KMBOX_BUTTON_LEFT = 0,
