@@ -341,9 +341,11 @@ typedef struct __attribute__((packed)) {
 #define HID_KEYBOARD_KEYCODE_COUNT      6       // Number of simultaneous keycodes supported
 #define HID_CONSUMER_CONTROL_SIZE       2       // Consumer control report size in bytes
 
-// Activity tracking
-#define KEYBOARD_ACTIVITY_THROTTLE      50      // Trigger keyboard activity flash every 50 reports
-#define MOUSE_ACTIVITY_THROTTLE         100     // Trigger mouse activity flash every 100 reports
+// Activity tracking (power-of-2 for bitmask instead of modulo division)
+#define KEYBOARD_ACTIVITY_THROTTLE      64      // Trigger keyboard activity flash every 64 reports
+#define KEYBOARD_ACTIVITY_MASK          (KEYBOARD_ACTIVITY_THROTTLE - 1)
+#define MOUSE_ACTIVITY_THROTTLE         128     // Trigger mouse activity flash every 128 reports
+#define MOUSE_ACTIVITY_MASK             (MOUSE_ACTIVITY_THROTTLE - 1)
 
 //--------------------------------------------------------------------+
 // MOUSE CONFIGURATION

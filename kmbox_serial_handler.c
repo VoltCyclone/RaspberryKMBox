@@ -212,32 +212,29 @@ static void __not_in_flash_func(on_uart_irq)(void) {
 // Non-blocking TX: Use DMA if available, fall back to IRQ ring buffer
 static bool uart_send_bytes(const uint8_t *data, size_t len) {
     if (!data || len == 0) return true;
-    
-    // DMA TX path: zero-CPU transmission
+
+    // DMA TX path: zero-CPU, zero-wait transmission
     if (uart_tx_dma_chan >= 0) {
-        // Wait for previous DMA transfer to complete (should be very fast at 3Mbaud)
-        // Reduced timeout to 500µs to prevent starving tud_task() under burst traffic
-        // At 3Mbaud, 256 bytes takes ~0.85ms max; most packets are 8 bytes (~27µs)
-        uint32_t timeout = time_us_32() + 500;  // 500µs safety timeout
-        while (dma_tx_busy && time_us_32() < timeout) {
-            tight_loop_contents();
-        }
+        // Non-blocking: if DMA is still sending the previous packet, drop this one.
+        // At 3Mbaud, an 8-byte packet takes ~27µs — the previous DMA is almost
+        // always done by the next main loop iteration. The old 500µs spin-wait
+        // blocked tud_task() and hid_device_task(), adding up to 500µs of input latency.
+        // Bridge retries on missed responses, so dropping is safe.
         if (dma_tx_busy) {
-            // DMA still busy after timeout — drop the data to avoid blocking
             g_uart_tx_dropped += len;
             return false;
         }
-        
+
         // Copy data to DMA TX staging buffer
         size_t to_send = (len > DMA_TX_BUFFER_SIZE) ? DMA_TX_BUFFER_SIZE : len;
         memcpy(dma_tx_buffer, data, to_send);
         dma_tx_len = to_send;
         dma_tx_busy = true;
-        
+
         // Fire DMA transfer
         dma_channel_set_read_addr(uart_tx_dma_chan, dma_tx_buffer, false);
         dma_channel_set_trans_count(uart_tx_dma_chan, to_send, true);
-        
+
         if (to_send < len) {
             g_uart_tx_dropped += (len - to_send);
             return false;
@@ -395,14 +392,25 @@ static uint8_t __not_in_flash_func(process_bridge_packet)(const uint8_t *data, s
 extern void process_mouse_report(const hid_mouse_report_t *report);
 extern void process_kbd_report(const hid_keyboard_report_t *report);
 
+// 256-bit bitmap: O(1) single-load lookup replaces chained range comparisons.
+// Bit N is set if byte value N is a valid fast command start byte.
+// Excludes 0x0A (\n) and 0x0D (\r) to avoid text protocol conflict.
+static const uint32_t g_fast_cmd_bitmap[8] = {
+    // Bits 0-31:   commands 0x01-0x0F (excluding 0x0A, 0x0D)
+    //   0x01 MOUSE_MOVE, 0x02 MOUSE_CLICK, 0x07 SMOOTH_MOVE, 0x08 SMOOTH_CONFIG,
+    //   0x09 SMOOTH_CLEAR, 0x0B MULTI_MOVE, 0x0C KEY_COMBO, 0x0E INFO_EXT, 0x0F CYCLE_HUMAN
+    (1u << 0x01) | (1u << 0x02) | (1u << 0x07) | (1u << 0x08) |
+    (1u << 0x09) | (1u << 0x0B) | (1u << 0x0C) | (1u << 0x0E) | (1u << 0x0F),
+    // Bits 32-63:  Xbox commands 0x20-0x28
+    (1u << (0x20 - 32)) | (1u << (0x22 - 32)) | (1u << (0x23 - 32)) |
+    (1u << (0x27 - 32)) | (1u << (0x28 - 32)),
+    0, 0, 0, 0, 0,  // Bits 64-223: none
+    // Bits 224-255: 0xFC SYNC, 0xFE PING
+    (1u << (0xFC - 224)) | (1u << (0xFE - 224)),
+};
+
 static __force_inline bool is_fast_cmd_start(uint8_t byte) {
-    // Exclude 0x0A (\n) and 0x0D (\r) — these overlap with FAST_CMD_TIMED_MOVE
-    // and FAST_CMD_INFO but the text protocol uses them as line terminators.
-    // TODO: Reassign FAST_CMD_TIMED_MOVE to 0x10+ to avoid this conflict.
-    if (__builtin_expect(byte == 0x0A || byte == 0x0D, 0)) return false;
-    return (byte >= FAST_CMD_MOUSE_MOVE && byte <= FAST_CMD_CYCLE_HUMAN) ||
-           (byte >= FAST_CMD_XBOX_INPUT && byte <= FAST_CMD_XBOX_STATUS) ||
-           byte == FAST_CMD_PING;
+    return (g_fast_cmd_bitmap[byte >> 5] >> (byte & 31)) & 1;
 }
 
 static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
@@ -463,11 +471,15 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
         }
         
         case FAST_CMD_MULTI_MOVE: {
+            // Direct accumulator path — same as FAST_CMD_MOUSE_MOVE.
+            // Bridge moves are pre-transformed, so skip transform/velocity tracking
+            // that process_mouse_report() would apply.  Sum all 3 sub-moves into
+            // a single kmbox_add_mouse_movement() call (1 spinlock instead of 3).
             const fast_cmd_multi_t *m = (const fast_cmd_multi_t *)pkt;
-            hid_mouse_report_t report = {0};
-            if (m->x1 || m->y1) { report.x = m->x1; report.y = m->y1; process_mouse_report(&report); }
-            if (m->x2 || m->y2) { report.x = m->x2; report.y = m->y2; process_mouse_report(&report); }
-            if (m->x3 || m->y3) { report.x = m->x3; report.y = m->y3; process_mouse_report(&report); }
+            int16_t sum_x = m->x1 + m->x2 + m->x3;
+            int16_t sum_y = m->y1 + m->y2 + m->y3;
+            if (sum_x || sum_y) kmbox_add_mouse_movement(sum_x, sum_y);
+            neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
             fast_cmd_count++;
             return true;
         }

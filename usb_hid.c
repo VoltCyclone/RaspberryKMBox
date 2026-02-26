@@ -212,6 +212,7 @@ static uint8_t mouse_device_instance = 0;
 // When the host mouse sends vendor reports (e.g. Logitech HID++, Razer),
 // Core1 queues them here and Core0 drains them via tud_hid_report().
 #define VENDOR_QUEUE_SIZE 8
+#define VENDOR_QUEUE_MASK (VENDOR_QUEUE_SIZE - 1)
 #define VENDOR_REPORT_MAX_LEN 64
 
 typedef struct {
@@ -541,6 +542,16 @@ static uint8_t host_mouse_report_id = 0;
 // incoming reports with kmbox/smooth deltas injected in-place.
 //
 // Layout populated by parse_mouse_report_layout() during tuh_hid_mount_cb.
+
+// Fast-path classification for forward_raw_mouse_report():
+// Most gaming mice use byte-aligned 8-bit or 16-bit XY.  Classifying the
+// layout at parse time lets the hot path skip complex bitwise extraction.
+typedef enum {
+    LAYOUT_GENERIC,     // Arbitrary bit-width / non-aligned — full extraction needed
+    LAYOUT_FAST_8BIT,   // buttons[1] + X[i8] + Y[i8] + optional wheel/pan — all byte-aligned
+    LAYOUT_FAST_16BIT,  // buttons[1-2] + X[i16 LE] + Y[i16 LE] — all byte-aligned
+} layout_class_t;
+
 typedef struct {
     // Total expected report size (excluding report-ID prefix byte)
     uint8_t  report_size;
@@ -578,6 +589,7 @@ typedef struct {
     bool     has_report_id;
 
     bool     valid;            // true once successfully parsed
+    layout_class_t layout_class; // fast-path classification (set by classify_layout)
 } mouse_report_layout_t;
 
 static mouse_report_layout_t host_mouse_layout = { .valid = false };
@@ -1582,6 +1594,26 @@ static inline void build_raw_mouse_report(uint8_t *buf, uint8_t sz,
         buf[L->pan_offset] = (uint8_t)pan;
 }
 
+// Classify a parsed layout for fast-path dispatch in forward_raw_mouse_report().
+// Called once after parse (+ any fixups), not on the hot path.
+static void classify_mouse_layout(mouse_report_layout_t *L) {
+    if (!L->valid) { L->layout_class = LAYOUT_GENERIC; return; }
+
+    // Check byte-alignment: all axes must start on byte boundary
+    bool x_aligned = (L->x_bit_in_byte == 0);
+    bool y_aligned = (L->y_bit_in_byte == 0);
+
+    if (x_aligned && y_aligned && L->x_bits == 16 && L->y_bits == 16 &&
+        L->x_is_16bit && L->y_is_16bit && L->buttons_bits <= 8) {
+        L->layout_class = LAYOUT_FAST_16BIT;
+    } else if (x_aligned && y_aligned && L->x_bits == 8 && L->y_bits == 8 &&
+               !L->x_is_16bit && !L->y_is_16bit && L->buttons_bits <= 8) {
+        L->layout_class = LAYOUT_FAST_8BIT;
+    } else {
+        L->layout_class = LAYOUT_GENERIC;
+    }
+}
+
 /**
  * Core1 accumulate-only mouse report handler.
  *
@@ -1596,10 +1628,35 @@ static void __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
 {
     const mouse_report_layout_t *L = &host_mouse_layout;
 
-    // --- Extract physical movement from the raw report ---
     int16_t phys_x = 0, phys_y = 0;
     int8_t  phys_wheel = 0, phys_pan = 0;
     uint8_t phys_buttons = 0;
+
+    // --- Fast paths for common byte-aligned layouts (95%+ of gaming mice) ---
+    // Avoids all the bitwise extraction, bounds checks, and branches below.
+    if (__builtin_expect(L->layout_class == LAYOUT_FAST_16BIT, 1)) {
+        // 16-bit XY, byte-aligned, <=8-bit buttons
+        if (__builtin_expect(raw_len >= L->y_offset + 2, 1)) {
+            phys_buttons = raw[L->buttons_offset] & ((L->buttons_bits >= 8) ? 0xFF : ((1u << L->buttons_bits) - 1));
+            phys_x = (int16_t)(raw[L->x_offset] | (raw[L->x_offset + 1] << 8));
+            phys_y = (int16_t)(raw[L->y_offset] | (raw[L->y_offset + 1] << 8));
+            if (L->has_wheel && L->wheel_offset < raw_len) phys_wheel = (int8_t)raw[L->wheel_offset];
+            if (L->has_pan && L->pan_offset < raw_len)     phys_pan = (int8_t)raw[L->pan_offset];
+            goto accumulate;
+        }
+    } else if (L->layout_class == LAYOUT_FAST_8BIT) {
+        // 8-bit XY, byte-aligned, <=8-bit buttons
+        if (__builtin_expect(raw_len >= L->y_offset + 1, 1)) {
+            phys_buttons = raw[L->buttons_offset] & ((L->buttons_bits >= 8) ? 0xFF : ((1u << L->buttons_bits) - 1));
+            phys_x = (int8_t)raw[L->x_offset];
+            phys_y = (int8_t)raw[L->y_offset];
+            if (L->has_wheel && L->wheel_offset < raw_len) phys_wheel = (int8_t)raw[L->wheel_offset];
+            if (L->has_pan && L->pan_offset < raw_len)     phys_pan = (int8_t)raw[L->pan_offset];
+            goto accumulate;
+        }
+    }
+
+    // --- Generic path: arbitrary bit-width and non-aligned fields ---
 
     // Extract buttons (handle both 8-bit and 16-bit button fields)
     if (L->buttons_offset < raw_len) {
@@ -1668,6 +1725,7 @@ static void __not_in_flash_func(forward_raw_mouse_report)(const uint8_t *raw, ui
         phys_pan = (int8_t)raw[L->pan_offset];
     }
 
+accumulate:
     // --- Accumulate into shared state (spinlock-protected inside each call) ---
     kmbox_update_physical_buttons(phys_buttons & 0x1F);
 
@@ -1735,7 +1793,7 @@ void __not_in_flash_func(process_kbd_report)(const hid_keyboard_report_t *report
     }
 
     static uint32_t activity_counter = 0;
-    if (++activity_counter % KEYBOARD_ACTIVITY_THROTTLE == 0)
+    if ((++activity_counter & KEYBOARD_ACTIVITY_MASK) == 0)
     {
         neopixel_trigger_activity_flash_color(COLOR_KEYBOARD_ACTIVITY);
     }
@@ -1755,7 +1813,7 @@ void __not_in_flash_func(process_mouse_report)(const hid_mouse_report_t *report)
     }
 
     static uint32_t activity_counter = 0;
-    if (++activity_counter % MOUSE_ACTIVITY_THROTTLE == 0)
+    if ((++activity_counter & MOUSE_ACTIVITY_MASK) == 0)
     {
         neopixel_trigger_activity_flash_color(0x000000FF); // Blue for mouse activity
     }
@@ -1848,21 +1906,22 @@ void hid_device_task(void)
     // and sets was_active=true.  We drain everything here.
     if (tud_hid_n_ready(mouse_device_instance))
     {
-        bool has_kmbox = kmbox_has_pending_movement();
+        // Cache humanization mode for this frame — avoid 3 function calls per frame
+        const humanization_mode_t frame_human_mode = smooth_get_humanization_mode();
+
+        // Atomic check-and-drain: single spinlock instead of separate
+        // kmbox_has_pending_movement() + kmbox_get_mouse_report_16() (was 2 spinlock roundtrips)
+        uint8_t buttons;
+        int16_t x, y;
+        int8_t wheel, pan;
+        bool has_kmbox = kmbox_try_drain_mouse_16(last_sent_buttons,
+                                                   &buttons, &x, &y, &wheel, &pan);
         bool has_smooth = smooth_has_pending();
-        // Cheaply read current button byte without draining accumulators
-        uint8_t current_buttons = kmbox_get_current_buttons();
-        bool buttons_changed = (current_buttons != last_sent_buttons);
+        bool buttons_changed = (buttons != last_sent_buttons);
 
         bool has_pending = has_kmbox || has_smooth || buttons_changed;
 
         if (!has_pending) goto check_idle;
-
-        // Drain accumulators (spinlock-protected, safe from both cores)
-        uint8_t buttons;
-        int16_t x, y;
-        int8_t wheel, pan;
-        kmbox_get_mouse_report_16(&buttons, &x, &y, &wheel, &pan);
 
         // Process smooth injection (int16_t for high-DPI support)
         int16_t smooth_x = 0, smooth_y = 0;
@@ -1888,7 +1947,7 @@ void hid_device_task(void)
         // All output-stage noise is scaled by movement magnitude to prevent
         // overwhelming low-speed signals.  At 1-2 counts, ±1 noise is 50-100%
         // perturbation, creating chaotic scribble.
-        if (smooth_get_humanization_mode() != HUMANIZATION_OFF &&
+        if (frame_human_mode != HUMANIZATION_OFF &&
             (x != 0 || y != 0)) {
             float out_mag = sqrtf((float)x * x + (float)y * y);
             float noise_gate = fminf(1.0f, out_mag / 4.0f);  // ramp 0→1 over [0,4]px
@@ -1946,7 +2005,7 @@ void hid_device_task(void)
             // Always jitter when humanization is active — perfectly regular 1ms
             // intervals are a fingerprint regardless of physical mouse state.
             // Real USB polling has crystal oscillator drift + OS scheduling jitter.
-            if (smooth_get_humanization_mode() != HUMANIZATION_OFF) {
+            if (frame_human_mode != HUMANIZATION_OFF) {
                 // Gaussian jitter, stddev ~350us → CV ≈ 0.35 on 1000us base.
                 // Smaller than before to avoid excessive clamping; range is
                 // roughly ±700us (95th percentile), keeping interval in [500, 2000].
@@ -2006,7 +2065,7 @@ check_idle:
             tud_hid_n_report(e->device_instance, e->report_id, e->data, e->len);
         }
         __dmb();
-        vendor_fwd_queue.tail = (vendor_fwd_queue.tail + 1) % VENDOR_QUEUE_SIZE;
+        vendor_fwd_queue.tail = (vendor_fwd_queue.tail + 1) & VENDOR_QUEUE_MASK;
     }
 }
 
@@ -2095,13 +2154,15 @@ void hid_host_task(void)
 {
     // Drain SET_REPORT passthrough queue (Core0 → Core1).
     // Forward vendor SET_REPORT requests from the downstream PC to the real mouse.
-    while (set_report_queue.tail != set_report_queue.head) {
+    // Process at most 1 per call — tuh_hid_set_report() may block on USB
+    // control transfer, and draining the full queue could stall Core1's PIO USB.
+    if (set_report_queue.tail != set_report_queue.head) {
         set_report_entry_t *e = &set_report_queue.entries[set_report_queue.tail];
         tuh_hid_set_report(e->host_dev_addr, e->host_instance,
                            e->report_id, e->report_type,
                            (void*)e->data, e->len);
         __dmb();
-        set_report_queue.tail = (set_report_queue.tail + 1) % VENDOR_QUEUE_SIZE;
+        set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
     }
 }
 
@@ -2283,6 +2344,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
                 host_mouse_layout.y_is_16bit = true;
                 host_mouse_layout.report_size = 8;
             }
+
+            // Classify layout for fast-path dispatch (after all fixups)
+            classify_mouse_layout(&host_mouse_layout);
 
             // Extract mouse report ID
             if (host_mouse_layout.valid && host_mouse_layout.has_report_id) {
@@ -2496,7 +2560,7 @@ static void __not_in_flash_func(queue_vendor_report)(uint8_t device_instance, ui
     }
 
     // Queue for Core0 to forward via interrupt IN endpoint
-    uint8_t next_head = (vendor_fwd_queue.head + 1) % VENDOR_QUEUE_SIZE;
+    uint8_t next_head = (vendor_fwd_queue.head + 1) & VENDOR_QUEUE_MASK;
     if (next_head == vendor_fwd_queue.tail) return;  // Queue full, drop
 
     vendor_report_entry_t *e = &vendor_fwd_queue.entries[vendor_fwd_queue.head];
@@ -2674,7 +2738,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     if (buffer != NULL && bufsize > 0 && instance < mirrored_itf_count && mirrored_itfs[instance].active) {
         mirrored_interface_t *mitf = &mirrored_itfs[instance];
 
-        uint8_t next_head = (set_report_queue.head + 1) % VENDOR_QUEUE_SIZE;
+        uint8_t next_head = (set_report_queue.head + 1) & VENDOR_QUEUE_MASK;
         if (next_head != set_report_queue.tail) {
             set_report_entry_t *e = &set_report_queue.entries[set_report_queue.head];
             e->host_dev_addr = mitf->host_dev_addr;

@@ -113,9 +113,12 @@ static inline int32_t __not_in_flash_func(fp_mul)(int32_t a, int32_t b) {
     return (int32_t)((uint32_t)(hi << SMOOTH_FP_SHIFT) | (lo >> SMOOTH_FP_SHIFT));
 }
 
+// Fixed-point division via M33 FPU float path (~14 cycles VDIV.F32)
+// instead of 64-bit software division (__aeabi_ldivmod, ~60-100 cycles).
+// Precision: 24-bit mantissa → sufficient for 16.16 fixed-point work.
 static __force_inline int32_t fp_div(int32_t a, int32_t b) {
     if (b == 0) return 0;
-    return (int32_t)(((int64_t)a << SMOOTH_FP_SHIFT) / b);
+    return (int32_t)((float)a / (float)b * (float)SMOOTH_FP_ONE);
 }
 
 static __force_inline int32_t int_to_fp(int16_t val) {
@@ -194,26 +197,32 @@ static inline int32_t __not_in_flash_func(compute_adaptive_alpha)(
 static int32_t g_velocity_sum_x_fp = 0;
 static int32_t g_velocity_sum_y_fp = 0;
 
+// SMOOTH_VELOCITY_WINDOW must be power of 2 for bitmask; use shift for division
+_Static_assert((SMOOTH_VELOCITY_WINDOW & (SMOOTH_VELOCITY_WINDOW - 1)) == 0,
+               "SMOOTH_VELOCITY_WINDOW must be power of 2");
+#define VELOCITY_WINDOW_MASK  (SMOOTH_VELOCITY_WINDOW - 1)
+#define VELOCITY_WINDOW_SHIFT 3  // log2(8) = 3
+
 static void velocity_update(int16_t x, int16_t y) {
     velocity_tracker_t *v = &g_smooth.velocity;
-    
+    const uint8_t idx = v->history_index;
+
     // Get old value that will be replaced
-    int16_t old_x = v->x_history[v->history_index];
-    int16_t old_y = v->y_history[v->history_index];
-    
+    int16_t old_x = v->x_history[idx];
+    int16_t old_y = v->y_history[idx];
+
     // Store new values in history
-    v->x_history[v->history_index] = x;
-    v->y_history[v->history_index] = y;
-    v->history_index = (v->history_index + 1) % SMOOTH_VELOCITY_WINDOW;
-    
+    v->x_history[idx] = x;
+    v->y_history[idx] = y;
+    v->history_index = (idx + 1) & VELOCITY_WINDOW_MASK;  // Bitmask instead of modulo
+
     // Update running sum in fixed-point (remove old, add new) - O(1)
-    // Keep accumulators in fixed-point to preserve precision across cycles
-    g_velocity_sum_x_fp = g_velocity_sum_x_fp - int_to_fp(old_x) + int_to_fp(x);
-    g_velocity_sum_y_fp = g_velocity_sum_y_fp - int_to_fp(old_y) + int_to_fp(y);
-    
-    // Store as fixed-point average (no precision loss)
-    v->avg_velocity_x_fp = g_velocity_sum_x_fp / SMOOTH_VELOCITY_WINDOW;
-    v->avg_velocity_y_fp = g_velocity_sum_y_fp / SMOOTH_VELOCITY_WINDOW;
+    g_velocity_sum_x_fp += int_to_fp(x) - int_to_fp(old_x);
+    g_velocity_sum_y_fp += int_to_fp(y) - int_to_fp(old_y);
+
+    // Arithmetic right shift by 3 = divide by 8 (power of 2, no division instruction)
+    v->avg_velocity_x_fp = g_velocity_sum_x_fp >> VELOCITY_WINDOW_SHIFT;
+    v->avg_velocity_y_fp = g_velocity_sum_y_fp >> VELOCITY_WINDOW_SHIFT;
 }
 
 // smooth state accessor for external use

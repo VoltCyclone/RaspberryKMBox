@@ -152,6 +152,14 @@ void kmbox_start_button_click(kmbox_button_t button, uint32_t current_time_ms);
 // Used to detect button-only state changes that need an immediate report.
 uint8_t kmbox_get_current_buttons(void);
 
+// Atomic check-and-drain: single spinlock acquire to test pending + drain accumulators.
+// Returns true if any movement/wheel/pan/button-change was pending and writes drained values.
+// Replaces separate kmbox_has_pending_movement() + kmbox_get_mouse_report_16() calls
+// to eliminate double spinlock acquisition in the hot path.
+bool kmbox_try_drain_mouse_16(uint8_t last_sent_buttons,
+                               uint8_t *buttons, int16_t *x, int16_t *y,
+                               int8_t *wheel, int8_t *pan);
+
 // Get button name string for debugging
 const char* kmbox_get_button_name(kmbox_button_t button);
 
