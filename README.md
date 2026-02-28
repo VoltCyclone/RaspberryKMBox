@@ -12,13 +12,13 @@
 A high-performance dual-role USB HID firmware that creates a **transparent USB passthrough device** while providing **KMBox-compatible serial control** for mouse and keyboard automation with advanced humanization and optional visual feedback via ILI9341 display.
 
 ```
- Mouse/Keyboard ──► [RP2350 Board 1] ──► PC
-                        ▲  UART (crossed)
-                        ▼
-                    [RP2350 Board 2] ──► ILI9341 TFT Display
-                        ▲
-                        │ USB CDC
-                    [PC Tool / Script]
+Mouse/Keyboard ──► [RP2350 Board 1] ──► PC
+                       ▲  UART (crossed)
+                       ▼
+                   [RP2350 Board 2] ──► ILI9341 TFT Display
+                       ▲
+                       │ USB CDC
+                   [PC Tool / Script]
 ```
 
 </div>
@@ -49,12 +49,12 @@ A high-performance dual-role USB HID firmware that creates a **transparent USB p
 
 PIOKMbox turns an RP2350 board into a transparent man-in-the-middle USB HID device. Your PC sees the original mouse or keyboard — not the microcontroller — while serial commands let you inject precise, humanized input alongside physical devices.
 
-| Capability | Description |
-|:---|:---|
-| **USB Passthrough** | Mirrors the connected device's VID/PID, manufacturer, and product name. The PC never sees the RP2350. |
-| **Serial Control** | Accepts KMBox, Macku binary, and Ferrum-compatible commands over UART to inject mouse movements, clicks, and keyboard input. |
-| **Humanization** | Movement-aware jitter, velocity suppression, overshoot simulation, and Bezier easing — all configurable across four intensity levels. |
-| **Visual Feedback** | Optional ILI9341 TFT display shows real-time latency graphs, connection status, and thermal metrics. |
+| Capability          | Description                                                                                                                           |
+|:--------------------|:--------------------------------------------------------------------------------------------------------------------------------------|
+| **USB Passthrough** | Mirrors the connected device's VID/PID, manufacturer, and product name. The PC never sees the RP2350.                                 |
+| **Serial Control**  | Accepts KMBox, Macku binary, and Ferrum-compatible commands over UART to inject mouse movements, clicks, and keyboard input.          |
+| **Humanization**    | Movement-aware jitter, velocity suppression, overshoot simulation, and Bezier easing — all configurable across four intensity levels. |
+| **Visual Feedback** | Optional ILI9341 TFT display shows real-time latency graphs, connection status, and thermal metrics.                                  |
 
 > **Thermal note:** This firmware runs at 240 MHz+ for optimal performance. Monitor temperature during extended sessions, especially with the TFT display enabled.
 
@@ -81,31 +81,31 @@ PIOKMbox turns an RP2350 board into a transparent man-in-the-middle USB HID devi
 
 #### Board 1: USB Proxy (Main KMBox)
 
-| Item | Detail |
-|:---|:---|
-| **Board** | Adafruit Metro RP2350 |
-| **Role** | USB HID passthrough + KMBox command execution |
-| **USB-A** | Physical mouse or keyboard |
-| **USB-C** | To PC (appears as the passthrough device) |
-| **UART** | TX/RX to Board 2 (crossed), shared GND |
+| Item      | Detail                                        |
+|:----------|:----------------------------------------------|
+| **Board** | Adafruit Metro RP2350                         |
+| **Role**  | USB HID passthrough + KMBox command execution |
+| **USB-A** | Physical mouse or keyboard                    |
+| **USB-C** | To PC (appears as the passthrough device)     |
+| **UART**  | TX/RX to Board 2 (crossed), shared GND        |
 
 #### Board 2: Bridge / Autopilot (Optional)
 
-| Item | Detail |
-|:---|:---|
-| **Board** | Adafruit Metro RP2350 |
-| **Role** | Computer vision tracking + ILI9341 display driver |
-| **USB-C** | To PC (for serial input commands) |
-| **UART** | TX/RX to Board 1 (crossed), shared GND |
-| **SPI** | ILI9341 display + optional touch controller |
+| Item      | Detail                                            |
+|:----------|:--------------------------------------------------|
+| **Board** | Adafruit Metro RP2350                             |
+| **Role**  | Computer vision tracking + ILI9341 display driver |
+| **USB-C** | To PC (for serial input commands)                 |
+| **UART**  | TX/RX to Board 1 (crossed), shared GND            |
+| **SPI**   | ILI9341 display + optional touch controller       |
 
 #### ILI9341 TFT Display (Optional)
 
-| Spec | Value |
-|:---|:---|
-| Resolution | 320 x 240 |
-| Interface | SPI (hardware accelerated) |
-| Features | Real-time latency graphs, status display, touch support |
+| Spec       | Value                                                   |
+|:-----------|:--------------------------------------------------------|
+| Resolution | 320 x 240                                               |
+| Interface  | SPI (hardware accelerated)                              |
+| Features   | Real-time latency graphs, status display, touch support |
 
 ### Serial Wire Configuration
 
@@ -147,10 +147,10 @@ git submodule update --init --recursive
 
 ### 2. Flash Firmware
 
-| Board | Steps |
-|:---|:---|
-| **Board 1** (USB Proxy) | Hold **BOOTSEL** while connecting USB-C to PC. Drag `build-metro/PIOKMbox.uf2` to the mounted **RP2350** drive. |
-| **Board 2** (Bridge) | Hold **BOOTSEL** while connecting USB-C to PC. Drag `bridge/build-metro/kmbox_bridge.uf2` to the mounted **RP2350** drive. |
+| Board                   | Steps                                                                                                                      |
+|:------------------------|:---------------------------------------------------------------------------------------------------------------------------|
+| **Board 1** (USB Proxy) | Hold **BOOTSEL** while connecting USB-C to PC. Drag `build-metro/PIOKMbox.uf2` to the mounted **RP2350** drive.            |
+| **Board 2** (Bridge)    | Hold **BOOTSEL** while connecting USB-C to PC. Drag `bridge/build-metro/kmbox_bridge.uf2` to the mounted **RP2350** drive. |
 
 Both boards reboot automatically after flashing.
 
@@ -179,11 +179,11 @@ For display wiring, see [`bridge/README.md`](bridge/README.md).
 
 ### Connection
 
-| Parameter | Value |
-|:---|:---|
-| Interface | UART (hardware serial, crossed between boards) |
+| Parameter | Value                                                      |
+|:----------|:-----------------------------------------------------------|
+| Interface | UART (hardware serial, crossed between boards)             |
 | Baud Rate | 115200 (configurable; speeds are uncapped in USB CDC mode) |
-| Protocol | KMBox-compatible text and binary commands |
+| Protocol  | KMBox-compatible text and binary commands                  |
 
 ### Text Commands
 
@@ -231,14 +231,14 @@ km.monitor(0)         # Disable monitoring
 
 Fully compatible with **KMBox B+**, **Ferrum**, and **Macku** protocols:
 
-| Feature | Status |
-|:---|:---:|
-| Mouse control (movement, buttons, scroll) | Supported |
+| Feature                                     |  Status   |
+|:--------------------------------------------|:---------:|
+| Mouse control (movement, buttons, scroll)   | Supported |
 | Axis locking (X/Y movement, button masking) | Supported |
-| Monitor mode (real-time button state) | Supported |
-| Fast binary protocol (< 50 µs) | Supported |
-| Smooth injection (velocity matching) | Supported |
-| Movement humanization (Bezier easing) | Supported |
+| Monitor mode (real-time button state)       | Supported |
+| Fast binary protocol (< 50 µs)              | Supported |
+| Smooth injection (velocity matching)        | Supported |
+| Movement humanization (Bezier easing)       | Supported |
 
 ---
 
@@ -250,12 +250,12 @@ An advanced anti-detection system that simulates natural human mouse movement th
 
 **Movement-Aware Scaling** — intensity adapts to movement distance:
 
-| Distance | Jitter Scale | Behavior |
-|:---|:---|:---|
-| 0–20 px | 0.7–0.8x | Simulates hand tremor during precise positioning |
-| 20–60 px | 0.3–0.7x | Balances precision and speed |
-| 60–110 px | 0.1–0.3x | Reduced jitter for intentional movements |
-| 110+ px | 0.05–0.09x | Minimal jitter — keeps fast flicks snappy |
+| Distance  | Jitter Scale | Behavior                                         |
+|:----------|:-------------|:-------------------------------------------------|
+| 0–20 px   | 0.7–0.8x     | Simulates hand tremor during precise positioning |
+| 20–60 px  | 0.3–0.7x     | Balances precision and speed                     |
+| 60–110 px | 0.1–0.3x     | Reduced jitter for intentional movements         |
+| 110+ px   | 0.05–0.09x   | Minimal jitter — keeps fast flicks snappy        |
 
 **Velocity-Based Suppression** — jitter fades as movement slows, preventing a "shaky" cursor after motion completes. Mimics natural hand settling.
 
@@ -265,12 +265,12 @@ An advanced anti-detection system that simulates natural human mouse movement th
 
 Control via button press (GPIO 7) or serial command:
 
-| Mode | Jitter | Overshoot | Onset Delay | Use Case |
-|:---|:---|:---|:---|:---|
-| **OFF** | None | Disabled | None | Testing, maximum precision |
-| **LOW** | ± 0.06 px | Disabled | 0–1 frames | Competitive gaming, fast reactions |
-| **MEDIUM** | ± 0.17 px | 5% chance | 1–3 frames | **Default** — general use |
-| **HIGH** | ± 0.33 px | 10% chance | 2–6 frames | Maximum stealth |
+| Mode       | Jitter    | Overshoot  | Onset Delay | Use Case                           |
+|:-----------|:----------|:-----------|:------------|:-----------------------------------|
+| **OFF**    | None      | Disabled   | None        | Testing, maximum precision         |
+| **LOW**    | ± 0.06 px | Disabled   | 0–1 frames  | Competitive gaming, fast reactions |
+| **MEDIUM** | ± 0.17 px | 5% chance  | 1–3 frames  | **Default** — general use          |
+| **HIGH**   | ± 0.33 px | 10% chance | 2–6 frames  | Maximum stealth                    |
 
 <details>
 <summary><strong>Detailed mode parameters</strong></summary>
@@ -287,19 +287,19 @@ Control via button press (GPIO 7) or serial command:
 
 ### Additional Techniques
 
-| Technique | Description |
-|:---|:---|
-| **Bezier Easing** | Cubic ease-in-out for large movements; quadratic ease-out for quick corrections. Auto-selected by movement characteristics. |
-| **Micro-Jitter** | ± 1–2 px hand tremor simulation. Context-aware (more during mid-movement). 40% chance per frame. |
-| **Overshoot & Correction** | 5–10% chance to overshoot by 0.5–1.0 px, smoothly corrected over 2–4 frames. Only on moves > 15 px. |
-| **Per-Session Randomization** | Base parameters vary on init. ± 1 px per move, ± 1 frame for moves > 3 frames. Prevents statistical fingerprinting. |
+| Technique                     | Description                                                                                                                 |
+|:------------------------------|:----------------------------------------------------------------------------------------------------------------------------|
+| **Bezier Easing**             | Cubic ease-in-out for large movements; quadratic ease-out for quick corrections. Auto-selected by movement characteristics. |
+| **Micro-Jitter**              | ± 1–2 px hand tremor simulation. Context-aware (more during mid-movement). 40% chance per frame.                            |
+| **Overshoot & Correction**    | 5–10% chance to overshoot by 0.5–1.0 px, smoothly corrected over 2–4 frames. Only on moves > 15 px.                         |
+| **Per-Session Randomization** | Base parameters vary on init. ± 1 px per move, ± 1 frame for moves > 3 frames. Prevents statistical fingerprinting.         |
 
 ### Button Control (GPIO 7)
 
-| Action | Result |
-|:---|:---|
+| Action                  | Result                                                    |
+|:------------------------|:----------------------------------------------------------|
 | **Short press** (< 3 s) | Cycle humanization mode. LED: Red → Yellow → Green → Cyan |
-| **Long press** (>= 3 s) | Reset USB stacks |
+| **Long press** (>= 3 s) | Reset USB stacks                                          |
 
 For full technical details, see [HUMANIZATION.md](HUMANIZATION.md).
 
@@ -321,14 +321,14 @@ An optional companion firmware for a second **Adafruit Metro RP2350** with an IL
 
 ### Bridge Features
 
-| Feature | Description |
-|:---|:---|
-| **ILI9341 Display** | 320 x 240 real-time status, latency graphs, connection indicators |
-| **USB CDC Interface** | Receives serial commands from PC for tracking and automation |
-| **Color Tracking** | Hardware-accelerated blob detection and centroid calculation |
-| **UART Relay** | Bidirectional serial between bridge and main KMBox |
-| **Touch Support** | Optional XPT2046 / FT6206 for interactive controls |
-| **Temperature Monitoring** | Real-time thermal tracking with visual gauges |
+| Feature                    | Description                                                       |
+|:---------------------------|:------------------------------------------------------------------|
+| **ILI9341 Display**        | 320 x 240 real-time status, latency graphs, connection indicators |
+| **USB CDC Interface**      | Receives serial commands from PC for tracking and automation      |
+| **Color Tracking**         | Hardware-accelerated blob detection and centroid calculation      |
+| **UART Relay**             | Bidirectional serial between bridge and main KMBox                |
+| **Touch Support**          | Optional XPT2046 / FT6206 for interactive controls                |
+| **Temperature Monitoring** | Real-time thermal tracking with visual gauges                     |
 
 ### Bridge Quick Setup
 
@@ -387,34 +387,34 @@ An optional companion firmware for a second **Adafruit Metro RP2350** with an IL
 
 ### NeoPixel Colors
 
-| Color | State |
-|:---|:---|
-| Blue | Starting up |
-| Green | USB device only |
-| Orange | USB host only |
-| Cyan | Both USB stacks active |
-| Magenta | Mouse connected |
-| Yellow | Keyboard connected |
-| Pink | Mouse + keyboard connected |
-| Red | Error state |
-| Purple | Suspended |
+| Color   | State                      |
+|:--------|:---------------------------|
+| Blue    | Starting up                |
+| Green   | USB device only            |
+| Orange  | USB host only              |
+| Cyan    | Both USB stacks active     |
+| Magenta | Mouse connected            |
+| Yellow  | Keyboard connected         |
+| Pink    | Mouse + keyboard connected |
+| Red     | Error state                |
+| Purple  | Suspended                  |
 
 ### Humanization Mode LED
 
-| Color | Mode |
-|:---|:---|
-| Red | OFF (no humanization) |
-| Yellow | LOW (minimal) |
-| Green | MEDIUM (default) |
-| Cyan | HIGH (maximum) |
+| Color  | Mode                  |
+|:-------|:----------------------|
+| Red    | OFF (no humanization) |
+| Yellow | LOW (minimal)         |
+| Green  | MEDIUM (default)      |
+| Cyan   | HIGH (maximum)        |
 
 ### LED Patterns
 
-| Pattern | Meaning |
-|:---|:---|
+| Pattern    | Meaning                   |
+|:-----------|:--------------------------|
 | Fast blink | Device connected / active |
 | Slow blink | Device suspended or error |
-| Solid | Normal operation |
+| Solid      | Normal operation          |
 
 ---
 
@@ -476,19 +476,19 @@ Append `clean` to force a rebuild: `./build.sh all clean`
 
 Presets defined in `defines.h`:
 
-| Preset | Description |
-|:---|:---|
-| `BUILD_CONFIG_DEVELOPMENT` | Default — verbose logging |
-| `BUILD_CONFIG_PRODUCTION` | Optimized, minimal logging |
-| `BUILD_CONFIG_TESTING` | Extended diagnostics |
-| `BUILD_CONFIG_DEBUG` | Full debug symbols |
+| Preset                     | Description                |
+|:---------------------------|:---------------------------|
+| `BUILD_CONFIG_DEVELOPMENT` | Default — verbose logging  |
+| `BUILD_CONFIG_PRODUCTION`  | Optimized, minimal logging |
+| `BUILD_CONFIG_TESTING`     | Extended diagnostics       |
+| `BUILD_CONFIG_DEBUG`       | Full debug symbols         |
 
 ### Clock Speeds
 
-| Target | Frequency | Notes |
-|:---|:---|:---|
-| Main KMBox (RP2350) | 300 MHz | Optimized for PIO-USB |
-| Bridge | 280 MHz | Balanced for display + UART |
+| Target              | Frequency | Notes                       |
+|:--------------------|:----------|:----------------------------|
+| Main KMBox (RP2350) | 300 MHz   | Optimized for PIO-USB       |
+| Bridge              | 280 MHz   | Balanced for display + UART |
 
 ### Prerequisites
 
@@ -503,14 +503,14 @@ Presets defined in `defines.h`:
 
 Typical results on Metro RP2350 @ 300 MHz:
 
-| Operation | Latency | Notes |
-|:---|:---|:---|
-| USB passthrough | < 1 ms | Report forwarding |
-| Text command | < 100 µs | Parsing + execution |
-| Binary command | < 50 µs | Direct execution |
+| Operation             | Latency     | Notes                 |
+|:----------------------|:------------|:----------------------|
+| USB passthrough       | < 1 ms      | Report forwarding     |
+| Text command          | < 100 µs    | Parsing + execution   |
+| Binary command        | < 50 µs     | Direct execution      |
 | Humanization overhead | < 10 cycles | Per-pixel calculation |
-| Display update | 16–33 ms | 30–60 FPS typical |
-| UART transmission | 87 µs | 8 bytes @ 115200 baud |
+| Display update        | 16–33 ms    | 30–60 FPS typical     |
+| UART transmission     | 87 µs       | 8 bytes @ 115200 baud |
 
 ---
 
@@ -574,6 +574,7 @@ Typical results on Metro RP2350 @ 300 MHz:
 <summary><strong>Build Issues</strong></summary>
 
 **CMake errors:**
+
 ```bash
 # Ensure Pico SDK is installed and path is set
 export PICO_SDK_PATH=/path/to/pico-sdk
@@ -630,11 +631,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
 
 Main project files follow standard open-source practices. Libraries under `lib/` retain their respective licenses:
 
-| Library | License |
-|:---|:---|
+| Library      | License                        |
+|:-------------|:-------------------------------|
 | Pico-PIO-USB | See `lib/Pico-PIO-USB/LICENSE` |
-| TinyUSB | MIT |
-| Pico SDK | BSD 3-Clause |
+| TinyUSB      | MIT                            |
+| Pico SDK     | BSD 3-Clause                   |
 
 ---
 
@@ -650,11 +651,11 @@ Main project files follow standard open-source practices. Libraries under `lib/`
 
 ## Support
 
-| Channel | Link |
-|:---|:---|
-| Bug Reports | [GitHub Issues](https://github.com/ramseymcgrath/RaspberryKMBox/issues) |
-| Discussions | [GitHub Discussions](https://github.com/ramseymcgrath/RaspberryKMBox/discussions) |
-| Documentation | See individual `.md` files for detailed topics |
+| Channel       | Link                                                                              |
+|:--------------|:----------------------------------------------------------------------------------|
+| Bug Reports   | [GitHub Issues](https://github.com/ramseymcgrath/RaspberryKMBox/issues)           |
+| Discussions   | [GitHub Discussions](https://github.com/ramseymcgrath/RaspberryKMBox/discussions) |
+| Documentation | See individual `.md` files for detailed topics                                    |
 
 ---
 
