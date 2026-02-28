@@ -1325,6 +1325,47 @@ void kmbox_add_pan_movement(int8_t pan)
     spin_unlock(g_acc_spinlock, irq);
 }
 
+void kmbox_accumulate_mouse(int16_t x, int16_t y, int8_t wheel, int8_t pan)
+{
+    int16_t ax = 0, ay = 0;
+
+    uint32_t irq = spin_lock_blocking(g_acc_spinlock);
+
+    if (!g_kmbox_state.lock_mx) {
+        g_kmbox_state.mouse_x_accumulator += x;
+        ax = x;
+    }
+    if (!g_kmbox_state.lock_my) {
+        g_kmbox_state.mouse_y_accumulator += y;
+        ay = y;
+    }
+
+    if (g_kmbox_state.mouse_x_accumulator > 4096)
+        g_kmbox_state.mouse_x_accumulator = 4096;
+    else if (g_kmbox_state.mouse_x_accumulator < -4096)
+        g_kmbox_state.mouse_x_accumulator = -4096;
+    if (g_kmbox_state.mouse_y_accumulator > 4096)
+        g_kmbox_state.mouse_y_accumulator = 4096;
+    else if (g_kmbox_state.mouse_y_accumulator < -4096)
+        g_kmbox_state.mouse_y_accumulator = -4096;
+
+    g_kmbox_state.wheel_accumulator += wheel;
+    if (g_kmbox_state.wheel_accumulator > 1000)
+        g_kmbox_state.wheel_accumulator = 1000;
+    else if (g_kmbox_state.wheel_accumulator < -1000)
+        g_kmbox_state.wheel_accumulator = -1000;
+
+    g_kmbox_state.pan_accumulator += pan;
+    if (g_kmbox_state.pan_accumulator > 1000)
+        g_kmbox_state.pan_accumulator = 1000;
+    else if (g_kmbox_state.pan_accumulator < -1000)
+        g_kmbox_state.pan_accumulator = -1000;
+
+    spin_unlock(g_acc_spinlock, irq);
+
+    record_movement_event(ax, ay, g_kmbox_state.last_update_time);
+}
+
 bool kmbox_has_pending_movement(void)
 {
     uint32_t irq = spin_lock_blocking(g_acc_spinlock);
